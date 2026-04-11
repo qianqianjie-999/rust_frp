@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::env;
 use glob::glob;
 
 /// 服务器配置
@@ -202,9 +201,11 @@ impl ConfigLoader {
 
     /// 处理配置文件包含
     fn process_includes(config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(includes) = &config.includes {
+        // 先获取includes列表的克隆，避免同时借用
+        let includes = config.includes.clone();
+        if let Some(includes) = includes {
             for pattern in includes {
-                let files = glob(pattern)?;
+                let files = glob(&pattern)?;
                 for file in files {
                     match file {
                         Ok(path) => {
@@ -224,9 +225,11 @@ impl ConfigLoader {
 
     /// 处理配置文件包含
     fn process_includes_client(config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(includes) = &config.includes {
+        // 先获取includes列表的克隆，避免同时借用
+        let includes = config.includes.clone();
+        if let Some(includes) = includes {
             for pattern in includes {
-                let files = glob(pattern)?;
+                let files = glob(&pattern)?;
                 for file in files {
                     match file {
                         Ok(path) => {
@@ -289,14 +292,14 @@ impl ConfigLoader {
     }
 
     /// 替换环境变量
-    fn replace_environment_variables(config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_environment_variables(_config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         // 这里应该实现环境变量替换逻辑
         // 暂时简单实现
         Ok(())
     }
 
     /// 替换环境变量
-    fn replace_environment_variables_client(config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_environment_variables_client(_config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
         // 这里应该实现环境变量替换逻辑
         // 暂时简单实现
         Ok(())

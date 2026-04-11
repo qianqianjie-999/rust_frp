@@ -5,10 +5,15 @@ use rust_frp_config::PluginConfig;
 use std::fs::File;
 use std::path::Path;
 
+
+/// Combined trait for AsyncRead + AsyncWrite
+trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
+
 /// 插件接口
 #[async_trait]
 pub trait Plugin: Send + Sync {
-    async fn handle(&mut self, conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>>;
+    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 /// 插件工厂
@@ -38,7 +43,7 @@ impl UnixDomainSocketPlugin {
 
 #[async_trait]
 impl Plugin for UnixDomainSocketPlugin {
-    async fn handle(&mut self, mut conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle(&mut self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
         // 连接到 Unix 域套接字
         let mut unix_conn = UnixStream::connect(&self.unix_path).await?;
 
@@ -74,7 +79,7 @@ impl StaticFilePlugin {
     }
 
     /// 处理 HTTP 请求
-    async fn handle_http_request(&self, mut conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_http_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
         // 读取 HTTP 请求
         let mut buf = [0; 1024];
         let n = conn.read(&mut buf).await?;
@@ -141,7 +146,7 @@ impl StaticFilePlugin {
     }
 
     /// 提供文件
-    async fn serve_file(&self, file_path: &str, mut conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn serve_file(&self, file_path: &str, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
         let path = Path::new(file_path);
 
         // 检查文件是否存在
@@ -177,7 +182,7 @@ impl StaticFilePlugin {
 
 #[async_trait]
 impl Plugin for StaticFilePlugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
         self.handle_http_request(conn).await
     }
 }
@@ -197,7 +202,7 @@ impl HttpProxyPlugin {
     }
 
     /// 处理 HTTP 代理请求
-    async fn handle_http_proxy_request(&self, mut conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_http_proxy_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
         // 读取 HTTP 请求
         let mut buf = [0; 1024];
         let n = conn.read(&mut buf).await?;
@@ -240,7 +245,7 @@ impl HttpProxyPlugin {
 
 #[async_trait]
 impl Plugin for HttpProxyPlugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
         self.handle_http_proxy_request(conn).await
     }
 }
@@ -260,7 +265,7 @@ impl Socks5Plugin {
     }
 
     /// 处理 SOCKS5 代理请求
-    async fn handle_socks5_request(&self, mut conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_socks5_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
         // 读取 SOCKS5 握手请求
         let mut buf = [0; 256];
         let n = conn.read(&mut buf).await?;
@@ -360,7 +365,7 @@ impl Socks5Plugin {
 
 #[async_trait]
 impl Plugin for Socks5Plugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncRead + AsyncWrite + Send + Sync + Unpin>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
         self.handle_socks5_request(conn).await
     }
 }
@@ -372,7 +377,7 @@ pub struct PluginManager {
 
 impl PluginManager {
     pub fn new() -> Self {
-        let mut factories = std::collections::HashMap::new();
+        let mut factories: std::collections::HashMap<String, Box<dyn PluginFactory + Send + Sync>> = std::collections::HashMap::new();
 
         // 注册内置插件
         factories.insert("unix_domain_socket".to_string(), Box::new(UnixDomainSocketPluginFactory {}));
