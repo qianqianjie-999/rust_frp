@@ -1,0 +1,29 @@
+# 客户端配置文件
+
+# 服务器连接配置
+server_addr = "127.0.0.1"
+server_port = 7000
+user = "client"
+
+# 启用客户端 Web 管理界面
+[web_server]
+addr = "127.0.0.1"
+port = 7400
+user = "admin"
+password = "admin"
+
+# 认证配置
+[auth]
+method = "token"
+token = "test_token"
+
+# 传输配置
+[transport]
+protocol = "tcp"
+tls = { enable = true }  # 使用内置证书
+
+# 代理配置
+proxies = [
+  { name = "tcp_proxy", type = "tcp", local_ip = "127.0.0.1", local_port = 8080, remote_port = 8080 },
+  { name = "http_proxy", type = "http", local_ip = "127.0.0.1", local_port = 80, custom_domains = ["example.com"] }
+]

@@ -1,0 +1,15 @@
+[package]
+name = "rust_frp_config"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+serde_yaml = { workspace = true }
+glob = { workspace = true }
+log = { workspace = true }
+rust_frp_util = { path = "../rust_frp_util" }
