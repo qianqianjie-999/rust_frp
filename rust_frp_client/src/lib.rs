@@ -29,11 +29,61 @@ impl ClientProxyManager {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
                     .parse::<SocketAddr>()?;
                 log::info!("starting TCP proxy: {} -> {}", config.name, local_addr);
+                
+                // 启动本地监听器
+                let listener = tokio::net::TcpListener::bind(&local_addr).await?;
+                let proxy_name = config.name.clone();
+                let listeners = self.listeners.clone();
+                
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((conn, _)) => {
+                                log::info!("new local TCP connection for proxy: {}", proxy_name);
+                                // 这里应该处理本地连接的转发
+                                // 暂时关闭连接
+                                drop(conn);
+                            }
+                            Err(e) => {
+                                log::error!("accept local TCP connection error: {:?}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+                
+                let mut listeners = listeners.write().await;
+                listeners.insert(config.name.clone(), listener);
             }
             "http" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
                     .parse::<SocketAddr>()?;
                 log::info!("starting HTTP proxy: {} -> {}", config.name, local_addr);
+                
+                // 启动本地监听器
+                let listener = tokio::net::TcpListener::bind(&local_addr).await?;
+                let proxy_name = config.name.clone();
+                let listeners = self.listeners.clone();
+                
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((conn, _)) => {
+                                log::info!("new local HTTP connection for proxy: {}", proxy_name);
+                                // 这里应该处理本地 HTTP 连接的转发
+                                // 暂时关闭连接
+                                drop(conn);
+                            }
+                            Err(e) => {
+                                log::error!("accept local HTTP connection error: {:?}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+                
+                let mut listeners = listeners.write().await;
+                listeners.insert(config.name.clone(), listener);
             }
             "https" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
