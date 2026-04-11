@@ -224,8 +224,8 @@ impl ServerProxyManager {
                         loop {
                             match listener.accept().await {
                                 Ok((conn, _)) => {
-                                    // 这里应该处理 TCP 连接的转发
                                     log::info!("new TCP connection for proxy: {}", proxy_name);
+                                    // 这里应该处理 TCP 连接的转发
                                     // 暂时关闭连接
                                     drop(conn);
                                 }
@@ -242,7 +242,32 @@ impl ServerProxyManager {
                 }
             }
             "http" => {
-                // 这里应该处理 HTTP 代理
+                if let Some(vhost_http_port) = config.vhost_http_port {
+                    let addr = format!("0.0.0.0:{}", vhost_http_port).parse::<SocketAddr>()?;
+                    let listener = tokio::net::TcpListener::bind(&addr).await?;
+                    let proxy_name = config.name.clone();
+                    let listeners = self.listeners.clone();
+
+                    tokio::spawn(async move {
+                        loop {
+                            match listener.accept().await {
+                                Ok((conn, _)) => {
+                                    log::info!("new HTTP connection for proxy: {}", proxy_name);
+                                    // 这里应该处理 HTTP 连接的转发
+                                    // 暂时关闭连接
+                                    drop(conn);
+                                }
+                                Err(e) => {
+                                    log::error!("accept HTTP connection error: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    let mut listeners = listeners.write().await;
+                    listeners.insert(config.name.clone(), listener);
+                }
             }
             "https" => {
                 // 这里应该处理 HTTPS 代理
@@ -761,6 +786,7 @@ impl Server {
             Message::NewWorkConn(new_work_conn_msg) => {
                 // 处理新工作连接
                 log::info!("new work connection for proxy: {}", new_work_conn_msg.proxy_name);
+                // 这里应该处理工作连接的建立
                 // 暂时关闭连接
                 drop(conn);
             }

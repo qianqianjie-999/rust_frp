@@ -21,6 +21,7 @@ pub struct ServerConfig {
     pub allow_ports: Option<Vec<PortRange>>,
     pub custom_404_page: Option<String>,
     pub includes: Option<Vec<String>>,
+    pub proxies: Vec<ProxyConfig>,
 }
 
 /// 客户端配置
@@ -165,8 +166,8 @@ impl ConfigLoader {
     /// 从文件加载客户端配置
     pub fn load_client_config<P: AsRef<Path>>(path: P) -> Result<ClientConfig, Box<dyn std::error::Error>> {
         let mut config = Self::load_config_from_file(path)?;
-        Self::process_includes(&mut config)?;
-        Self::replace_environment_variables(&mut config)?;
+        Self::process_includes_client(&mut config)?;
+        Self::replace_environment_variables_client(&mut config)?;
         Self::validate_client_config(&config)?;
         Ok(config)
     }
