@@ -1,0 +1,15 @@
+[package]
+name = "rust_frp_auth"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+rust_frp_util = { path = "../rust_frp_util" }
+rust_frp_config = { path = "../rust_frp_config" }

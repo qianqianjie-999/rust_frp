@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "rust_frp_core",
+    "rust_frp_server",
+    "rust_frp_client",
+    "rust_frp_config",
+    "rust_frp_plugin",
+    "rust_frp_auth",
+    "rust_frp_net",
+    "rust_frp_util"
+]
+
+[workspace.dependencies]
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+serde_yaml = "0.9"
+log = "0.4"
+env_logger = "0.10"
+tokio-openssl = "0.6"
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+rand = "0.8"
+glob = "0.3"
+warp = "0.3"
+hostname = "0.3"
+ring = "0.16"
+base64 = "0.13"
+
