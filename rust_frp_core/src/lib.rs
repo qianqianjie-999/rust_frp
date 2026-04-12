@@ -7,6 +7,8 @@ use rust_frp_net::FrpConn;
 pub enum Message {
     Login(LoginMsg),
     LoginResp(LoginRespMsg),
+    RegisterProxy(RegisterProxyMsg),
+    RegisterProxyResp(RegisterProxyRespMsg),
     NewWorkConn(NewWorkConnMsg),
     StartWorkConn(StartWorkConnMsg),
     NewVisitorConn(NewVisitorConnMsg),
@@ -29,6 +31,7 @@ pub struct LoginMsg {
     pub version: String,
     pub timestamp: i64,
     pub run_id: String,
+    pub token: String,
     pub metas: std::collections::HashMap<String, String>,
     pub client_spec: Option<ClientSpec>,
 }
@@ -45,6 +48,19 @@ pub struct ClientSpec {
 pub struct LoginRespMsg {
     pub version: String,
     pub run_id: String,
+    pub error: String,
+}
+
+/// 代理注册消息
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RegisterProxyMsg {
+    pub proxy: rust_frp_config::ProxyConfig,
+}
+
+/// 代理注册响应消息
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RegisterProxyRespMsg {
+    pub name: String,
     pub error: String,
 }
 
@@ -110,7 +126,7 @@ pub struct ProxyStatusRespMsg {
 }
 
 /// 消息读取器
-pub async fn read_message<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Message, Box<dyn std::error::Error>> {
+pub async fn read_message<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
     let mut len_buf = [0; 4];
     conn.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -121,7 +137,7 @@ pub async fn read_message<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Message,
 }
 
 /// 消息写入器
-pub async fn write_message<T: AsyncWrite + Unpin>(conn: &mut T, msg: &Message) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn write_message<T: AsyncWrite + Unpin>(conn: &mut T, msg: &Message) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let msg_buf = serde_json::to_vec(msg)?;
     let len = msg_buf.len() as u32;
     let len_buf = len.to_be_bytes();
@@ -142,11 +158,11 @@ impl ControlConn {
         }
     }
 
-    pub async fn read_message(&mut self) -> Result<Message, Box<dyn std::error::Error>> {
+    pub async fn read_message(&mut self) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
         read_message(&mut self.conn).await
     }
 
-    pub async fn write_message(&mut self, msg: &Message) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn write_message(&mut self, msg: &Message) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         write_message(&mut self.conn, msg).await
     }
 
@@ -181,14 +197,14 @@ impl WorkConn {
 /// 代理管理器 trait
 #[async_trait::async_trait]
 pub trait ProxyManager {
-    async fn add_proxy(&self, config: rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error>>;
-    async fn remove_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error>>;
-    async fn get_proxy_status(&self, name: &str) -> Result<Option<String>, Box<dyn std::error::Error>>;
+    async fn add_proxy(&self, config: rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn remove_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_proxy_status(&self, name: &str) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// 访问者管理器 trait
 #[async_trait::async_trait]
 pub trait VisitorManager {
-    async fn add_visitor(&self, config: rust_frp_config::VisitorConfig) -> Result<(), Box<dyn std::error::Error>>;
-    async fn remove_visitor(&self, name: &str) -> Result<(), Box<dyn std::error::Error>>;
+    async fn add_visitor(&self, config: rust_frp_config::VisitorConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn remove_visitor(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }

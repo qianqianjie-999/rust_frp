@@ -7,7 +7,7 @@ use std::path::Path;
 
 
 /// Combined trait for AsyncRead + AsyncWrite
-trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
+pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
 
 /// 插件接口
@@ -54,6 +54,7 @@ impl Plugin for UnixDomainSocketPlugin {
 }
 
 /// 静态文件插件
+#[allow(dead_code)]
 pub struct StaticFilePlugin {
     local_path: String,
     strip_prefix: Option<String>,
@@ -188,6 +189,7 @@ impl Plugin for StaticFilePlugin {
 }
 
 /// HTTP 代理插件
+#[allow(dead_code)]
 pub struct HttpProxyPlugin {
     http_user: Option<String>,
     http_password: Option<String>,
@@ -251,6 +253,7 @@ impl Plugin for HttpProxyPlugin {
 }
 
 /// SOCKS5 代理插件
+#[allow(dead_code)]
 pub struct Socks5Plugin {
     username: Option<String>,
     password: Option<String>,
@@ -302,7 +305,9 @@ impl Socks5Plugin {
 
         // 解析目标地址
         let addr_type = buf[3];
+        #[allow(unused_assignments)]
         let mut target_addr = String::new();
+        #[allow(unused_assignments)]
         let mut target_port = 0;
 
         match addr_type {

@@ -1,12 +1,13 @@
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::Arc;
+use std::net::SocketAddr;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_openssl::SslStream;
-use openssl::ssl::{SslContext, SslAcceptor, SslConnector};
+use openssl::ssl::SslContext;
+use openssl::x509::X509;
+use openssl::pkey::PKey;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, Stream};
 
 /// 网络连接 trait
 #[async_trait::async_trait]
@@ -29,14 +30,17 @@ impl FrpConn for SslStream<TokioTcpStream> {
 }
 
 /// WebSocket 连接
-pub struct WebSocketConn {
-    stream: WebSocketStream<TokioTcpStream>,
+pub struct WebSocketConn<S> {
+    stream: WebSocketStream<S>,
     remote_addr: SocketAddr,
     read_buf: Vec<u8>,
 }
 
-impl WebSocketConn {
-    pub fn new(stream: WebSocketStream<TokioTcpStream>, remote_addr: SocketAddr) -> Self {
+impl<S> WebSocketConn<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn new(stream: WebSocketStream<S>, remote_addr: SocketAddr) -> Self {
         Self {
             stream,
             remote_addr,
@@ -45,7 +49,10 @@ impl WebSocketConn {
     }
 }
 
-impl AsyncRead for WebSocketConn {
+impl<S> AsyncRead for WebSocketConn<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -101,7 +108,10 @@ impl AsyncRead for WebSocketConn {
     }
 }
 
-impl AsyncWrite for WebSocketConn {
+impl<S> AsyncWrite for WebSocketConn<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -175,7 +185,10 @@ impl AsyncWrite for WebSocketConn {
     }
 }
 
-impl FrpConn for WebSocketConn {
+impl<S> FrpConn for WebSocketConn<S>
+where
+    S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+{
     fn remote_addr(&self) -> Option<SocketAddr> {
         Some(self.remote_addr)
     }
@@ -219,28 +232,38 @@ impl UdpListener {
 
 /// TLS 配置
 pub struct TlsConfig {
-    acceptor: Option<SslAcceptor>,
-    connector: Option<SslConnector>,
+    acceptor: Option<openssl::ssl::SslContext>,
+    connector: Option<openssl::ssl::SslContext>,
+}
+
+impl Clone for TlsConfig {
+    fn clone(&self) -> Self {
+        Self {
+            acceptor: self.acceptor.clone(),
+            connector: self.connector.clone(),
+        }
+    }
 }
 
 impl TlsConfig {
     /// 从文件创建服务器 TLS 配置
     pub fn new_server(cert_file: &str, key_file: &str) -> Result<Self, openssl::error::ErrorStack> {
-        let mut builder = SslAcceptor::mozilla_intermediate(openssl::ssl::SslMethod::tls())?;
-        builder.set_certificate_file(cert_file, openssl::ssl::SslFiletype::PEM)?;
-        builder.set_private_key_file(key_file, openssl::ssl::SslFiletype::PEM)?;
+        let mut ctx = SslContext::builder(openssl::ssl::SslMethod::tls_server())?;
+        ctx.set_certificate_file(cert_file, openssl::ssl::SslFiletype::PEM)?;
+        ctx.set_private_key_file(key_file, openssl::ssl::SslFiletype::PEM)?;
         Ok(Self {
-            acceptor: Some(builder.build()),
+            acceptor: Some(ctx.build()),
             connector: None,
         })
     }
 
     /// 创建客户端 TLS 配置
     pub fn new_client() -> Result<Self, openssl::error::ErrorStack> {
-        let builder = SslConnector::mozilla_intermediate(openssl::ssl::SslMethod::tls())?;
+        let mut ctx = SslContext::builder(openssl::ssl::SslMethod::tls_client())?;
+        ctx.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))?;
         Ok(Self {
             acceptor: None,
-            connector: Some(builder.build()),
+            connector: Some(ctx.build()),
         })
     }
 
@@ -250,18 +273,24 @@ impl TlsConfig {
         let cert_pem = include_bytes!("../cert/frp.crt");
         let key_pem = include_bytes!("../cert/frp.key");
 
-        let mut builder = SslAcceptor::mozilla_intermediate(openssl::ssl::SslMethod::tls())?;
-        builder.set_certificate(&openssl::x509::X509::from_pem(cert_pem)?)?;
-        builder.set_private_key(&openssl::pkey::PKey::private_key_from_pem(key_pem)?)?;
+        let mut ctx = SslContext::builder(openssl::ssl::SslMethod::tls_server())?;
+        ctx.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))?;
+        let cert = X509::from_pem(cert_pem)?;
+        ctx.set_certificate(&cert)?;
+        let key = PKey::private_key_from_pem(key_pem)?;
+        ctx.set_private_key(&key)?;
         Ok(Self {
-            acceptor: Some(builder.build()),
+            acceptor: Some(ctx.build()),
             connector: None,
         })
     }
 
     pub async fn accept(&self, stream: TokioTcpStream) -> Result<SslStream<TokioTcpStream>, std::io::Error> {
         if let Some(acceptor) = &self.acceptor {
-            let stream = tokio_openssl::accept(acceptor, stream).await?;
+            let ssl = openssl::ssl::Ssl::new(acceptor)?;
+            let mut stream = SslStream::new(ssl, stream)?;
+            std::pin::Pin::new(&mut stream).accept().await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             Ok(stream)
         } else {
             Err(std::io::Error::new(
@@ -273,7 +302,11 @@ impl TlsConfig {
 
     pub async fn connect(&self, domain: &str, stream: TokioTcpStream) -> Result<SslStream<TokioTcpStream>, std::io::Error> {
         if let Some(connector) = &self.connector {
-            let stream = tokio_openssl::connect(connector, domain, stream).await?;
+            let mut ssl = openssl::ssl::Ssl::new(connector)?;
+            ssl.set_hostname(domain)?;
+            let mut stream = SslStream::new(ssl, stream)?;
+            std::pin::Pin::new(&mut stream).connect().await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             Ok(stream)
         } else {
             Err(std::io::Error::new(
@@ -317,7 +350,7 @@ impl ConnPool {
 
 /// 网络连接管理器
 pub struct ConnManager {
-    tls_config: Option<TlsConfig>,
+    pub tls_config: Option<TlsConfig>,
     conn_pools: std::collections::HashMap<SocketAddr, ConnPool>,
     max_pool_size: usize,
 }
@@ -350,7 +383,7 @@ impl ConnManager {
         }
     }
 
-    pub async fn connect_websocket(&mut self, url: &str) -> Result<WebSocketConn, std::io::Error> {
+    pub async fn connect_websocket(&mut self, url: &str) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error> {
         let (stream, _) = connect_async(url).await.map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, e)
         })?;
@@ -358,7 +391,7 @@ impl ConnManager {
         Ok(WebSocketConn::new(stream, remote_addr))
     }
 
-    pub async fn accept_websocket(&self, stream: TokioTcpStream) -> Result<WebSocketConn, std::io::Error> {
+    pub async fn accept_websocket(&self, stream: TokioTcpStream) -> Result<WebSocketConn<TokioTcpStream>, std::io::Error> {
         let remote_addr = stream.peer_addr()?;
         let stream = accept_async(stream).await.map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, e)

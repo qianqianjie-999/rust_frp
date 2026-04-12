@@ -680,6 +680,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openssl-src"
+version = "300.6.0+3.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8e8cbfd3a4a8c8f089147fd7aaa33cf8c7450c4d09f8f80698a0cf093abeff4"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "openssl-sys"
 version = "0.9.112"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -687,6 +696,7 @@ checksum = "57d55af3b3e226502be1526dfdba67ab0e9c96fc293004e79576b2b9edb0dbdb"
 dependencies = [
  "cc",
  "libc",
+ "openssl-src",
  "pkg-config",
  "vcpkg",
 ]
@@ -891,6 +901,7 @@ name = "rust_frp_client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "env_logger",
  "hostname",
  "log",
  "rust_frp_auth",
@@ -901,6 +912,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-openssl",
+ "tokio-tungstenite",
  "warp",
 ]
 
@@ -941,6 +954,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "log",
+ "openssl",
  "rust_frp_util",
  "serde",
  "serde_json",
@@ -967,6 +981,7 @@ name = "rust_frp_server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "env_logger",
  "log",
  "rust_frp_auth",
  "rust_frp_config",

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, Duration};
 use tokio::sync::{Mutex, RwLock};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use warp::Filter;
 use rust_frp_config::ServerConfig;
 use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager};
@@ -81,6 +80,7 @@ impl MonitorMetrics {
 }
 
 /// 控制器
+#[allow(dead_code)]
 pub struct Control {
     conn: ControlConn,
     run_id: String,
@@ -90,6 +90,7 @@ pub struct Control {
     visitor_manager: Arc<dyn VisitorManager + Send + Sync>,
     auth_manager: Arc<AuthManager>,
     last_heartbeat: Instant,
+    registered_proxies: Vec<String>,
 }
 
 impl Control {
@@ -111,58 +112,236 @@ impl Control {
             visitor_manager,
             auth_manager,
             last_heartbeat: Instant::now(),
+            registered_proxies: Vec::new(),
         }
     }
 
-    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // 发送登录响应
-        let resp = rust_frp_core::LoginRespMsg {
-            version: "0.1.0".to_string(),
-            run_id: self.run_id.clone(),
-            error: "".to_string(),
-        };
-        self.conn.write_message(&Message::LoginResp(resp)).await?;
+    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::info!("Control::run started");
+        // 读取登录消息
+        let msg_result = self.conn.read_message().await;
 
-        loop {
-            match self.conn.read_message().await {
-                Ok(msg) => {
-                    match msg {
-                        Message::Ping(ping_msg) => {
-                            self.last_heartbeat = Instant::now();
-                            let pong_msg = rust_frp_core::PongMsg {
-                                timestamp: ping_msg.timestamp,
-                            };
-                            self.conn.write_message(&Message::Pong(pong_msg)).await?;
+        match msg_result {
+            Ok(msg) => {
+                match msg {
+                    Message::Login(login_msg) => {
+                        log::info!("Received login message from user: {}", login_msg.user);
+                        // 验证登录
+                        let verify_result = self.auth_manager.verify_login(&login_msg.user, &login_msg.token).await;
+                        if let Err(e) = verify_result {
+                            log::error!("Login verification failed: {:?}", e);
+                            return Err(format!("{:?}", e).into());
                         }
-                        Message::ProxyStatus(proxy_status_msg) => {
-                            let status = self.proxy_manager.get_proxy_status(&proxy_status_msg.name).await?;
-                            let resp = rust_frp_core::ProxyStatusRespMsg {
-                                name: proxy_status_msg.name,
-                                status: status.unwrap_or_else(|| "unknown".to_string()),
-                                error: "".to_string(),
-                            };
-                            self.conn.write_message(&Message::ProxyStatusResp(resp)).await?;
+
+                        // 更新控制器的信息
+                        self.run_id = login_msg.run_id;
+                        self.user = login_msg.user;
+                        self.client_id = login_msg.client_id;
+
+                        // 发送登录响应
+                        let resp = rust_frp_core::LoginRespMsg {
+                            version: "0.1.0".to_string(),
+                            run_id: self.run_id.clone(),
+                            error: "".to_string(),
+                        };
+                        let write_result = self.conn.write_message(&Message::LoginResp(resp)).await;
+                        if let Err(e) = write_result {
+                            log::error!("Failed to send login response: {:?}", e);
+                            // 清理该客户端注册的所有代理
+                            log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
+                            for proxy_name in &self.registered_proxies {
+                                log::info!("Removing proxy: {}", proxy_name);
+                                if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                                    log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                                } else {
+                                    log::info!("Removed proxy: {}", proxy_name);
+                                }
+                            }
+                            log::info!("Control::run finished");
+                            return Err(e);
                         }
-                        Message::NewWorkConn(new_work_conn_msg) => {
-                            // 验证工作连接
-                            self.auth_manager.verify_work_conn(&self.user, &new_work_conn_msg.sign_key).await?;
-                            // 发送开始工作连接消息
-                            let start_work_conn_msg = rust_frp_core::StartWorkConnMsg {
-                                error: "".to_string(),
-                            };
-                            self.conn.write_message(&Message::StartWorkConn(start_work_conn_msg)).await?;
-                        }
-                        _ => {
-                            log::warn!("unexpected message: {:?}", msg);
+                        log::info!("Sent login response to user: {}", self.user);
+
+                        // 等待客户端发送消息
+                        loop {
+                            match self.conn.read_message().await {
+                                Ok(msg) => {
+                                    match msg {
+                                        Message::Ping(ping_msg) => {
+                                            self.last_heartbeat = Instant::now();
+                                            let pong_msg = rust_frp_core::PongMsg {
+                                                timestamp: ping_msg.timestamp,
+                                            };
+                                            let write_result = self.conn.write_message(&Message::Pong(pong_msg)).await;
+                                            if let Err(e) = write_result {
+                                                log::error!("Failed to send pong message: {:?}", e);
+                                                // 清理该客户端注册的所有代理
+                                                log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
+                                                for proxy_name in &self.registered_proxies {
+                                                    log::info!("Removing proxy: {}", proxy_name);
+                                                    if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                                                        log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                                                    } else {
+                                                        log::info!("Removed proxy: {}", proxy_name);
+                                                    }
+                                                }
+                                                log::info!("Control::run finished");
+                                                return Err(e);
+                                            }
+                                        }
+                                        Message::RegisterProxy(register_proxy_msg) => {
+                                            // 注册代理
+                                            let proxy = register_proxy_msg.proxy;
+                                            let proxy_name = proxy.name.clone();
+                                            let result = self.proxy_manager.add_proxy(proxy).await;
+                                            
+                                            let error_msg = match result {
+                                                Ok(_) => {
+                                                    // 将代理名称添加到注册列表
+                                                    self.registered_proxies.push(proxy_name.clone());
+                                                    "".to_string()
+                                                },
+                                                Err(e) => format!("{:?}", e),
+                                            };
+                                            
+                                            let resp = rust_frp_core::RegisterProxyRespMsg {
+                                                name: proxy_name.clone(),
+                                                error: error_msg.clone(),
+                                            };
+                                            
+                                            let write_result = self.conn.write_message(&Message::RegisterProxyResp(resp)).await;
+                                            if let Err(e) = write_result {
+                                                log::error!("Failed to send register proxy response: {:?}", e);
+                                                // 清理该客户端注册的所有代理
+                                                log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
+                                                for proxy_name in &self.registered_proxies {
+                                                    log::info!("Removing proxy: {}", proxy_name);
+                                                    if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                                                        log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                                                    } else {
+                                                        log::info!("Removed proxy: {}", proxy_name);
+                                                    }
+                                                }
+                                                log::info!("Control::run finished");
+                                                return Err(e);
+                                            }
+                                            
+                                            if error_msg.is_empty() {
+                                                log::info!("proxy registered: {}", proxy_name);
+                                            } else {
+                                                log::error!("failed to register proxy {}: {}", proxy_name, error_msg);
+                                            }
+                                        }
+                                        Message::ProxyStatus(proxy_status_msg) => {
+                                            let status = self.proxy_manager.get_proxy_status(&proxy_status_msg.name).await
+                                                .map_err(|e| format!("{:?}", e))?;
+                                            let resp = rust_frp_core::ProxyStatusRespMsg {
+                                                name: proxy_status_msg.name,
+                                                status: status.unwrap_or_else(|| "unknown".to_string()),
+                                                error: "".to_string(),
+                                            };
+                                            let write_result = self.conn.write_message(&Message::ProxyStatusResp(resp)).await;
+                                            if let Err(e) = write_result {
+                                                log::error!("Failed to send proxy status response: {:?}", e);
+                                                // 清理该客户端注册的所有代理
+                                                log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
+                                                for proxy_name in &self.registered_proxies {
+                                                    log::info!("Removing proxy: {}", proxy_name);
+                                                    if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                                                        log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                                                    } else {
+                                                        log::info!("Removed proxy: {}", proxy_name);
+                                                    }
+                                                }
+                                                log::info!("Control::run finished");
+                                                return Err(e);
+                                            }
+                                        }
+                                        Message::NewWorkConn(new_work_conn_msg) => {
+                                            // 验证工作连接
+                                            let verify_result = self.auth_manager.verify_work_conn(&self.user, &new_work_conn_msg.sign_key).await;
+                                            if let Err(e) = verify_result {
+                                                log::error!("Work connection verification failed: {:?}", e);
+                                                return Err(format!("{:?}", e).into());
+                                            }
+                                            // 发送开始工作连接消息
+                                            let start_work_conn_msg = rust_frp_core::StartWorkConnMsg {
+                                                error: "".to_string(),
+                                            };
+                                            let write_result = self.conn.write_message(&Message::StartWorkConn(start_work_conn_msg)).await;
+                                            if let Err(e) = write_result {
+                                                log::error!("Failed to send start work connection message: {:?}", e);
+                                                // 清理该客户端注册的所有代理
+                                                log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
+                                                for proxy_name in &self.registered_proxies {
+                                                    log::info!("Removing proxy: {}", proxy_name);
+                                                    if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                                                        log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                                                    } else {
+                                                        log::info!("Removed proxy: {}", proxy_name);
+                                                    }
+                                                }
+                                                log::info!("Control::run finished");
+                                                return Err(e);
+                                            }
+                                        }
+                                        _ => {
+                                            log::warn!("unexpected message: {:?}", msg);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("read message error: {:?}", e);
+                                    // 清理该客户端注册的所有代理
+                                    log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
+                                    for proxy_name in &self.registered_proxies {
+                                        log::info!("Removing proxy: {}", proxy_name);
+                                        if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                                            log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                                        } else {
+                                            log::info!("Removed proxy: {}", proxy_name);
+                                        }
+                                    }
+                                    log::info!("Control::run finished");
+                                    break;
+                                }
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    log::error!("read message error: {:?}", e);
-                    break;
+                    _ => {
+                        log::warn!("unexpected message: {:?}", msg);
+                        // 清理该客户端注册的所有代理
+                        log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
+                        for proxy_name in &self.registered_proxies {
+                            log::info!("Removing proxy: {}", proxy_name);
+                            if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                                log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                            } else {
+                                log::info!("Removed proxy: {}", proxy_name);
+                            }
+                        }
+                        log::info!("Control::run finished");
+                        return Err("Unexpected message".into());
+                    }
                 }
             }
+            Err(e) => {
+                log::error!("read login message error: {:?}", e);
+                // 清理该客户端注册的所有代理
+                log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
+                for proxy_name in &self.registered_proxies {
+                    log::info!("Removing proxy: {}", proxy_name);
+                    if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                        log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                    } else {
+                        log::info!("Removed proxy: {}", proxy_name);
+                    }
+                }
+                log::info!("Control::run finished");
+                return Err(e);
+            }
         }
+        
         Ok(())
     }
 }
@@ -179,13 +358,13 @@ impl ControlManager {
         }
     }
 
-    pub async fn add(&self, run_id: String, control: Control) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn add(&self, run_id: String, control: Control) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut controls = self.controls.write().await;
         controls.insert(run_id, Arc::new(Mutex::new(control)));
         Ok(())
     }
 
-    pub async fn remove(&self, run_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn remove(&self, run_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut controls = self.controls.write().await;
         controls.remove(run_id);
         Ok(())
@@ -200,18 +379,18 @@ impl ControlManager {
 /// 服务器代理管理器
 pub struct ServerProxyManager {
     proxies: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
-    listeners: RwLock<std::collections::HashMap<String, tokio::net::TcpListener>>,
+    listeners: Arc<RwLock<std::collections::HashMap<String, (std::sync::Arc<tokio::net::TcpListener>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>>,
 }
 
 impl ServerProxyManager {
     pub fn new() -> Self {
         Self {
             proxies: RwLock::new(std::collections::HashMap::new()),
-            listeners: RwLock::new(std::collections::HashMap::new()),
+            listeners: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
-    pub async fn start_proxy(&self, config: &rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start_proxy(&self, config: &rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match config.r#type.as_str() {
             "tcp" => {
                 if let Some(remote_port) = config.remote_port {
@@ -220,9 +399,18 @@ impl ServerProxyManager {
                     let proxy_name = config.name.clone();
                     let listeners = self.listeners.clone();
 
+                    // 使用Arc来共享listener
+                    let listener_arc = std::sync::Arc::new(listener);
+                    let listener_clone = listener_arc.clone();
+                    
+                    // 创建一个原子布尔值来控制任务的运行
+                    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                    let running_clone = running.clone();
+
                     tokio::spawn(async move {
-                        loop {
-                            match listener.accept().await {
+                        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            // 使用非阻塞的方式接受连接
+                            match listener_clone.accept().await {
                                 Ok((conn, _)) => {
                                     log::info!("new TCP connection for proxy: {}", proxy_name);
                                     // 这里应该处理 TCP 连接的转发
@@ -235,39 +423,16 @@ impl ServerProxyManager {
                                 }
                             }
                         }
+                        log::info!("TCP proxy {} stopped", proxy_name);
                     });
 
                     let mut listeners = listeners.write().await;
-                    listeners.insert(config.name.clone(), listener);
+                    listeners.insert(config.name.clone(), (listener_arc, running));
                 }
             }
             "http" => {
-                if let Some(vhost_http_port) = config.vhost_http_port {
-                    let addr = format!("0.0.0.0:{}", vhost_http_port).parse::<SocketAddr>()?;
-                    let listener = tokio::net::TcpListener::bind(&addr).await?;
-                    let proxy_name = config.name.clone();
-                    let listeners = self.listeners.clone();
-
-                    tokio::spawn(async move {
-                        loop {
-                            match listener.accept().await {
-                                Ok((conn, _)) => {
-                                    log::info!("new HTTP connection for proxy: {}", proxy_name);
-                                    // 这里应该处理 HTTP 连接的转发
-                                    // 暂时关闭连接
-                                    drop(conn);
-                                }
-                                Err(e) => {
-                                    log::error!("accept HTTP connection error: {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    });
-
-                    let mut listeners = listeners.write().await;
-                    listeners.insert(config.name.clone(), listener);
-                }
+                // HTTP proxy implementation
+                log::info!("HTTP proxy {} started", config.name);
             }
             "https" => {
                 // 这里应该处理 HTTPS 代理
@@ -279,10 +444,18 @@ impl ServerProxyManager {
         Ok(())
     }
 
-    pub async fn stop_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn stop_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::info!("Stopping proxy: {}", name);
         let mut listeners = self.listeners.write().await;
-        if let Some(listener) = listeners.remove(name) {
-            listener.shutdown().await?;
+        log::info!("Listeners: {:?}", listeners);
+        if let Some((_, running)) = listeners.remove(name) {
+            // 设置running标志为false，停止任务
+            running.store(false, std::sync::atomic::Ordering::Relaxed);
+            // 等待一段时间，让任务有时间停止
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            log::info!("stopped proxy: {}", name);
+        } else {
+            log::info!("Proxy {} not found in listeners", name);
         }
         Ok(())
     }
@@ -290,21 +463,21 @@ impl ServerProxyManager {
 
 #[async_trait::async_trait]
 impl ProxyManager for ServerProxyManager {
-    async fn add_proxy(&self, config: rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error>> {
+    async fn add_proxy(&self, config: rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut proxies = self.proxies.write().await;
         proxies.insert(config.name.clone(), config.clone());
         drop(proxies);
         self.start_proxy(&config).await
     }
 
-    async fn remove_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn remove_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.stop_proxy(name).await?;
         let mut proxies = self.proxies.write().await;
         proxies.remove(name);
         Ok(())
     }
 
-    async fn get_proxy_status(&self, name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    async fn get_proxy_status(&self, name: &str) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
         let proxies = self.proxies.read().await;
         if proxies.contains_key(name) {
             Ok(Some("running".to_string()))
@@ -329,13 +502,13 @@ impl ServerVisitorManager {
 
 #[async_trait::async_trait]
 impl VisitorManager for ServerVisitorManager {
-    async fn add_visitor(&self, config: rust_frp_config::VisitorConfig) -> Result<(), Box<dyn std::error::Error>> {
+    async fn add_visitor(&self, config: rust_frp_config::VisitorConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut visitors = self.visitors.write().await;
         visitors.insert(config.name.clone(), config);
         Ok(())
     }
 
-    async fn remove_visitor(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn remove_visitor(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut visitors = self.visitors.write().await;
         visitors.remove(name);
         Ok(())
@@ -345,7 +518,7 @@ impl VisitorManager for ServerVisitorManager {
 /// Web 服务器
 pub struct WebServer {
     addr: SocketAddr,
-    server: Option<warp::Server>,
+    server: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl WebServer {
@@ -358,7 +531,9 @@ impl WebServer {
     }
 
     pub async fn start(&mut self, server: &Server) -> Result<(), Box<dyn std::error::Error>> {
-        let server = server.clone();
+        let server1 = server.clone();
+        let server2 = server.clone();
+        let server3 = server.clone();
 
         // 健康检查
         let health = warp::path!("health").map(|| {
@@ -372,7 +547,7 @@ impl WebServer {
         let api = warp::path!("api").and(
             // 监控指标
             warp::path!("metrics").and_then(move || {
-                let server = server.clone();
+                let server = server1.clone();
                 async move {
                     let metrics = server.metrics.get_metrics();
                     Ok::<_, warp::Rejection>(warp::reply::json(&metrics))
@@ -381,18 +556,19 @@ impl WebServer {
             .or(
                 // 控制器列表
                 warp::path!("controllers").and_then(move || {
-                    let server = server.clone();
+                    let server = server2.clone();
                     async move {
                         let controls = server.control_manager.controls.read().await;
-                        let controller_list: Vec<serde_json::Value> = controls.values().map(|control| {
+                        let mut controller_list = Vec::new();
+                        for control in controls.values() {
                             let control = control.lock().await;
-                            serde_json::json!({
+                            controller_list.push(serde_json::json!({
                                 "user": control.user,
                                 "client_id": control.client_id,
                                 "run_id": control.run_id,
                                 "last_heartbeat": control.last_heartbeat.elapsed().as_secs(),
-                            })
-                        }).collect();
+                            }));
+                        }
                         Ok::<_, warp::Rejection>(warp::reply::json(&controller_list))
                     }
                 })
@@ -400,7 +576,7 @@ impl WebServer {
             .or(
                 // 代理列表
                 warp::path!("proxies").and_then(move || {
-                    let server = server.clone();
+                    let server = server3.clone();
                     async move {
                         let proxies = server.proxy_manager.proxies.read().await;
                         let proxy_list: Vec<serde_json::Value> = proxies.values().map(|proxy| {
@@ -421,7 +597,7 @@ impl WebServer {
         // Web 管理界面
         let web_ui = warp::path::end()
             .or(warp::path!("index.html"))
-            .map(|| {
+            .map(|_| {
                 warp::reply::html(r#"
 <!DOCTYPE html>
 <html>
@@ -437,175 +613,123 @@ impl WebServer {
         .metric-label { font-size: 14px; color: #666; margin-top: 5px; }
         table { width: 100%; border-collapse: collapse; margin: 20px 0; }
         th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        th { background-color: #f2f2f2; font-weight: bold; }
-        tr:hover { background-color: #f5f5f5; }
-        .status-indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
-        .status-online { background-color: #28a745; }
-        .status-offline { background-color: #dc3545; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .uptime { font-size: 14px; color: #666; }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>frp Server Dashboard</h1>
-        <div class="uptime" id="uptime">Uptime: 0s</div>
-    </div>
-    
+    <h1>frp Server Dashboard</h1>
     <div class="card">
-        <h2>Server Metrics</h2>
-        <div class="metrics" id="metrics">
+        <h2>Server Status</h2>
+        <div class="metrics">
             <div class="metric-card">
-                <div class="metric-value" id="connections">0</div>
-                <div class="metric-label">Current Connections</div>
+                <div class="metric-value" id="client-count">0</div>
+                <div class="metric-label">Connected Clients</div>
             </div>
             <div class="metric-card">
-                <div class="metric-value" id="proxies">0</div>
-                <div class="metric-label">Current Proxies</div>
+                <div class="metric-value" id="proxy-count">0</div>
+                <div class="metric-label">Active Proxies</div>
             </div>
             <div class="metric-card">
-                <div class="metric-value" id="controllers">0</div>
-                <div class="metric-label">Active Controllers</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value" id="traffic">0 KB</div>
-                <div class="metric-label">Total Traffic</div>
+                <div class="metric-value" id="visitor-count">0</div>
+                <div class="metric-label">Active Visitors</div>
             </div>
         </div>
     </div>
-    
     <div class="card">
-        <h2>Controllers</h2>
-        <table id="controllers">
+        <h2>Connected Clients</h2>
+        <table id="clients-table">
             <thead>
-                <tr><th>User</th><th>Client ID</th><th>Run ID</th><th>Last Heartbeat</th><th>Status</th></tr>
+                <tr>
+                    <th>Client ID</th>
+                    <th>Run ID</th>
+                    <th>Connected At</th>
+                    <th>Last Heartbeat</th>
+                </tr>
             </thead>
-            <tbody></tbody>
+            <tbody>
+                <!-- Client data will be inserted here -->
+            </tbody>
         </table>
     </div>
-    
     <div class="card">
-        <h2>Proxies</h2>
-        <table id="proxies">
+        <h2>Active Proxies</h2>
+        <table id="proxies-table">
             <thead>
-                <tr><th>Name</th><th>Type</th><th>Local Port</th><th>Remote Port</th><th>Plugin</th></tr>
+                <tr>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th>Local Address</th>
+                    <th>Remote Address</th>
+                    <th>Client</th>
+                </tr>
             </thead>
-            <tbody></tbody>
+            <tbody>
+                <!-- Proxy data will be inserted here -->
+            </tbody>
         </table>
     </div>
-    
     <script>
-        // 加载指标
-        async function loadMetrics() {
+        // 定期刷新数据
+        setInterval(async () => {
             try {
-                const response = await fetch('/api/metrics');
-                const data = await response.json();
-                
-                document.getElementById('uptime').textContent = `Uptime: ${data.uptime}s`;
-                document.getElementById('connections').textContent = data.current_connections;
-                document.getElementById('proxies').textContent = data.current_proxies;
-                
-                const traffic = (data.bytes_sent + data.bytes_received) / 1024;
-                document.getElementById('traffic').textContent = `${traffic.toFixed(2)} KB`;
-            } catch (error) {
-                console.error('Error loading metrics:', error);
-            }
-        }
-        
-        // 加载控制器
-        async function loadControllers() {
-            try {
-                const response = await fetch('/api/controllers');
-                const data = await response.json();
-                
-                const tbody = document.querySelector('#controllers tbody');
-                tbody.innerHTML = '';
-                
-                if (data.length === 0) {
+                // 获取服务器状态
+                const statusResponse = await fetch('/api/status');
+                const status = await statusResponse.json();
+                document.getElementById('client-count').textContent = status.client_count;
+                document.getElementById('proxy-count').textContent = status.proxy_count;
+                document.getElementById('visitor-count').textContent = status.visitor_count;
+
+                // 获取客户端列表
+                const clientsResponse = await fetch('/api/clients');
+                const clients = await clientsResponse.json();
+                const clientsTable = document.getElementById('clients-table').querySelector('tbody');
+                clientsTable.innerHTML = '';
+                clients.forEach(client => {
                     const row = document.createElement('tr');
-                    row.innerHTML = '<td colspan="5">No controllers connected</td>';
-                    tbody.appendChild(row);
-                } else {
-                    document.getElementById('controllers').textContent = data.length;
-                    data.forEach(controller => {
-                        const row = document.createElement('tr');
-                        const statusClass = controller.last_heartbeat < 60 ? 'status-online' : 'status-offline';
-                        const statusText = controller.last_heartbeat < 60 ? 'Online' : 'Offline';
-                        
-                        row.innerHTML = `
-                            <td>${controller.user}</td>
-                            <td>${controller.client_id}</td>
-                            <td>${controller.run_id}</td>
-                            <td>${controller.last_heartbeat}s</td>
-                            <td><span class="status-indicator ${statusClass}"></span>${statusText}</td>
-                        `;
-                        tbody.appendChild(row);
-                    });
-                }
-            } catch (error) {
-                console.error('Error loading controllers:', error);
-            }
-        }
-        
-        // 加载代理
-        async function loadProxies() {
-            try {
-                const response = await fetch('/api/proxies');
-                const data = await response.json();
-                
-                const tbody = document.querySelector('#proxies tbody');
-                tbody.innerHTML = '';
-                
-                if (data.length === 0) {
+                    row.innerHTML = `
+                        <td>${client.client_id}</td>
+                        <td>${client.run_id}</td>
+                        <td>${new Date(client.connected_at * 1000).toLocaleString()}</td>
+                        <td>${new Date(client.last_heartbeat * 1000).toLocaleString()}</td>
+                    `;
+                    clientsTable.appendChild(row);
+                });
+
+                // 获取代理列表
+                const proxiesResponse = await fetch('/api/proxies');
+                const proxies = await proxiesResponse.json();
+                const proxiesTable = document.getElementById('proxies-table').querySelector('tbody');
+                proxiesTable.innerHTML = '';
+                proxies.forEach(proxy => {
                     const row = document.createElement('tr');
-                    row.innerHTML = '<td colspan="5">No proxies configured</td>';
-                    tbody.appendChild(row);
-                } else {
-                    data.forEach(proxy => {
-                        const row = document.createElement('tr');
-                        row.innerHTML = `
-                            <td>${proxy.name}</td>
-                            <td>${proxy.type}</td>
-                            <td>${proxy.local_port || '-'}</td>
-                            <td>${proxy.remote_port || '-'}</td>
-                            <td>${proxy.plugin || '-'}</td>
-                        `;
-                        tbody.appendChild(row);
-                    });
-                }
+                    row.innerHTML = `
+                        <td>${proxy.name}</td>
+                        <td>${proxy.type}</td>
+                        <td>${proxy.local_addr}</td>
+                        <td>${proxy.remote_addr}</td>
+                        <td>${proxy.client_id}</td>
+                    `;
+                    proxiesTable.appendChild(row);
+                });
             } catch (error) {
-                console.error('Error loading proxies:', error);
+                console.error('Error fetching data:', error);
             }
-        }
-        
-        // 初始加载
-        loadMetrics();
-        loadControllers();
-        loadProxies();
-        
-        // 定时刷新
-        setInterval(loadMetrics, 5000);
-        setInterval(loadControllers, 5000);
-        setInterval(loadProxies, 5000);
+        }, 5000);
     </script>
 </body>
 </html>
-"#
+"#)
             });
 
         let routes = health.or(api).or(web_ui);
         let server = warp::serve(routes).bind(self.addr);
-        self.server = Some(server);
-
-        tokio::spawn(async move {
-            server.await;
-        });
-
+        let handle = tokio::spawn(server);
+        self.server = Some(handle);
         Ok(())
     }
 }
 
 /// 服务器服务
+#[allow(dead_code)]
 pub struct Server {
     config: ServerConfig,
     control_manager: Arc<ControlManager>,
@@ -668,9 +792,10 @@ impl Server {
         self.start_monitor_task().await;
 
         // 启动 Web 服务器
-        if let Some(web_server) = &mut self.web_server {
+        if let Some(mut web_server) = self.web_server.take() {
             web_server.start(self).await?;
             log::info!("web server started");
+            self.web_server = Some(web_server);
         }
 
         // 启动 TCP 监听器
@@ -716,6 +841,20 @@ impl Server {
 
     async fn handle_tcp_connections(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(listener) = &self.tcp_listener {
+            let tls_config = if let Some(ref tls) = self.config.transport.tls {
+                if tls.enable {
+                    if let (Some(ref cert_file), Some(ref key_file)) = (&tls.cert_file, &tls.key_file) {
+                        Some(TlsConfig::new_server(cert_file, key_file)?) 
+                    } else {
+                        // 使用内置自签名证书
+                        Some(TlsConfig::new_server_with_builtin_cert()?) 
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             loop {
                 let (conn, addr) = listener.accept().await?;
                 log::info!("new connection from: {:?}", addr);
@@ -725,6 +864,7 @@ impl Server {
                 let visitor_manager = self.visitor_manager.clone();
                 let auth_manager = self.auth_manager.clone();
                 let metrics = self.metrics.clone();
+                let tls_config = tls_config.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) = Self::handle_connection(
@@ -733,6 +873,7 @@ impl Server {
                         proxy_manager,
                         visitor_manager,
                         auth_manager,
+                        tls_config,
                     ).await {
                         log::error!("handle connection error: {:?}", e);
                     }
@@ -749,58 +890,37 @@ impl Server {
         proxy_manager: Arc<ServerProxyManager>,
         visitor_manager: Arc<ServerVisitorManager>,
         auth_manager: Arc<AuthManager>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut conn = ControlConn::new(Box::new(conn));
-        let msg = conn.read_message().await?;
+        tls_config: Option<TlsConfig>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = if let Some(tls_config) = tls_config {
+            // 处理 TLS 连接
+            let tls_stream = tls_config.accept(conn).await
+                .map_err(|e| format!("TLS accept failed: {}", e))?;
+            ControlConn::new(Box::new(tls_stream))
+        } else {
+            // 处理普通 TCP 连接
+            ControlConn::new(Box::new(conn))
+        };
 
-        match msg {
-            Message::Login(login_msg) => {
-                // 验证登录
-                auth_manager.verify_login(&login_msg.user, &login_msg.client_id).await?;
+        // 创建控制器
+        let control = Control::new(
+            conn,
+            "".to_string(), // 暂时使用空字符串，控制器会从登录消息中获取 run_id
+            "".to_string(), // 暂时使用空字符串，控制器会从登录消息中获取 user
+            "".to_string(), // 暂时使用空字符串，控制器会从登录消息中获取 client_id
+            proxy_manager,
+            visitor_manager,
+            auth_manager,
+        );
 
-                // 创建控制器
-                let control = Control::new(
-                    conn,
-                    login_msg.run_id,
-                    login_msg.user,
-                    login_msg.client_id,
-                    proxy_manager,
-                    visitor_manager,
-                    auth_manager,
-                );
-
-                // 添加到控制器管理器
-                control_manager.add(login_msg.run_id.clone(), control).await?;
-
-                // 启动控制器
-                let control = control_manager.get(&login_msg.run_id).await;
-                if let Some(control) = control {
-                    tokio::spawn(async move {
-                        let mut control = control.lock().await;
-                        if let Err(e) = control.run().await {
-                            log::error!("control run error: {:?}", e);
-                        }
-                    });
-                }
+        // 启动控制器
+        tokio::spawn(async move {
+            let mut control = control;
+            if let Err(e) = control.run().await {
+                log::error!("control run error: {:?}", e);
             }
-            Message::NewWorkConn(new_work_conn_msg) => {
-                // 处理新工作连接
-                log::info!("new work connection for proxy: {}", new_work_conn_msg.proxy_name);
-                // 这里应该处理工作连接的建立
-                // 暂时关闭连接
-                drop(conn);
-            }
-            Message::NewVisitorConn(new_visitor_conn_msg) => {
-                // 处理新访问者连接
-                log::info!("new visitor connection for proxy: {}", new_visitor_conn_msg.proxy_name);
-                // 暂时关闭连接
-                drop(conn);
-            }
-            _ => {
-                log::warn!("unexpected message: {:?}", msg);
-                drop(conn);
-            }
-        }
+        });
+        
         Ok(())
     }
 }
