@@ -9,8 +9,11 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+env_logger = { workspace = true }
 hostname = { workspace = true }
 warp = { workspace = true }
+tokio-openssl = { workspace = true }
+tokio-tungstenite = { workspace = true }
 rust_frp_util = { path = "../rust_frp_util" }
 rust_frp_net = { path = "../rust_frp_net" }
 rust_frp_config = { path = "../rust_frp_config" }

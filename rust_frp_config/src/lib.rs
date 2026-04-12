@@ -5,7 +5,8 @@ use std::path::Path;
 use glob::glob;
 
 /// 服务器配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
 pub struct ServerConfig {
     pub bind_addr: String,
     pub bind_port: u16,
@@ -24,7 +25,8 @@ pub struct ServerConfig {
 }
 
 /// 客户端配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
 pub struct ClientConfig {
     pub server_addr: String,
     pub server_port: u16,
@@ -38,8 +40,26 @@ pub struct ClientConfig {
     pub includes: Option<Vec<String>>,
 }
 
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            user: None,
+            client_id: None,
+            web_server: WebServerConfig::default(),
+            auth: AuthConfig::default(),
+            transport: TransportConfig::default(),
+            proxies: Vec::new(),
+            visitors: Vec::new(),
+            includes: None,
+        }
+    }
+}
+
 /// Web 服务器配置
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
 pub struct WebServerConfig {
     pub addr: String,
     pub port: u16,
@@ -48,16 +68,40 @@ pub struct WebServerConfig {
     pub tls: Option<TlsConfig>,
 }
 
+impl Default for WebServerConfig {
+    fn default() -> Self {
+        Self {
+            addr: "0.0.0.0".to_string(),
+            port: 0,
+            user: None,
+            password: None,
+            tls: None,
+        }
+    }
+}
+
 /// 认证配置
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
 pub struct AuthConfig {
     pub method: String,
     pub token: Option<String>,
     pub oidc: Option<OidcConfig>,
 }
 
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            method: "token".to_string(),
+            token: None,
+            oidc: None,
+        }
+    }
+}
+
 /// OIDC 配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
 pub struct OidcConfig {
     pub issuer: String,
     pub audience: String,
@@ -68,6 +112,7 @@ pub struct OidcConfig {
 
 /// 传输配置
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
 pub struct TransportConfig {
     pub protocol: String,
     pub tls: Option<TlsConfig>,
@@ -76,8 +121,21 @@ pub struct TransportConfig {
     pub bandwidth_limit: Option<String>,
 }
 
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            protocol: "tcp".to_string(),
+            tls: None,
+            tcp_mux: true,
+            pool_count: 10,
+            bandwidth_limit: None,
+        }
+    }
+}
+
 /// TLS 配置
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(default)]
 pub struct TlsConfig {
     pub enable: bool,
     pub cert_file: Option<String>,
@@ -86,8 +144,21 @@ pub struct TlsConfig {
     pub force: bool,
 }
 
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            cert_file: None,
+            key_file: None,
+            trusted_ca_file: None,
+            force: false,
+        }
+    }
+}
+
 /// 端口范围
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
 pub struct PortRange {
     pub start: Option<u16>,
     pub end: Option<u16>,
@@ -95,9 +166,11 @@ pub struct PortRange {
 }
 
 /// 代理配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
 pub struct ProxyConfig {
     pub name: String,
+    #[serde(rename = "type")]
     pub r#type: String,
     pub local_ip: String,
     pub local_port: u16,
@@ -114,7 +187,8 @@ pub struct ProxyConfig {
 }
 
 /// 访问者配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
 pub struct VisitorConfig {
     pub name: String,
     pub r#type: String,
@@ -126,7 +200,8 @@ pub struct VisitorConfig {
 }
 
 /// 健康检查配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
 pub struct HealthCheckConfig {
     pub r#type: String,
     pub timeout_seconds: u32,
@@ -136,7 +211,8 @@ pub struct HealthCheckConfig {
 }
 
 /// 插件配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
 pub struct PluginConfig {
     pub r#type: String,
     pub unix_path: Option<String>,
@@ -172,7 +248,7 @@ impl ConfigLoader {
     }
 
     /// 从文件加载配置
-    fn load_config_from_file<P: AsRef<Path>, T: serde::de::DeserializeOwned>(path: P) -> Result<T, Box<dyn std::error::Error>> {
+    fn load_config_from_file<P: AsRef<Path>, T: serde::de::DeserializeOwned + Default>(path: P) -> Result<T, Box<dyn std::error::Error>> {
         let mut file = File::open(path)?;
         let mut content = String::new();
         file.read_to_string(&mut content)?;
@@ -180,18 +256,36 @@ impl ConfigLoader {
     }
 
     /// 解析配置
-    fn parse_config<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, Box<dyn std::error::Error>> {
-        // 尝试 TOML 解析
-        if let Ok(config) = toml::from_str(content) {
-            return Ok(config);
+    fn parse_config<T: serde::de::DeserializeOwned + Default>(content: &str) -> Result<T, Box<dyn std::error::Error>> {
+        log::info!("Trying to parse config as TOML");
+        match toml::from_str(content) {
+            Ok(config) => {
+                log::info!("Successfully parsed config as TOML");
+                return Ok(config);
+            }
+            Err(e) => {
+                log::error!("Failed to parse as TOML: {:?}", e);
+            }
         }
-        // 尝试 YAML 解析
-        if let Ok(config) = serde_yaml::from_str(content) {
-            return Ok(config);
+        log::info!("Trying to parse config as YAML");
+        match serde_yaml::from_str(content) {
+            Ok(config) => {
+                log::info!("Successfully parsed config as YAML");
+                return Ok(config);
+            }
+            Err(e) => {
+                log::error!("Failed to parse as YAML: {:?}", e);
+            }
         }
-        // 尝试 JSON 解析
-        if let Ok(config) = serde_json::from_str(content) {
-            return Ok(config);
+        log::info!("Trying to parse config as JSON");
+        match serde_json::from_str(content) {
+            Ok(config) => {
+                log::info!("Successfully parsed config as JSON");
+                return Ok(config);
+            }
+            Err(e) => {
+                log::error!("Failed to parse as JSON: {:?}", e);
+            }
         }
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -201,7 +295,6 @@ impl ConfigLoader {
 
     /// 处理配置文件包含
     fn process_includes(config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-        // 先获取includes列表的克隆，避免同时借用
         let includes = config.includes.clone();
         if let Some(includes) = includes {
             for pattern in includes {
@@ -210,7 +303,6 @@ impl ConfigLoader {
                     match file {
                         Ok(path) => {
                             let include_config = Self::load_config_from_file(path)?;
-                            // 合并配置
                             Self::merge_server_config(config, &include_config);
                         }
                         Err(e) => {
@@ -225,7 +317,6 @@ impl ConfigLoader {
 
     /// 处理配置文件包含
     fn process_includes_client(config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
-        // 先获取includes列表的克隆，避免同时借用
         let includes = config.includes.clone();
         if let Some(includes) = includes {
             for pattern in includes {
@@ -234,7 +325,6 @@ impl ConfigLoader {
                     match file {
                         Ok(path) => {
                             let include_config = Self::load_config_from_file(path)?;
-                            // 合并配置
                             Self::merge_client_config(config, &include_config);
                         }
                         Err(e) => {
@@ -249,7 +339,7 @@ impl ConfigLoader {
 
     /// 合并服务器配置
     fn merge_server_config(target: &mut ServerConfig, source: &ServerConfig) {
-        if source.bind_addr != "" {
+        if !source.bind_addr.is_empty() {
             target.bind_addr = source.bind_addr.clone();
         }
         if source.bind_port != 0 {
@@ -275,7 +365,7 @@ impl ConfigLoader {
 
     /// 合并客户端配置
     fn merge_client_config(target: &mut ClientConfig, source: &ClientConfig) {
-        if source.server_addr != "" {
+        if !source.server_addr.is_empty() {
             target.server_addr = source.server_addr.clone();
         }
         if source.server_port != 0 {
@@ -293,15 +383,11 @@ impl ConfigLoader {
 
     /// 替换环境变量
     fn replace_environment_variables(_config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-        // 这里应该实现环境变量替换逻辑
-        // 暂时简单实现
         Ok(())
     }
 
     /// 替换环境变量
     fn replace_environment_variables_client(_config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
-        // 这里应该实现环境变量替换逻辑
-        // 暂时简单实现
         Ok(())
     }
 
@@ -318,7 +404,7 @@ impl ConfigLoader {
 
     /// 验证客户端配置
     fn validate_client_config(config: &ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if config.server_addr == "" {
+        if config.server_addr.is_empty() {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "server_addr is required",
@@ -333,4 +419,3 @@ impl ConfigLoader {
         Ok(())
     }
 }
-

@@ -13,3 +13,4 @@ tokio-openssl = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 rust_frp_util = { path = "../rust_frp_util" }
+openssl = { version = "0.10", features = ["vendored"] }

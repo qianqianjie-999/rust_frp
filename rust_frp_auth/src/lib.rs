@@ -1,8 +1,5 @@
 use async_trait::async_trait;
-use std::io;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rust_frp_config::{AuthConfig, OidcConfig};
-use rust_frp_util::get_timestamp;
 use ring::hmac;
 use ring::digest;
 use base64::encode;
@@ -54,6 +51,7 @@ impl AuthVerifier for TokenAuthVerifier {
 }
 
 /// OIDC 认证验证器
+#[allow(dead_code)]
 pub struct OidcAuthVerifier {
     issuer: String,
     audience: String,
@@ -74,7 +72,7 @@ impl OidcAuthVerifier {
     }
 
     /// 验证 OIDC 令牌
-    async fn verify_token(&self, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn verify_token(&self, _token: &str) -> Result<(), Box<dyn std::error::Error>> {
         // 这里应该实现 OIDC 令牌验证逻辑
         // 暂时简单实现
         Ok(())
@@ -156,7 +154,7 @@ impl AuthManager {
 
     /// 加密数据
     pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        if let Some(key) = self.encryption_key.as_ref() {
+        if let Some(_key) = self.encryption_key.as_ref() {
             // 这里应该实现加密逻辑
             // 暂时简单实现
             Ok(data.to_vec())
@@ -170,7 +168,7 @@ impl AuthManager {
 
     /// 解密数据
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        if let Some(key) = self.encryption_key.as_ref() {
+        if let Some(_key) = self.encryption_key.as_ref() {
             // 这里应该实现解密逻辑
             // 暂时简单实现
             Ok(data.to_vec())
