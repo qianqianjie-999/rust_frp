@@ -17,6 +17,7 @@ pub enum Message {
     Pong(PongMsg),
     ProxyStatus(ProxyStatusMsg),
     ProxyStatusResp(ProxyStatusRespMsg),
+    Disconnect(DisconnectMsg),
 }
 
 /// 登录消息
@@ -109,6 +110,12 @@ pub struct PingMsg {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PongMsg {
     pub timestamp: i64,
+}
+
+/// 断开连接消息
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DisconnectMsg {
+    pub reason: String,
 }
 
 /// 代理状态消息

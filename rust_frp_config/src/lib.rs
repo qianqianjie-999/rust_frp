@@ -25,7 +25,7 @@ pub struct ServerConfig {
 }
 
 /// 客户端配置
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct ClientConfig {
     pub server_addr: String,
