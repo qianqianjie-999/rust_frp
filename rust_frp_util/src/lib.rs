@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::{SocketAddr, ToSocketAddrs};
 
 /// 获取当前时间戳（秒）
@@ -29,27 +29,8 @@ pub fn rand_id(len: usize) -> String {
         .collect()
 }
 
-/// 重试机制
-pub async fn retry<F, T, E>(
-    mut f: F,
-    max_attempts: usize,
-    delay: Duration,
-) -> Result<T, E>
-where
-    F: FnMut() -> Result<T, E>,
-    E: std::fmt::Display,
-{
-    let mut last_err: Option<E> = None;
-    for attempt in 0..max_attempts {
-        match f() {
-            Ok(t) => return Ok(t),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < max_attempts - 1 {
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap())
-}
+// 导出重试模块
+pub mod retry;
+
+// 重新导出常用类型
+pub use retry::{RetryConfig, RetryResult, retry, retry_with_default, ConnectionError, RetryableError};

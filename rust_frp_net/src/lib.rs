@@ -317,64 +317,36 @@ impl TlsConfig {
     }
 }
 
-/// 连接池
-pub struct ConnPool {
-    conns: Vec<TokioTcpStream>,
-    addr: SocketAddr,
-    max_size: usize,
-}
 
-impl ConnPool {
-    pub fn new(addr: SocketAddr, max_size: usize) -> Self {
-        Self {
-            conns: Vec::with_capacity(max_size),
-            addr,
-            max_size,
-        }
-    }
-
-    pub async fn get(&mut self) -> Result<TokioTcpStream, std::io::Error> {
-        if let Some(conn) = self.conns.pop() {
-            Ok(conn)
-        } else {
-            TokioTcpStream::connect(&self.addr).await
-        }
-    }
-
-    pub fn put(&mut self, conn: TokioTcpStream) {
-        if self.conns.len() < self.max_size {
-            self.conns.push(conn);
-        }
-    }
-}
 
 /// 网络连接管理器
 pub struct ConnManager {
     pub tls_config: Option<TlsConfig>,
-    conn_pools: std::collections::HashMap<SocketAddr, ConnPool>,
-    max_pool_size: usize,
+    pool_manager: PoolManager,
 }
 
 impl ConnManager {
     pub fn new(tls_config: Option<TlsConfig>, max_pool_size: usize) -> Self {
+        let pool_config = PoolConfig {
+            max_size: max_pool_size,
+            ..Default::default()
+        };
+        
         Self {
             tls_config,
-            conn_pools: std::collections::HashMap::new(),
-            max_pool_size,
+            pool_manager: PoolManager::new(pool_config),
         }
     }
 
-    pub async fn connect_tcp(&mut self, addr: &SocketAddr) -> Result<TokioTcpStream, std::io::Error> {
-        let pool = self.conn_pools.entry(*addr).or_insert_with(|| {
-            ConnPool::new(*addr, self.max_pool_size)
-        });
+    pub async fn connect_tcp(&self, addr: &SocketAddr) -> Result<PooledConn, std::io::Error> {
+        let pool = self.pool_manager.get_or_create_pool(*addr).await;
         pool.get().await
     }
 
-    pub async fn connect_tls(&mut self, domain: &str, addr: &SocketAddr) -> Result<SslStream<TokioTcpStream>, std::io::Error> {
-        let stream = self.connect_tcp(addr).await?;
+    pub async fn connect_tls(&self, domain: &str, addr: &SocketAddr) -> Result<SslStream<TokioTcpStream>, std::io::Error> {
+        let pooled = self.connect_tcp(addr).await?;
         if let Some(tls_config) = &self.tls_config {
-            tls_config.connect(domain, stream).await
+            tls_config.connect(domain, pooled.conn).await
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -383,7 +355,7 @@ impl ConnManager {
         }
     }
 
-    pub async fn connect_websocket(&mut self, url: &str) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error> {
+    pub async fn connect_websocket(&self, url: &str) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error> {
         let (stream, _) = connect_async(url).await.map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, e)
         })?;
@@ -399,9 +371,23 @@ impl ConnManager {
         Ok(WebSocketConn::new(stream, remote_addr))
     }
 
-    pub fn put_back(&mut self, addr: SocketAddr, conn: TokioTcpStream) {
-        if let Some(pool) = self.conn_pools.get_mut(&addr) {
-            pool.put(conn);
+    pub async fn put_back(&self, addr: SocketAddr, conn: PooledConn) {
+        if let Some(pool) = self.pool_manager.get_pool(addr).await {
+            pool.put(conn).await;
         }
     }
+
+    pub fn get_tls_config(&self) -> Option<&TlsConfig> {
+        self.tls_config.as_ref()
+    }
+
+    pub fn get_pool_manager(&self) -> &PoolManager {
+        &self.pool_manager
+    }
 }
+
+// 导出连接池模块
+pub mod pool;
+
+// 重新导出连接池类型
+pub use pool::{ConnPool, PoolManager, PoolConfig, PoolStats, PooledConn};

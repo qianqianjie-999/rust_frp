@@ -7,8 +7,8 @@ use base64::encode;
 /// 认证验证器 trait
 #[async_trait]
 pub trait AuthVerifier {
-    async fn verify_login(&self, user: &str, token: &str) -> Result<(), Box<dyn std::error::Error>>;
-    async fn verify_work_conn(&self, user: &str, token: &str) -> Result<(), Box<dyn std::error::Error>>;
+    async fn verify_login(&self, user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn verify_work_conn(&self, user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Token 认证验证器
@@ -34,7 +34,7 @@ impl TokenAuthVerifier {
 
 #[async_trait]
 impl AuthVerifier for TokenAuthVerifier {
-    async fn verify_login(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn verify_login(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if token == self.token {
             Ok(())
         } else {
@@ -45,7 +45,7 @@ impl AuthVerifier for TokenAuthVerifier {
         }
     }
 
-    async fn verify_work_conn(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn verify_work_conn(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.verify_login(_user, token).await
     }
 }
@@ -72,7 +72,7 @@ impl OidcAuthVerifier {
     }
 
     /// 验证 OIDC 令牌
-    async fn verify_token(&self, _token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn verify_token(&self, _token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 这里应该实现 OIDC 令牌验证逻辑
         // 暂时简单实现
         Ok(())
@@ -81,11 +81,11 @@ impl OidcAuthVerifier {
 
 #[async_trait]
 impl AuthVerifier for OidcAuthVerifier {
-    async fn verify_login(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn verify_login(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.verify_token(token).await
     }
 
-    async fn verify_work_conn(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    async fn verify_work_conn(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.verify_token(token).await
     }
 }
@@ -97,7 +97,7 @@ pub struct AuthManager {
 }
 
 impl AuthManager {
-    pub fn new(auth_config: &AuthConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(auth_config: &AuthConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let verifier: Box<dyn AuthVerifier + Send + Sync> = match auth_config.method.as_str() {
             "token" => {
                 if let Some(token) = &auth_config.token {
@@ -153,7 +153,7 @@ impl AuthManager {
     }
 
     /// 加密数据
-    pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(_key) = self.encryption_key.as_ref() {
             // 这里应该实现加密逻辑
             // 暂时简单实现
@@ -167,7 +167,7 @@ impl AuthManager {
     }
 
     /// 解密数据
-    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(_key) = self.encryption_key.as_ref() {
             // 这里应该实现解密逻辑
             // 暂时简单实现
@@ -180,12 +180,30 @@ impl AuthManager {
         }
     }
 
-    pub async fn verify_login(&self, user: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn verify_login(&self, user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.verifier.verify_login(user, token).await
     }
 
-    pub async fn verify_work_conn(&self, user: &str, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn verify_work_conn(&self, user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.verifier.verify_work_conn(user, token).await
+    }
+
+    /// 生成工作连接签名密钥
+    pub async fn generate_work_conn_sign_key(&self, run_id: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // 使用 token 和 run_id 生成签名
+        if let Some(key) = &self.encryption_key {
+            use ring::hmac;
+            use base64::encode;
+            let msg = format!("work_conn:{}", run_id);
+            let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+            let tag = hmac::sign(&hmac_key, msg.as_bytes());
+            Ok(encode(tag.as_ref()))
+        } else {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "encryption key not set",
+            )))
+        }
     }
 }
 

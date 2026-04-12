@@ -1,17 +1,55 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::io::AsyncWriteExt;
 use warp::Filter;
 use rust_frp_config::ClientConfig;
-use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager};
+use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager, NewWorkConnMsg};
 use rust_frp_net::{ConnManager, TlsConfig};
 use rust_frp_auth::AuthManager;
-use rust_frp_util::{get_timestamp, rand_id};
+use rust_frp_util::{get_timestamp, rand_id, retry::{RetryConfig, retry, ConnectionError}};
+
+/// 工作连接管理器
+pub struct WorkConnManager {
+    // proxy_name -> sender for incoming connections (with initial data)
+    work_conn_senders: RwLock<std::collections::HashMap<String, mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>>,
+}
+
+impl WorkConnManager {
+    pub fn new() -> Self {
+        Self {
+            work_conn_senders: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub async fn register_work_conn_handler(&self, proxy_name: String, sender: mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>) {
+        let mut senders = self.work_conn_senders.write().await;
+        senders.insert(proxy_name, sender);
+    }
+
+    pub async fn get_work_conn_sender(&self, proxy_name: &str) -> Option<mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>> {
+        let senders = self.work_conn_senders.read().await;
+        senders.get(proxy_name).cloned()
+    }
+
+    pub async fn handle_work_conn(&self, proxy_name: &str, server_conn: tokio::net::TcpStream, initial_data: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(sender) = self.get_work_conn_sender(proxy_name).await {
+            sender.send((server_conn, initial_data)).await?;
+            Ok(())
+        } else {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No work conn handler for proxy: {}", proxy_name),
+            )))
+        }
+    }
+}
 
 /// 客户端代理管理器
 pub struct ClientProxyManager {
     proxies: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
     listeners: RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::net::TcpListener>>>,
+    work_conn_handlers: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl ClientProxyManager {
@@ -19,10 +57,105 @@ impl ClientProxyManager {
         Self {
             proxies: RwLock::new(std::collections::HashMap::new()),
             listeners: RwLock::new(std::collections::HashMap::new()),
+            work_conn_handlers: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
-    pub async fn start_proxy(&self, config: &rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// 启动工作连接处理器
+    pub async fn start_work_conn_handler(
+        &self,
+        proxy_name: String,
+        local_addr: SocketAddr,
+        mut receiver: mpsc::Receiver<(tokio::net::TcpStream, Vec<u8>)>,
+    ) {
+        let proxy_name_clone = proxy_name.clone();
+        let handle = tokio::spawn(async move {
+            log::info!("Starting work connection handler for proxy: {}", proxy_name_clone);
+            
+            while let Some((mut server_conn, initial_data)) = receiver.recv().await {
+                log::info!("Received work connection for proxy: {}", proxy_name_clone);
+                
+                // 使用重试机制连接到本地服务
+                let retry_config = RetryConfig::fast();
+                let connect_result = retry(
+                    &retry_config,
+                    &format!("connect to local service for proxy {}", proxy_name_clone),
+                    || async {
+                        tokio::net::TcpStream::connect(&local_addr).await.map_err(|e| {
+                            log::warn!("Connection attempt failed: {:?}", e);
+                            ConnectionError::from(e)
+                        })
+                    }
+                ).await;
+                
+                match connect_result {
+                    Ok(retry_result) => {
+                        let mut local_conn = retry_result.value;
+                        log::info!(
+                            "Connected to local service at {:?} for proxy: {} (attempts: {}, delay: {:?})",
+                            local_addr,
+                            proxy_name_clone,
+                            retry_result.attempts,
+                            retry_result.total_delay
+                        );
+                        
+                        // 首先发送已读取的初始数据
+                        if !initial_data.is_empty() {
+                            if let Err(e) = local_conn.write_all(&initial_data).await {
+                                log::error!("Failed to write initial data to local conn: {:?}", e);
+                                continue;
+                            }
+                        }
+                        
+                        // 双向转发数据
+                        let (mut server_read, mut server_write) = server_conn.split();
+                        let (mut local_read, mut local_write) = local_conn.split();
+                        
+                        // 从服务器到本地
+                        let server_to_local = async {
+                            match tokio::io::copy(&mut server_read, &mut local_write).await {
+                                Ok(n) => log::info!("Server to local: {} bytes transferred", n),
+                                Err(e) => log::error!("Server to local error: {:?}", e),
+                            }
+                        };
+                        
+                        // 从本地到服务器
+                        let local_to_server = async {
+                            match tokio::io::copy(&mut local_read, &mut server_write).await {
+                                Ok(n) => log::info!("Local to server: {} bytes transferred", n),
+                                Err(e) => log::error!("Local to server error: {:?}", e),
+                            }
+                        };
+                        
+                        // 同时运行两个方向的转发
+                        tokio::select! {
+                            _ = server_to_local => {},
+                            _ = local_to_server => {},
+                        }
+                        
+                        log::info!("Work connection closed for proxy: {}", proxy_name_clone);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to connect to local service at {:?} after retries: {:?}", local_addr, e);
+                        // 发送 HTTP 错误响应
+                        let error_response = format!(
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\nFailed to connect to local service after retries: {}",
+                            e.to_string().len() + 45,
+                            e
+                        );
+                        let _ = server_conn.write_all(error_response.as_bytes()).await;
+                    }
+                }
+            }
+            
+            log::info!("Work connection handler stopped for proxy: {}", proxy_name_clone);
+        });
+        
+        let mut handlers = self.work_conn_handlers.write().await;
+        handlers.insert(proxy_name, handle);
+    }
+
+    pub async fn start_proxy(&self, config: &rust_frp_config::ProxyConfig) -> Result<Option<mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>, Box<dyn std::error::Error + Send + Sync>> {
         match config.r#type.as_str() {
             "tcp" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
@@ -56,50 +189,37 @@ impl ClientProxyManager {
                 
                 let mut listeners = self.listeners.write().await;
                 listeners.insert(config.name.clone(), listener_arc);
+                Ok(None)
             }
             "http" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
                     .parse::<SocketAddr>()?;
                 log::info!("starting HTTP proxy: {} -> {}", config.name, local_addr);
                 
-                // 启动本地监听器
-                let listener = tokio::net::TcpListener::bind(&local_addr).await?;
-                let proxy_name = config.name.clone();
+                // 为 HTTP 代理创建工作连接通道
+                let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
+                self.start_work_conn_handler(config.name.clone(), local_addr, rx).await;
                 
-                // 使用Arc来共享listener
-                let listener_arc = std::sync::Arc::new(listener);
-                let listener_clone = listener_arc.clone();
-                
-                tokio::spawn(async move {
-                    loop {
-                        match listener_clone.accept().await {
-                            Ok((conn, _)) => {
-                                log::info!("new local HTTP connection for proxy: {}", proxy_name);
-                                // 这里应该处理本地连接的转发
-                                // 暂时关闭连接
-                                drop(conn);
-                            }
-                            Err(e) => {
-                                log::error!("accept local HTTP connection error: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                });
-                
-                let mut listeners = self.listeners.write().await;
-                listeners.insert(config.name.clone(), listener_arc);
+                // 返回发送器
+                Ok(Some(tx))
             }
             "https" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
                     .parse::<SocketAddr>()?;
                 log::info!("starting HTTPS proxy: {} -> {}", config.name, local_addr);
+                
+                // 为 HTTPS 代理创建工作连接通道
+                let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
+                self.start_work_conn_handler(config.name.clone(), local_addr, rx).await;
+                
+                // 返回发送器
+                Ok(Some(tx))
             }
             _ => {
                 log::warn!("unsupported proxy type: {}", config.r#type);
+                Ok(None)
             }
         }
-        Ok(())
     }
 
     pub async fn stop_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -108,6 +228,13 @@ impl ClientProxyManager {
             // TcpListener doesn't have a shutdown method, we'll just drop it
             drop(listener);
         }
+        
+        // 停止工作连接处理器
+        let mut handlers = self.work_conn_handlers.write().await;
+        if let Some(handle) = handlers.remove(name) {
+            handle.abort();
+        }
+        
         Ok(())
     }
 }
@@ -118,7 +245,8 @@ impl ProxyManager for ClientProxyManager {
         let mut proxies = self.proxies.write().await;
         proxies.insert(config.name.clone(), config.clone());
         drop(proxies);
-        self.start_proxy(&config).await
+        let _ = self.start_proxy(&config).await?;
+        Ok(())
     }
 
     async fn remove_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -192,7 +320,7 @@ impl Connector {
         })
     }
 
-    pub async fn connect(&mut self) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error>> {
+    pub async fn connect(&mut self) -> Result<rust_frp_net::PooledConn, Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
             .parse::<SocketAddr>()?;
         Ok(self.conn_manager.connect_tcp(&addr).await?)
@@ -217,6 +345,8 @@ pub struct ClientControl {
     proxy_manager: Arc<ClientProxyManager>,
     visitor_manager: Arc<ClientVisitorManager>,
     auth_manager: Arc<AuthManager>,
+    work_conn_manager: Arc<WorkConnManager>,
+    config: ClientConfig,
 }
 
 impl ClientControl {
@@ -226,6 +356,8 @@ impl ClientControl {
         proxy_manager: Arc<ClientProxyManager>,
         visitor_manager: Arc<ClientVisitorManager>,
         auth_manager: Arc<AuthManager>,
+        work_conn_manager: Arc<WorkConnManager>,
+        config: ClientConfig,
     ) -> Self {
         Self {
             conn,
@@ -233,6 +365,8 @@ impl ClientControl {
             proxy_manager,
             visitor_manager,
             auth_manager,
+            work_conn_manager,
+            config,
         }
     }
 
@@ -255,6 +389,12 @@ impl ClientControl {
                             // 处理开始工作连接消息
                             if !start_work_conn_msg.error.is_empty() {
                                 log::error!("start work conn error: {}", start_work_conn_msg.error);
+                            } else {
+                                log::info!("Received StartWorkConn, establishing work connection");
+                                // 建立工作连接
+                                if let Err(e) = self.establish_work_connection().await {
+                                    log::error!("Failed to establish work connection: {:?}", e);
+                                }
                             }
                         }
                         _ => {
@@ -271,6 +411,42 @@ impl ClientControl {
             // 等待一段时间后再次发送 ping
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
+        Ok(())
+    }
+
+    async fn establish_work_connection(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 连接到服务器的工作端口
+        let use_tls = self.config.transport.tls.as_ref().map(|t| t.enable).unwrap_or(false);
+        let server_addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
+            .parse::<SocketAddr>()?;
+
+        let mut work_conn = if use_tls {
+            let tls_config = TlsConfig::new_client()?;
+            let tcp_stream = tokio::net::TcpStream::connect(&server_addr).await?;
+            let tls_stream = tls_config.connect(&self.config.server_addr, tcp_stream).await?;
+            Box::new(tls_stream) as Box<dyn rust_frp_net::FrpConn>
+        } else {
+            let tcp_stream = tokio::net::TcpStream::connect(&server_addr).await?;
+            Box::new(tcp_stream) as Box<dyn rust_frp_net::FrpConn>
+        };
+
+        // 发送 NewWorkConn 消息
+        let new_work_conn_msg = NewWorkConnMsg {
+            run_id: self.run_id.clone(),
+            proxy_name: "".to_string(), // 会在后续确定
+            timestamp: get_timestamp(),
+            sign_key: self.auth_manager.generate_work_conn_sign_key(&self.run_id).await?,
+            use_encryption: false,
+            use_compression: false,
+        };
+        rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
+
+        log::info!("Work connection established");
+        
+        // 这里应该将工作连接交给适当的代理处理
+        // 暂时关闭连接
+        drop(work_conn);
+        
         Ok(())
     }
 }
@@ -338,6 +514,7 @@ pub struct Client {
     proxy_manager: Arc<ClientProxyManager>,
     visitor_manager: Arc<ClientVisitorManager>,
     auth_manager: Arc<AuthManager>,
+    work_conn_manager: Arc<WorkConnManager>,
     connector: Connector,
     web_server: Option<WebServer>,
     config_path: Option<String>,
@@ -345,9 +522,10 @@ pub struct Client {
 
 impl Client {
     pub fn new(config: ClientConfig, config_path: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
-        let auth_manager = Arc::new(AuthManager::new(&config.auth)?);
+        let auth_manager = Arc::new(AuthManager::new(&config.auth).map_err(|e| e.to_string())?);
         let proxy_manager = Arc::new(ClientProxyManager::new());
         let visitor_manager = Arc::new(ClientVisitorManager::new());
+        let work_conn_manager = Arc::new(WorkConnManager::new());
         let connector = Connector::new(config.clone())?;
 
         let mut web_server = None;
@@ -361,6 +539,7 @@ impl Client {
             proxy_manager,
             visitor_manager,
             auth_manager,
+            work_conn_manager,
             connector,
             web_server,
             config_path,
@@ -379,7 +558,7 @@ impl Client {
         self.login().await.map_err(|e| e.to_string())?;
 
         // 克隆代理配置到临时向量
-        let mut proxies = self.config.proxies.clone();
+        let proxies = self.config.proxies.clone();
         
         log::info!("Number of proxies: {}", proxies.len());
 
@@ -400,12 +579,53 @@ impl Client {
             self.visitor_manager.add_visitor(visitor.clone()).await.map_err(|e| e.to_string())?;
         }
 
-        // 运行控制循环
-        if let Some(control) = &self.control {
-            let mut control = control.lock().await;
-            control.run().await.map_err(|e| e.to_string())?;
+        // 设置信号处理
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+        log::info!("Client started, waiting for signals...");
+
+        // 运行控制循环，同时监听信号
+        tokio::select! {
+            _ = async {
+                if let Some(control) = &self.control {
+                    let mut control = control.lock().await;
+                    control.run().await
+                } else {
+                    Ok(())
+                }
+            } => {
+                log::info!("Control loop ended");
+            }
+            _ = sigint.recv() => {
+                log::info!("Received SIGINT, shutting down gracefully...");
+                self.graceful_shutdown().await?;
+            }
+            _ = sigterm.recv() => {
+                log::info!("Received SIGTERM, shutting down gracefully...");
+                self.graceful_shutdown().await?;
+            }
         }
 
+        Ok(())
+    }
+
+    async fn graceful_shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        log::info!("Sending disconnect message to server...");
+        
+        if let Some(control) = &self.control {
+            let mut control = control.lock().await;
+            let disconnect_msg = rust_frp_core::DisconnectMsg {
+                reason: "client_shutdown".to_string(),
+            };
+            if let Err(e) = control.conn.write_message(&Message::Disconnect(disconnect_msg)).await {
+                log::warn!("Failed to send disconnect message: {:?}", e);
+            } else {
+                log::info!("Disconnect message sent successfully");
+            }
+        }
+
+        log::info!("Graceful shutdown completed");
         Ok(())
     }
 
@@ -496,6 +716,8 @@ impl Client {
                     self.proxy_manager.clone(),
                     self.visitor_manager.clone(),
                     self.auth_manager.clone(),
+                    self.work_conn_manager.clone(),
+                    self.config.clone(),
                 );
                 self.control = Some(Mutex::new(control));
 
@@ -543,6 +765,7 @@ impl Clone for Client {
             proxy_manager: self.proxy_manager.clone(),
             visitor_manager: self.visitor_manager.clone(),
             auth_manager: self.auth_manager.clone(),
+            work_conn_manager: self.work_conn_manager.clone(),
             connector: Connector::new(self.config.clone()).unwrap(),
             web_server: None,
             config_path: self.config_path.clone(),

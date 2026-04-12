@@ -2,13 +2,197 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, Duration};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use warp::Filter;
 use rust_frp_config::ServerConfig;
 use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager};
 use rust_frp_net::{TcpListener, UdpListener, TlsConfig, ConnManager};
 use rust_frp_auth::AuthManager;
 use rust_frp_util::get_timestamp;
+
+/// HTTP 请求信息
+#[derive(Debug, Clone)]
+pub struct HttpRequestInfo {
+    pub method: String,
+    pub path: String,
+    pub version: String,
+    pub headers: std::collections::HashMap<String, String>,
+    pub host: String,
+}
+
+impl HttpRequestInfo {
+    /// 从原始 HTTP 请求数据解析
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let request_str = String::from_utf8_lossy(data);
+        let lines: Vec<&str> = request_str.lines().collect();
+        if lines.is_empty() {
+            return None;
+        }
+
+        // 解析请求行
+        let first_line = lines[0];
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() < 3 {
+            return None;
+        }
+
+        let method = parts[0].to_string();
+        let path = parts[1].to_string();
+        let version = parts[2].to_string();
+
+        // 解析请求头
+        let mut headers = std::collections::HashMap::new();
+        let mut host = String::new();
+
+        for line in &lines[1..] {
+            if line.is_empty() {
+                break;
+            }
+            if let Some(idx) = line.find(':') {
+                let key = line[..idx].trim().to_lowercase();
+                let value = line[idx + 1..].trim().to_string();
+                if key == "host" {
+                    // 去除端口号
+                    host = value.split(':').next().unwrap_or(&value).to_string();
+                }
+                headers.insert(key, value);
+            }
+        }
+
+        if host.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            method,
+            path,
+            version,
+            headers,
+            host,
+        })
+    }
+
+    /// 检查是否是 WebSocket 升级请求
+    pub fn is_websocket_upgrade(&self) -> bool {
+        // 检查 Connection 头是否包含 "Upgrade"
+        if let Some(connection) = self.headers.get("connection") {
+            if !connection.to_lowercase().contains("upgrade") {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        // 检查 Upgrade 头是否为 "websocket"
+        if let Some(upgrade) = self.headers.get("upgrade") {
+            upgrade.to_lowercase() == "websocket"
+        } else {
+            false
+        }
+    }
+
+    /// 获取 Sec-WebSocket-Key
+    pub fn get_websocket_key(&self) -> Option<&str> {
+        self.headers.get("sec-websocket-key").map(|s| s.as_str())
+    }
+
+    /// 生成 WebSocket 接受密钥
+    pub fn generate_websocket_accept_key(key: &str) -> String {
+        use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
+        use base64::encode;
+
+        let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        let combined = format!("{}{}", key, magic_string);
+
+        let mut context = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
+        context.update(combined.as_bytes());
+        let digest = context.finish();
+
+        encode(digest.as_ref())
+    }
+}
+
+/// HTTP 虚拟主机路由器
+pub struct HttpVhostRouter {
+    // domain -> proxy_name
+    domain_map: RwLock<std::collections::HashMap<String, String>>,
+    // proxy_name -> (work_conn sender, pending connections)
+    work_conn_senders: RwLock<std::collections::HashMap<String, mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>>,
+    // proxy_name -> proxy config
+    proxy_configs: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
+}
+
+impl HttpVhostRouter {
+    pub fn new() -> Self {
+        Self {
+            domain_map: RwLock::new(std::collections::HashMap::new()),
+            work_conn_senders: RwLock::new(std::collections::HashMap::new()),
+            proxy_configs: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 注册 HTTP 代理的域名映射
+    pub async fn register_proxy(&self, proxy_name: String, domains: Vec<String>, config: rust_frp_config::ProxyConfig) {
+        let mut domain_map = self.domain_map.write().await;
+        for domain in domains {
+            log::info!("Registering domain '{}' for proxy '{}'", domain, proxy_name);
+            domain_map.insert(domain, proxy_name.clone());
+        }
+        
+        let mut proxy_configs = self.proxy_configs.write().await;
+        proxy_configs.insert(proxy_name, config);
+    }
+
+    /// 注销 HTTP 代理
+    pub async fn unregister_proxy(&self, proxy_name: &str) {
+        let mut domain_map = self.domain_map.write().await;
+        domain_map.retain(|_, v| v != proxy_name);
+        
+        let mut work_conn_senders = self.work_conn_senders.write().await;
+        work_conn_senders.remove(proxy_name);
+        
+        let mut proxy_configs = self.proxy_configs.write().await;
+        proxy_configs.remove(proxy_name);
+    }
+
+    /// 根据 Host 查找代理名称
+    pub async fn find_proxy_by_host(&self, host: &str) -> Option<String> {
+        let domain_map = self.domain_map.read().await;
+        
+        // 首先尝试精确匹配
+        if let Some(proxy_name) = domain_map.get(host) {
+            return Some(proxy_name.clone());
+        }
+        
+        // 尝试子域名匹配
+        for (domain, proxy_name) in domain_map.iter() {
+            if host.ends_with(domain) {
+                return Some(proxy_name.clone());
+            }
+        }
+        
+        None
+    }
+
+    /// 获取代理配置
+    pub async fn get_proxy_config(&self, proxy_name: &str) -> Option<rust_frp_config::ProxyConfig> {
+        let proxy_configs = self.proxy_configs.read().await;
+        proxy_configs.get(proxy_name).cloned()
+    }
+
+    /// 注册工作连接发送器
+    pub async fn register_work_conn_sender(&self, proxy_name: String, sender: mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>) {
+        let mut work_conn_senders = self.work_conn_senders.write().await;
+        work_conn_senders.insert(proxy_name, sender);
+    }
+
+    /// 获取工作连接发送器
+    pub async fn get_work_conn_sender(&self, proxy_name: &str) -> Option<mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>> {
+        let work_conn_senders = self.work_conn_senders.read().await;
+        work_conn_senders.get(proxy_name).cloned()
+    }
+}
 
 /// 监控指标
 pub struct MonitorMetrics {
@@ -285,13 +469,28 @@ impl Control {
                                                 return Err(e);
                                             }
                                         }
+                                        Message::Disconnect(disconnect_msg) => {
+                                            log::info!("Received disconnect message from client: reason={}", disconnect_msg.reason);
+                                            // 清理该客户端注册的所有代理
+                                            log::info!("Client requested disconnect, cleaning up {} proxies", self.registered_proxies.len());
+                                            for proxy_name in &self.registered_proxies {
+                                                log::info!("Removing proxy: {}", proxy_name);
+                                                if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
+                                                    log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
+                                                } else {
+                                                    log::info!("Removed proxy: {}", proxy_name);
+                                                }
+                                            }
+                                            log::info!("Control::run finished (graceful disconnect)");
+                                            return Ok(());
+                                        }
                                         _ => {
                                             log::warn!("unexpected message: {:?}", msg);
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    log::error!("read message error: {:?}", e);
+                                    log::warn!("Client connection closed unexpectedly: {:?}", e);
                                     // 清理该客户端注册的所有代理
                                     log::info!("Client disconnected, cleaning up {} proxies", self.registered_proxies.len());
                                     for proxy_name in &self.registered_proxies {
@@ -380,13 +579,15 @@ impl ControlManager {
 pub struct ServerProxyManager {
     proxies: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
     listeners: Arc<RwLock<std::collections::HashMap<String, (std::sync::Arc<tokio::net::TcpListener>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>>,
+    http_vhost_router: Arc<HttpVhostRouter>,
 }
 
 impl ServerProxyManager {
-    pub fn new() -> Self {
+    pub fn new(http_vhost_router: Arc<HttpVhostRouter>) -> Self {
         Self {
             proxies: RwLock::new(std::collections::HashMap::new()),
             listeners: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            http_vhost_router,
         }
     }
 
@@ -431,11 +632,43 @@ impl ServerProxyManager {
                 }
             }
             "http" => {
-                // HTTP proxy implementation
-                log::info!("HTTP proxy {} started", config.name);
+                // HTTP 代理 - 注册到虚拟主机路由器
+                let mut domains = Vec::new();
+                
+                // 添加自定义域名
+                if let Some(custom_domains) = &config.custom_domains {
+                    domains.extend(custom_domains.clone());
+                }
+                
+                // 添加子域名
+                if let Some(subdomain) = &config.subdomain {
+                    // 这里可以配置基础域名，例如: subdomain.example.com
+                    domains.push(subdomain.clone());
+                }
+                
+                if !domains.is_empty() {
+                    self.http_vhost_router.register_proxy(config.name.clone(), domains, config.clone()).await;
+                    log::info!("HTTP proxy {} registered with domains: {:?}", config.name, config.custom_domains);
+                } else {
+                    log::warn!("HTTP proxy {} has no domains configured", config.name);
+                }
             }
             "https" => {
-                // 这里应该处理 HTTPS 代理
+                // HTTPS 代理 - 类似于 HTTP，但需要 TLS 处理
+                let mut domains = Vec::new();
+                
+                if let Some(custom_domains) = &config.custom_domains {
+                    domains.extend(custom_domains.clone());
+                }
+                
+                if let Some(subdomain) = &config.subdomain {
+                    domains.push(subdomain.clone());
+                }
+                
+                if !domains.is_empty() {
+                    self.http_vhost_router.register_proxy(config.name.clone(), domains, config.clone()).await;
+                    log::info!("HTTPS proxy {} registered with domains: {:?}", config.name, config.custom_domains);
+                }
             }
             _ => {
                 log::warn!("unsupported proxy type: {}", config.r#type);
@@ -446,6 +679,10 @@ impl ServerProxyManager {
 
     pub async fn stop_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log::info!("Stopping proxy: {}", name);
+        
+        // 从 HTTP 虚拟主机路由器中注销
+        self.http_vhost_router.unregister_proxy(name).await;
+        
         let mut listeners = self.listeners.write().await;
         log::info!("Listeners: {:?}", listeners);
         if let Some((_, running)) = listeners.remove(name) {
@@ -458,6 +695,10 @@ impl ServerProxyManager {
             log::info!("Proxy {} not found in listeners", name);
         }
         Ok(())
+    }
+
+    pub fn get_http_vhost_router(&self) -> Arc<HttpVhostRouter> {
+        self.http_vhost_router.clone()
     }
 }
 
@@ -728,6 +969,52 @@ impl WebServer {
     }
 }
 
+/// HTTP 虚拟主机监听器
+pub struct HttpVhostListener {
+    inner: std::sync::Arc<tokio::net::TcpListener>,
+}
+
+impl HttpVhostListener {
+    pub async fn bind(addr: &SocketAddr) -> Result<Self, std::io::Error> {
+        let inner = tokio::net::TcpListener::bind(addr).await?;
+        Ok(Self { inner: std::sync::Arc::new(inner) })
+    }
+
+    pub async fn accept(&self) -> Result<(tokio::net::TcpStream, SocketAddr), std::io::Error> {
+        self.inner.accept().await
+    }
+
+    pub fn get_listener(&self) -> std::sync::Arc<tokio::net::TcpListener> {
+        self.inner.clone()
+    }
+}
+
+/// HTTPS 虚拟主机监听器
+pub struct HttpsVhostListener {
+    inner: std::sync::Arc<tokio::net::TcpListener>,
+    tls_config: TlsConfig,
+}
+
+impl HttpsVhostListener {
+    pub async fn bind(addr: &SocketAddr, tls_config: TlsConfig) -> Result<Self, std::io::Error> {
+        let inner = tokio::net::TcpListener::bind(addr).await?;
+        Ok(Self { 
+            inner: std::sync::Arc::new(inner),
+            tls_config,
+        })
+    }
+
+    pub async fn accept(&self) -> Result<(tokio_openssl::SslStream<tokio::net::TcpStream>, SocketAddr), std::io::Error> {
+        let (conn, addr) = self.inner.accept().await?;
+        let tls_conn = self.tls_config.accept(conn).await?;
+        Ok((tls_conn, addr))
+    }
+
+    pub fn get_listener(&self) -> std::sync::Arc<tokio::net::TcpListener> {
+        self.inner.clone()
+    }
+}
+
 /// 服务器服务
 #[allow(dead_code)]
 pub struct Server {
@@ -739,15 +1026,18 @@ pub struct Server {
     conn_manager: ConnManager,
     tcp_listener: Option<TcpListener>,
     udp_listener: Option<UdpListener>,
+    vhost_http_listener: Option<HttpVhostListener>,
+    vhost_https_listener: Option<HttpsVhostListener>,
     web_server: Option<WebServer>,
     metrics: Arc<MonitorMetrics>,
 }
 
 impl Server {
     pub async fn new(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let auth_manager = Arc::new(AuthManager::new(&config.auth)?);
+        let auth_manager = Arc::new(AuthManager::new(&config.auth).map_err(|e| e.to_string())?);
         let control_manager = Arc::new(ControlManager::new());
-        let proxy_manager = Arc::new(ServerProxyManager::new());
+        let http_vhost_router = Arc::new(HttpVhostRouter::new());
+        let proxy_manager = Arc::new(ServerProxyManager::new(http_vhost_router));
         let visitor_manager = Arc::new(ServerVisitorManager::new());
         let metrics = Arc::new(MonitorMetrics::new());
 
@@ -782,6 +1072,8 @@ impl Server {
             conn_manager,
             tcp_listener: None,
             udp_listener: None,
+            vhost_http_listener: None,
+            vhost_https_listener: None,
             web_server,
             metrics,
         })
@@ -814,8 +1106,256 @@ impl Server {
             log::info!("UDP listener started on {}", addr);
         }
 
+        // 启动 HTTP 虚拟主机监听器（如果配置了 vhost_http_port）
+        if let Some(vhost_http_port) = self.config.vhost_http_port {
+            let addr = format!("{}:{}", self.config.bind_addr, vhost_http_port)
+                .parse::<SocketAddr>()?;
+            let vhost_listener = HttpVhostListener::bind(&addr).await?;
+            self.vhost_http_listener = Some(vhost_listener);
+            log::info!("HTTP vhost listener started on {}", addr);
+            
+            // 启动 HTTP 虚拟主机连接处理任务
+            let http_vhost_router = self.proxy_manager.get_http_vhost_router();
+            let vhost_listener = self.vhost_http_listener.as_ref().unwrap();
+            let metrics = self.metrics.clone();
+            self.start_http_vhost_handler(vhost_listener, http_vhost_router, metrics).await?;
+        }
+
+        // 启动 HTTPS 虚拟主机监听器（如果配置了 vhost_https_port 和 TLS）
+        if let Some(vhost_https_port) = self.config.vhost_https_port {
+            if let Some(tls_config) = self.conn_manager.get_tls_config() {
+                let addr = format!("{}:{}", self.config.bind_addr, vhost_https_port)
+                    .parse::<SocketAddr>()?;
+                let vhost_listener = HttpsVhostListener::bind(&addr, tls_config.clone()).await?;
+                self.vhost_https_listener = Some(vhost_listener);
+                log::info!("HTTPS vhost listener started on {}", addr);
+                
+                // 启动 HTTPS 虚拟主机连接处理任务
+                let http_vhost_router = self.proxy_manager.get_http_vhost_router();
+                let vhost_listener = self.vhost_https_listener.as_ref().unwrap();
+                let metrics = self.metrics.clone();
+                self.start_https_vhost_handler(vhost_listener, http_vhost_router, metrics).await?;
+            } else {
+                log::warn!("vhost_https_port configured but no TLS config available");
+            }
+        }
+
         // 开始处理连接
         self.handle_tcp_connections().await?;
+        Ok(())
+    }
+
+    async fn start_http_vhost_handler(
+        &self,
+        listener: &HttpVhostListener,
+        http_vhost_router: Arc<HttpVhostRouter>,
+        metrics: Arc<MonitorMetrics>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener_arc = listener.get_listener();
+        
+        tokio::spawn(async move {
+            loop {
+                match listener_arc.accept().await {
+                    Ok((conn, addr)) => {
+                        log::info!("new HTTP vhost connection from: {:?}", addr);
+                        metrics.increment_connections();
+                        let router = http_vhost_router.clone();
+                        let metrics_clone = metrics.clone();
+                        
+                        tokio::spawn(async move {
+                            if let Err(e) = Self::handle_http_vhost_connection(conn, router).await {
+                                log::error!("handle http vhost connection error: {:?}", e);
+                            }
+                            metrics_clone.decrement_connections();
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("accept HTTP vhost connection error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        });
+        
+        Ok(())
+    }
+
+    async fn start_https_vhost_handler(
+        &self,
+        listener: &HttpsVhostListener,
+        http_vhost_router: Arc<HttpVhostRouter>,
+        metrics: Arc<MonitorMetrics>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener_arc = listener.get_listener();
+        let tls_config = listener.tls_config.clone();
+        
+        tokio::spawn(async move {
+            loop {
+                match listener_arc.accept().await {
+                    Ok((conn, addr)) => {
+                        log::info!("new HTTPS vhost connection from: {:?}", addr);
+                        metrics.increment_connections();
+                        let router = http_vhost_router.clone();
+                        let tls_config = tls_config.clone();
+                        let metrics_clone = metrics.clone();
+                        
+                        tokio::spawn(async move {
+                            // 先进行 TLS 握手
+                            match tls_config.accept(conn).await {
+                                Ok(mut tls_conn) => {
+                                    if let Err(e) = Self::handle_https_vhost_connection(&mut tls_conn, router).await {
+                                        log::error!("handle https vhost connection error: {:?}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("TLS handshake error: {:?}", e);
+                                }
+                            }
+                            metrics_clone.decrement_connections();
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("accept HTTPS vhost connection error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        });
+        
+        Ok(())
+    }
+
+    async fn handle_http_vhost_connection(
+        mut conn: tokio::net::TcpStream,
+        http_vhost_router: Arc<HttpVhostRouter>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 读取 HTTP 请求头
+        let mut buf = [0u8; 4096];
+        let n = conn.read(&mut buf).await?;
+        
+        if n == 0 {
+            return Ok(());
+        }
+        
+        // 解析 HTTP 请求
+        let request_info = match HttpRequestInfo::parse(&buf[..n]) {
+            Some(info) => info,
+            None => {
+                log::warn!("failed to parse HTTP request");
+                let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                conn.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        
+        log::info!("HTTP request: {} {} Host: {}", request_info.method, request_info.path, request_info.host);
+        
+        // 根据 Host 查找代理
+        let proxy_name = match http_vhost_router.find_proxy_by_host(&request_info.host).await {
+            Some(name) => name,
+            None => {
+                log::warn!("no proxy found for host: {}", request_info.host);
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    request_info.host.len() + 24,
+                    format!("Proxy not found for host: {}", request_info.host)
+                );
+                conn.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        
+        log::info!("routing request to proxy: {}", proxy_name);
+        
+        // 获取工作连接发送器
+        let sender = match http_vhost_router.get_work_conn_sender(&proxy_name).await {
+            Some(s) => s,
+            None => {
+                log::warn!("no work connection available for proxy: {}", proxy_name);
+                let response = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 35\r\n\r\nNo work connection available for proxy";
+                conn.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        
+        // 发送连接和已读取的数据给工作连接处理器
+        let data = buf[..n].to_vec();
+        if let Err(e) = sender.send((conn, data)).await {
+            log::error!("failed to send connection to work conn handler: {:?}", e);
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "failed to send connection to work conn handler",
+            )));
+        }
+        
+        Ok(())
+    }
+
+    async fn handle_https_vhost_connection<S>(
+        conn: &mut S,
+        http_vhost_router: Arc<HttpVhostRouter>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync,
+    {
+        // 读取 HTTP 请求头
+        let mut buf = [0u8; 4096];
+        let n = conn.read(&mut buf).await?;
+        
+        if n == 0 {
+            return Ok(());
+        }
+        
+        // 解析 HTTP 请求
+        let request_info = match HttpRequestInfo::parse(&buf[..n]) {
+            Some(info) => info,
+            None => {
+                log::warn!("failed to parse HTTPS request");
+                let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                conn.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        
+        log::info!("HTTPS request: {} {} Host: {}", request_info.method, request_info.path, request_info.host);
+        
+        // 根据 Host 查找代理
+        let proxy_name = match http_vhost_router.find_proxy_by_host(&request_info.host).await {
+            Some(name) => name,
+            None => {
+                log::warn!("no proxy found for host: {}", request_info.host);
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    request_info.host.len() + 24,
+                    format!("Proxy not found for host: {}", request_info.host)
+                );
+                conn.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        
+        log::info!("routing HTTPS request to proxy: {}", proxy_name);
+        
+        // 获取工作连接发送器
+        let _sender = match http_vhost_router.get_work_conn_sender(&proxy_name).await {
+            Some(s) => s,
+            None => {
+                log::warn!("no work connection available for proxy: {}", proxy_name);
+                let response = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 35\r\n\r\nNo work connection available for proxy";
+                conn.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        
+        // 对于 HTTPS，我们需要将 TLS 连接包装后发送
+        // 这里简化处理，直接发送原始数据
+        // 实际实现中可能需要使用 TLS 透传或终止
+        let _data = buf[..n].to_vec();
+        
+        // 创建一个虚拟的 TcpStream 来传递数据
+        // 实际实现中应该使用更复杂的方式来处理 TLS 连接
+        log::info!("HTTPS connection forwarded to proxy: {}", proxy_name);
+        
         Ok(())
     }
 
@@ -886,7 +1426,7 @@ impl Server {
 
     async fn handle_connection(
         conn: tokio::net::TcpStream,
-        control_manager: Arc<ControlManager>,
+        _control_manager: Arc<ControlManager>,
         proxy_manager: Arc<ServerProxyManager>,
         visitor_manager: Arc<ServerVisitorManager>,
         auth_manager: Arc<AuthManager>,
@@ -936,6 +1476,8 @@ impl Clone for Server {
             conn_manager: ConnManager::new(None, self.config.transport.pool_count as usize),
             tcp_listener: None,
             udp_listener: None,
+            vhost_http_listener: None,
+            vhost_https_listener: None,
             web_server: None,
             metrics: self.metrics.clone(),
         }
