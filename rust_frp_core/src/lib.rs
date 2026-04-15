@@ -3,12 +3,13 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use rust_frp_net::FrpConn;
 
 /// 消息类型
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum Message {
     Login(LoginMsg),
     LoginResp(LoginRespMsg),
     RegisterProxy(RegisterProxyMsg),
     RegisterProxyResp(RegisterProxyRespMsg),
+    ReqWorkConn(ReqWorkConnMsg),
     NewWorkConn(NewWorkConnMsg),
     StartWorkConn(StartWorkConnMsg),
     NewVisitorConn(NewVisitorConnMsg),
@@ -21,7 +22,7 @@ pub enum Message {
 }
 
 /// 登录消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoginMsg {
     pub arch: String,
     pub os: String,
@@ -38,14 +39,14 @@ pub struct LoginMsg {
 }
 
 /// 客户端规范
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClientSpec {
     pub r#type: String,
     pub always_auth_pass: bool,
 }
 
 /// 登录响应消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LoginRespMsg {
     pub version: String,
     pub run_id: String,
@@ -53,20 +54,26 @@ pub struct LoginRespMsg {
 }
 
 /// 代理注册消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RegisterProxyMsg {
     pub proxy: rust_frp_config::ProxyConfig,
 }
 
 /// 代理注册响应消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RegisterProxyRespMsg {
     pub name: String,
     pub error: String,
 }
 
-/// 新工作连接消息
-#[derive(Debug, Deserialize, Serialize)]
+/// 请求工作连接消息（服务器发送给客户端）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReqWorkConnMsg {
+    pub proxy_name: String,
+}
+
+/// 新工作连接消息（客户端发送给服务器）
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NewWorkConnMsg {
     pub run_id: String,
     pub proxy_name: String,
@@ -77,13 +84,13 @@ pub struct NewWorkConnMsg {
 }
 
 /// 开始工作连接消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StartWorkConnMsg {
     pub error: String,
 }
 
 /// 新访问者连接消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NewVisitorConnMsg {
     pub run_id: String,
     pub proxy_name: String,
@@ -94,38 +101,38 @@ pub struct NewVisitorConnMsg {
 }
 
 /// 新访问者连接响应消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NewVisitorConnRespMsg {
     pub proxy_name: String,
     pub error: String,
 }
 
 /// Ping 消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PingMsg {
     pub timestamp: i64,
 }
 
 /// Pong 消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PongMsg {
     pub timestamp: i64,
 }
 
 /// 断开连接消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DisconnectMsg {
     pub reason: String,
 }
 
 /// 代理状态消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProxyStatusMsg {
     pub name: String,
 }
 
 /// 代理状态响应消息
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProxyStatusRespMsg {
     pub name: String,
     pub status: String,
@@ -171,6 +178,11 @@ impl ControlConn {
 
     pub async fn write_message(&mut self, msg: &Message) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         write_message(&mut self.conn, msg).await
+    }
+
+    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.conn.write_all(buf).await?;
+        Ok(())
     }
 
     pub fn remote_addr(&self) -> Option<std::net::SocketAddr> {
