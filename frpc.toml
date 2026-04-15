@@ -1,31 +1,45 @@
-# 客户端配置文件
+# ============================================
+# rust_frp 客户端配置文件
+# ============================================
 
 # 服务器连接配置
-server_addr = "127.0.0.1"
-server_port = 7000
-user = "client"
-
-# 启用客户端 Web 管理界面
-[web_server]
-addr = "127.0.0.1"
-port = 7400
-user = "admin"
-password = "admin"
+server_addr = "123.57.86.80"
+server_port = 9300
 
 # 认证配置
 [auth]
 method = "token"
-token = "test_token"
+token = "your_secure_token"
 
 # 传输配置
 [transport]
 protocol = "tcp"
-tls = { enable = true }  # 使用内置证书
+tls = { enable = true }
 
+# ============================================
 # 代理配置
+# ============================================
+
+# HTTP 代理示例
 [[proxies]]
-name = "tcp_proxy"
-type = "tcp"
+name = "http_web"
+type = "http"
 local_ip = "127.0.0.1"
 local_port = 8080
-remote_port = 9305
+custom_domains = ["web.example.com"]
+
+# TCP 代理示例
+[[proxies]]
+name = "tcp_ssh"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 22
+remote_port = 9302
+
+# HTTPS 代理示例
+[[proxies]]
+name = "https_web"
+type = "https"
+local_ip = "127.0.0.1"
+local_port = 8443
+custom_domains = ["secure.example.com"]
