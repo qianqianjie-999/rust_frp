@@ -50,6 +50,7 @@ pub struct ClientProxyManager {
     proxies: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
     listeners: RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::net::TcpListener>>>,
     work_conn_handlers: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+    work_conn_manager: Option<Arc<WorkConnManager>>,
 }
 
 impl ClientProxyManager {
@@ -58,7 +59,12 @@ impl ClientProxyManager {
             proxies: RwLock::new(std::collections::HashMap::new()),
             listeners: RwLock::new(std::collections::HashMap::new()),
             work_conn_handlers: RwLock::new(std::collections::HashMap::new()),
+            work_conn_manager: None,
         }
+    }
+
+    pub fn set_work_conn_manager(&mut self, work_conn_manager: Arc<WorkConnManager>) {
+        self.work_conn_manager = Some(work_conn_manager);
     }
 
     /// 启动工作连接处理器
@@ -155,41 +161,27 @@ impl ClientProxyManager {
         handlers.insert(proxy_name, handle);
     }
 
-    pub async fn start_proxy(&self, config: &rust_frp_config::ProxyConfig) -> Result<Option<mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start_proxy(&self, config: &rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match config.r#type.as_str() {
             "tcp" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
                     .parse::<SocketAddr>()?;
                 log::info!("starting TCP proxy: {} -> {}", config.name, local_addr);
                 
-                // 启动本地监听器
-                let listener = tokio::net::TcpListener::bind(&local_addr).await?;
-                let proxy_name = config.name.clone();
+                // 为 TCP 代理创建工作连接通道
+                // 当服务器收到外部连接时，会通过这个通道通知客户端
+                let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
+                self.start_work_conn_handler(config.name.clone(), local_addr, rx).await;
                 
-                // 使用Arc来共享listener
-                let listener_arc = std::sync::Arc::new(listener);
-                let listener_clone = listener_arc.clone();
+                // 注册工作连接发送器到 WorkConnManager
+                if let Some(work_conn_manager) = &self.work_conn_manager {
+                    work_conn_manager.register_work_conn_handler(config.name.clone(), tx).await;
+                } else {
+                    log::error!("WorkConnManager not set for proxy: {}", config.name);
+                    return Err("WorkConnManager not set".into());
+                }
                 
-                tokio::spawn(async move {
-                    loop {
-                        match listener_clone.accept().await {
-                            Ok((conn, _)) => {
-                                log::info!("new local TCP connection for proxy: {}", proxy_name);
-                                // 这里应该处理本地连接的转发
-                                // 暂时关闭连接
-                                drop(conn);
-                            }
-                            Err(e) => {
-                                log::error!("accept local TCP connection error: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                });
-                
-                let mut listeners = self.listeners.write().await;
-                listeners.insert(config.name.clone(), listener_arc);
-                Ok(None)
+                Ok(())
             }
             "http" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
@@ -200,8 +192,15 @@ impl ClientProxyManager {
                 let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
                 self.start_work_conn_handler(config.name.clone(), local_addr, rx).await;
                 
-                // 返回发送器
-                Ok(Some(tx))
+                // 注册工作连接发送器到 WorkConnManager
+                if let Some(work_conn_manager) = &self.work_conn_manager {
+                    work_conn_manager.register_work_conn_handler(config.name.clone(), tx).await;
+                } else {
+                    log::error!("WorkConnManager not set for proxy: {}", config.name);
+                    return Err("WorkConnManager not set".into());
+                }
+                
+                Ok(())
             }
             "https" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
@@ -212,12 +211,19 @@ impl ClientProxyManager {
                 let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
                 self.start_work_conn_handler(config.name.clone(), local_addr, rx).await;
                 
-                // 返回发送器
-                Ok(Some(tx))
+                // 注册工作连接发送器到 WorkConnManager
+                if let Some(work_conn_manager) = &self.work_conn_manager {
+                    work_conn_manager.register_work_conn_handler(config.name.clone(), tx).await;
+                } else {
+                    log::error!("WorkConnManager not set for proxy: {}", config.name);
+                    return Err("WorkConnManager not set".into());
+                }
+                
+                Ok(())
             }
             _ => {
                 log::warn!("unsupported proxy type: {}", config.r#type);
-                Ok(None)
+                Ok(())
             }
         }
     }
@@ -371,84 +377,163 @@ impl ClientControl {
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        loop {
-            // 发送 ping 消息
-            let ping_msg = rust_frp_core::PingMsg {
-                timestamp: get_timestamp(),
-            };
-            self.conn.write_message(&Message::Ping(ping_msg)).await?;
+        let mut msg_count = 0u32;
+        let ping_interval: u32 = 10; // 每 10 个消息周期发送一次 ping
+        let mut last_ping_time = std::time::Instant::now();
+        
+        log::debug!("ClientControl::run started, waiting for messages...");
 
-            // 读取响应
-            match self.conn.read_message().await {
-                Ok(msg) => {
-                    match msg {
-                        Message::Pong(_) => {
-                            // 收到 pong 消息，继续循环
-                        }
-                        Message::StartWorkConn(start_work_conn_msg) => {
-                            // 处理开始工作连接消息
-                            if !start_work_conn_msg.error.is_empty() {
-                                log::error!("start work conn error: {}", start_work_conn_msg.error);
-                            } else {
-                                log::info!("Received StartWorkConn, establishing work connection");
-                                // 建立工作连接
-                                if let Err(e) = self.establish_work_connection().await {
-                                    log::error!("Failed to establish work connection: {:?}", e);
-                                }
-                            }
-                        }
-                        _ => {
-                            log::warn!("unexpected message: {:?}", msg);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("read message error: {:?}", e);
+        loop {
+            // 定期发送 ping 消息（每 30 秒发送一次）
+            if last_ping_time.elapsed() > std::time::Duration::from_secs(30) {
+                let ping_msg = rust_frp_core::PingMsg {
+                    timestamp: get_timestamp(),
+                };
+                log::debug!("Sending ping message, count: {}", msg_count);
+                if let Err(e) = self.conn.write_message(&Message::Ping(ping_msg)).await {
+                    log::error!("Failed to send ping: {:?}", e);
                     break;
                 }
+                last_ping_time = std::time::Instant::now();
             }
 
-            // 等待一段时间后再次发送 ping
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            log::debug!("Waiting for message, count: {}", msg_count);
+            
+            // 使用带超时的消息读取，避免永久阻塞
+            let msg_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.conn.read_message()
+            ).await;
+
+            match msg_result {
+                Ok(Ok(msg)) => {
+                    msg_count += 1;
+                    log::debug!("=== 成功读取消息 ===");
+                    log::debug!("成功读取消息, 计数: {}", msg_count);
+                    self.handle_message(msg).await;
+                }
+                Ok(Err(e)) => {
+                    log::error!("=== 消息读取失败 ===");
+                    log::error!("Failed to read message from connection: {:?}", e);
+                    break;
+                }
+                Err(_) => {
+                    log::warn!("消息读取超时，继续循环...");
+                    // 超时后继续循环，不中断连接
+                    continue;
+                }
+            }
         }
+
         Ok(())
     }
 
-    async fn establish_work_connection(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 连接到服务器的工作端口
-        let use_tls = self.config.transport.tls.as_ref().map(|t| t.enable).unwrap_or(false);
-        let server_addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
-            .parse::<SocketAddr>()?;
+    /// 处理消息的通用方法
+    async fn handle_message(&self, msg: Message) {
+        match msg {
+            Message::Pong(pong_msg) => {
+                // 收到 pong 消息，继续循环
+                log::debug!("收到 Pong 消息: timestamp={}", pong_msg.timestamp);
+            }
+            Message::ReqWorkConn(req_work_conn_msg) => {
+                // 服务器请求建立工作连接
+                log::debug!("收到 ReqWorkConn 消息: proxy={}", req_work_conn_msg.proxy_name);
+                log::info!("Received ReqWorkConn for proxy: {}", req_work_conn_msg.proxy_name);
+                let proxy_name = req_work_conn_msg.proxy_name.clone();
+                let run_id = self.run_id.clone();
+                let config = self.config.clone();
 
-        let mut work_conn = if use_tls {
-            let tls_config = TlsConfig::new_client()?;
-            let tcp_stream = tokio::net::TcpStream::connect(&server_addr).await?;
-            let tls_stream = tls_config.connect(&self.config.server_addr, tcp_stream).await?;
-            Box::new(tls_stream) as Box<dyn rust_frp_net::FrpConn>
-        } else {
-            let tcp_stream = tokio::net::TcpStream::connect(&server_addr).await?;
-            Box::new(tcp_stream) as Box<dyn rust_frp_net::FrpConn>
-        };
-
-        // 发送 NewWorkConn 消息
-        let new_work_conn_msg = NewWorkConnMsg {
-            run_id: self.run_id.clone(),
-            proxy_name: "".to_string(), // 会在后续确定
-            timestamp: get_timestamp(),
-            sign_key: self.auth_manager.generate_work_conn_sign_key(&self.run_id).await?,
-            use_encryption: false,
-            use_compression: false,
-        };
-        rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
-
-        log::info!("Work connection established");
-        
-        // 这里应该将工作连接交给适当的代理处理
-        // 暂时关闭连接
-        drop(work_conn);
-        
-        Ok(())
+                tokio::spawn(async move {
+                    log::debug!("开始建立工作连接: proxy={}", proxy_name);
+                    if let Err(e) = establish_work_connection(
+                        &proxy_name,
+                        &run_id,
+                        &config,
+                    ).await {
+                        log::error!("Failed to establish work connection for {}: {:?}", proxy_name, e);
+                    } else {
+                        log::debug!("工作连接建立成功: proxy={}", proxy_name);
+                    }
+                });
+            }
+            _ => {
+                log::warn!("unexpected message: {:?}", msg);
+            }
+        }
     }
+}
+
+/// 生成工作连接签名密钥（与服务端 AuthManager::generate_work_conn_sign_key 一致）
+fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
+    use ring::{hmac, digest};
+    // encryption_key = SHA-256(token)
+    let mut hasher = digest::Context::new(&digest::SHA256);
+    hasher.update(token.as_bytes());
+    let encryption_key = hasher.finish();
+
+    // sign_key = HMAC-SHA256(encryption_key, "work_conn:{run_id}")
+    let msg = format!("work_conn:{}", run_id);
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, encryption_key.as_ref());
+    let tag = hmac::sign(&hmac_key, msg.as_bytes());
+    base64::encode(tag.as_ref())
+}
+
+/// 建立工作连接（独立函数，供 ClientControl::run 调用）
+async fn establish_work_connection(
+    proxy_name: &str,
+    run_id: &str,
+    config: &ClientConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 查找代理配置
+    let proxy_config = config.proxies.iter()
+        .find(|p| p.name == proxy_name)
+        .ok_or_else(|| format!("Proxy config not found: {}", proxy_name))?;
+
+    // 连接到服务器的工作连接端口 (server_port + 1000)
+    let work_port = config.server_port + 1000;
+    let work_addr = format!("{}:{}", config.server_addr, work_port);
+
+    let mut work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
+    log::info!("Connected to server work conn port: {}", work_addr);
+
+    // 生成 sign_key
+    let sign_key = config.auth.token.as_ref()
+        .map(|token| generate_work_conn_sign_key(token, run_id))
+        .unwrap_or_default();
+
+    // 发送 NewWorkConn 消息
+    let new_work_conn_msg = NewWorkConnMsg {
+        run_id: run_id.to_string(),
+        proxy_name: proxy_name.to_string(),
+        timestamp: get_timestamp(),
+        sign_key,
+        use_encryption: false,
+        use_compression: false,
+    };
+    rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
+
+    // 等待 StartWorkConn 响应
+    let resp = rust_frp_core::read_message(&mut work_conn).await?;
+    match resp {
+        Message::StartWorkConn(start_msg) => {
+            if !start_msg.error.is_empty() {
+                return Err(format!("Server error: {}", start_msg.error).into());
+            }
+            log::info!("Work conn established for proxy: {}", proxy_name);
+        }
+        _ => {
+            return Err("Unexpected response from server".into());
+        }
+    }
+
+    // 连接到本地服务
+    let local_addr = format!("{}:{}", proxy_config.local_ip, proxy_config.local_port);
+    let local_conn = tokio::net::TcpStream::connect(&local_addr).await?;
+    log::info!("Connected to local service: {}", local_addr);
+
+    // 双向桥接工作连接和本地连接
+    rust_frp_util::bridge_connections(work_conn, local_conn).await?;
+    Ok(())
 }
 
 /// Web 服务器
@@ -523,9 +608,14 @@ pub struct Client {
 impl Client {
     pub fn new(config: ClientConfig, config_path: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let auth_manager = Arc::new(AuthManager::new(&config.auth).map_err(|e| e.to_string())?);
-        let proxy_manager = Arc::new(ClientProxyManager::new());
-        let visitor_manager = Arc::new(ClientVisitorManager::new());
+        
+        // 先创建可变的 proxy_manager，设置 work_conn_manager，再包装成 Arc
+        let mut proxy_manager_instance = ClientProxyManager::new();
         let work_conn_manager = Arc::new(WorkConnManager::new());
+        proxy_manager_instance.set_work_conn_manager(work_conn_manager.clone());
+        let proxy_manager = Arc::new(proxy_manager_instance);
+        
+        let visitor_manager = Arc::new(ClientVisitorManager::new());
         let connector = Connector::new(config.clone())?;
 
         let mut web_server = None;

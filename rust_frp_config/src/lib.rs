@@ -5,7 +5,7 @@ use std::path::Path;
 use glob::glob;
 
 /// 服务器配置
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct ServerConfig {
     pub bind_addr: String,
@@ -15,6 +15,8 @@ pub struct ServerConfig {
     pub vhost_http_port: Option<u16>,
     pub vhost_https_port: Option<u16>,
     pub tcpmux_http_connect_port: Option<u16>,
+    /// 工作连接端口，用于客户端建立工作连接
+    pub work_conn_port: Option<u16>,
     pub web_server: WebServerConfig,
     pub auth: AuthConfig,
     pub transport: TransportConfig,
@@ -22,6 +24,28 @@ pub struct ServerConfig {
     pub custom_404_page: Option<String>,
     pub includes: Option<Vec<String>>,
     pub proxies: Vec<ProxyConfig>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: "0.0.0.0".to_string(),
+            bind_port: 7000,
+            kcp_bind_port: None,
+            quic_bind_port: None,
+            vhost_http_port: None,
+            vhost_https_port: None,
+            tcpmux_http_connect_port: None,
+            work_conn_port: None,
+            web_server: WebServerConfig::default(),
+            auth: AuthConfig::default(),
+            transport: TransportConfig::default(),
+            allow_ports: None,
+            custom_404_page: None,
+            includes: None,
+            proxies: Vec::new(),
+        }
+    }
 }
 
 /// 客户端配置
@@ -58,7 +82,7 @@ impl Default for ClientConfig {
 }
 
 /// Web 服务器配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct WebServerConfig {
     pub addr: String,
@@ -66,18 +90,6 @@ pub struct WebServerConfig {
     pub user: Option<String>,
     pub password: Option<String>,
     pub tls: Option<TlsConfig>,
-}
-
-impl Default for WebServerConfig {
-    fn default() -> Self {
-        Self {
-            addr: "0.0.0.0".to_string(),
-            port: 0,
-            user: None,
-            password: None,
-            tls: None,
-        }
-    }
 }
 
 /// 认证配置
@@ -231,7 +243,7 @@ pub struct ConfigLoader;
 impl ConfigLoader {
     /// 从文件加载服务器配置
     pub fn load_server_config<P: AsRef<Path>>(path: P) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-        let mut config = Self::load_config_from_file(path)?;
+        let mut config: ServerConfig = Self::load_config_from_file(path)?;
         Self::process_includes(&mut config)?;
         Self::replace_environment_variables(&mut config)?;
         Self::validate_server_config(&config)?;
@@ -252,13 +264,14 @@ impl ConfigLoader {
         let mut file = File::open(path)?;
         let mut content = String::new();
         file.read_to_string(&mut content)?;
+        log::debug!("Raw config content: {}", content);
         Self::parse_config(&content)
     }
 
     /// 解析配置
     fn parse_config<T: serde::de::DeserializeOwned + Default>(content: &str) -> Result<T, Box<dyn std::error::Error>> {
         log::info!("Trying to parse config as TOML");
-        match toml::from_str(content) {
+        match toml::from_str::<T>(content) {
             Ok(config) => {
                 log::info!("Successfully parsed config as TOML");
                 return Ok(config);
@@ -268,7 +281,7 @@ impl ConfigLoader {
             }
         }
         log::info!("Trying to parse config as YAML");
-        match serde_yaml::from_str(content) {
+        match serde_yaml::from_str::<T>(content) {
             Ok(config) => {
                 log::info!("Successfully parsed config as YAML");
                 return Ok(config);
@@ -381,13 +394,47 @@ impl ConfigLoader {
         target.visitors.extend(source.visitors.clone());
     }
 
+    /// 替换字符串中的环境变量 ${VAR_NAME}
+    fn replace_env_vars(s: &str) -> String {
+        let mut result = s.to_string();
+        // 查找 ${...} 模式并替换为环境变量值
+        while let Some(start) = result.find("${") {
+            if let Some(end) = result[start + 2..].find('}') {
+                let var_name = &result[start + 2..start + 2 + end];
+                let var_value = std::env::var(var_name).unwrap_or_default();
+                result.replace_range(start..start + 3 + end, &var_value);
+            } else {
+                break;
+            }
+        }
+        result
+    }
+
     /// 替换环境变量
-    fn replace_environment_variables(_config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_environment_variables(config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+        config.bind_addr = Self::replace_env_vars(&config.bind_addr);
+        if let Some(ref mut includes) = config.includes {
+            for item in includes.iter_mut() {
+                *item = Self::replace_env_vars(item);
+            }
+        }
+        for proxy in config.proxies.iter_mut() {
+            proxy.local_ip = Self::replace_env_vars(&proxy.local_ip);
+        }
         Ok(())
     }
 
     /// 替换环境变量
-    fn replace_environment_variables_client(_config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_environment_variables_client(config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
+        config.server_addr = Self::replace_env_vars(&config.server_addr);
+        if let Some(ref mut includes) = config.includes {
+            for item in includes.iter_mut() {
+                *item = Self::replace_env_vars(item);
+            }
+        }
+        for proxy in config.proxies.iter_mut() {
+            proxy.local_ip = Self::replace_env_vars(&proxy.local_ip);
+        }
         Ok(())
     }
 

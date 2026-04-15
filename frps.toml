@@ -1,6 +1,24 @@
-# 服务器基本配置
+# ============================================
+# rust_frp 服务器配置文件
+# ============================================
+#
+# 【重要】TOML 格式要求：
+#   - 顶级键值对（如 vhost_http_port）必须写在 [table] 之前！
+#   - [table] 定义之后不能有顶级键值对
+#
+
+# 服务器基本配置（必须在 [table] 之前）
 bind_addr = "0.0.0.0"
-bind_port = 7000
+bind_port = 9300
+
+# 工作连接端口（客户端建立工作代理连接的端口）
+# 如果不配置，默认使用 bind_port + 1000 = 10300
+work_conn_port = 10300
+
+# HTTP/HTTPS 虚主机端口（必须在 [table] 之前）
+# 如果不配置，将使用默认值：HTTP=9090, HTTPS=9091
+vhost_http_port = 9090
+vhost_https_port = 9091
 
 # Web 服务器配置
 [web_server]
@@ -13,7 +31,7 @@ tls = { enable = false }
 # 认证配置
 [auth]
 method = "token"
-token = "test_token"
+token = "your_secure_token"
 
 # 传输配置
 [transport]

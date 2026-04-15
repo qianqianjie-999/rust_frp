@@ -13,12 +13,12 @@ impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
 /// 插件接口
 #[async_trait]
 pub trait Plugin: Send + Sync {
-    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>>;
+    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// 插件工厂
 pub trait PluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error>>;
+    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Unix 域套接字插件
@@ -27,7 +27,7 @@ pub struct UnixDomainSocketPlugin {
 }
 
 impl UnixDomainSocketPlugin {
-    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(unix_path) = &config.unix_path {
             Ok(Self {
                 unix_path: unix_path.clone(),
@@ -43,7 +43,7 @@ impl UnixDomainSocketPlugin {
 
 #[async_trait]
 impl Plugin for UnixDomainSocketPlugin {
-    async fn handle(&mut self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle(&mut self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 连接到 Unix 域套接字
         let mut unix_conn = UnixStream::connect(&self.unix_path).await?;
 
@@ -63,7 +63,7 @@ pub struct StaticFilePlugin {
 }
 
 impl StaticFilePlugin {
-    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(local_path) = &config.local_path {
             Ok(Self {
                 local_path: local_path.clone(),
@@ -80,7 +80,7 @@ impl StaticFilePlugin {
     }
 
     /// 处理 HTTP 请求
-    async fn handle_http_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_http_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取 HTTP 请求
         let mut buf = [0; 1024];
         let n = conn.read(&mut buf).await?;
@@ -147,7 +147,7 @@ impl StaticFilePlugin {
     }
 
     /// 提供文件
-    async fn serve_file(&self, file_path: &str, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn serve_file(&self, file_path: &str, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let path = Path::new(file_path);
 
         // 检查文件是否存在
@@ -183,7 +183,7 @@ impl StaticFilePlugin {
 
 #[async_trait]
 impl Plugin for StaticFilePlugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.handle_http_request(conn).await
     }
 }
@@ -196,7 +196,7 @@ pub struct HttpProxyPlugin {
 }
 
 impl HttpProxyPlugin {
-    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
             http_user: config.http_user.clone(),
             http_password: config.http_password.clone(),
@@ -204,7 +204,7 @@ impl HttpProxyPlugin {
     }
 
     /// 处理 HTTP 代理请求
-    async fn handle_http_proxy_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_http_proxy_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取 HTTP 请求
         let mut buf = [0; 1024];
         let n = conn.read(&mut buf).await?;
@@ -247,7 +247,7 @@ impl HttpProxyPlugin {
 
 #[async_trait]
 impl Plugin for HttpProxyPlugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.handle_http_proxy_request(conn).await
     }
 }
@@ -260,7 +260,7 @@ pub struct Socks5Plugin {
 }
 
 impl Socks5Plugin {
-    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
             username: config.http_user.clone(),
             password: config.http_password.clone(),
@@ -268,7 +268,7 @@ impl Socks5Plugin {
     }
 
     /// 处理 SOCKS5 代理请求
-    async fn handle_socks5_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_socks5_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取 SOCKS5 握手请求
         let mut buf = [0; 256];
         let n = conn.read(&mut buf).await?;
@@ -370,7 +370,7 @@ impl Socks5Plugin {
 
 #[async_trait]
 impl Plugin for Socks5Plugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.handle_socks5_request(conn).await
     }
 }
@@ -395,7 +395,7 @@ impl PluginManager {
         }
     }
 
-    pub fn create_plugin(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error>> {
+    pub fn create_plugin(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(factory) = self.factories.get(&config.r#type) {
             factory.create(config)
         } else {
@@ -419,7 +419,7 @@ impl PluginManager {
 struct UnixDomainSocketPluginFactory {}
 
 impl PluginFactory for UnixDomainSocketPluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error>> {
+    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(UnixDomainSocketPlugin::new(config)?))
     }
 }
@@ -428,7 +428,7 @@ impl PluginFactory for UnixDomainSocketPluginFactory {
 struct StaticFilePluginFactory {}
 
 impl PluginFactory for StaticFilePluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error>> {
+    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(StaticFilePlugin::new(config)?))
     }
 }
@@ -437,7 +437,7 @@ impl PluginFactory for StaticFilePluginFactory {
 struct HttpProxyPluginFactory {}
 
 impl PluginFactory for HttpProxyPluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error>> {
+    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(HttpProxyPlugin::new(config)?))
     }
 }
@@ -446,7 +446,7 @@ impl PluginFactory for HttpProxyPluginFactory {
 struct Socks5PluginFactory {}
 
 impl PluginFactory for Socks5PluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error>> {
+    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(Socks5Plugin::new(config)?))
     }
 }
