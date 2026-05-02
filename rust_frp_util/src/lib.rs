@@ -40,31 +40,18 @@ pub async fn bridge_connections(
 /// 桥接任意两个双向流，实现双向数据转发
 /// 支持 TcpStream、TLS stream 等任何实现 AsyncRead + AsyncWrite 的类型
 pub async fn bridge_streams<S1, S2>(
-    stream1: S1,
-    stream2: S2,
+    mut stream1: S1,
+    mut stream2: S2,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut r1, mut w1) = tokio::io::split(stream1);
-    let (mut r2, mut w2) = tokio::io::split(stream2);
-
-    tokio::select! {
-        result = tokio::io::copy(&mut r1, &mut w2) => {
-            match result {
-                Ok(n) => log::debug!("Copied {} bytes from stream1 to stream2", n),
-                Err(e) => log::debug!("Copy from stream1 to stream2 error: {:?}", e),
-            }
-        }
-        result = tokio::io::copy(&mut r2, &mut w1) => {
-            match result {
-                Ok(n) => log::debug!("Copied {} bytes from stream2 to stream1", n),
-                Err(e) => log::debug!("Copy from stream2 to stream1 error: {:?}", e),
-            }
-        }
-    }
-
+    // 使用 tokio::io::copy_bidirectional，它会在两个方向上同时复制数据
+    // 并且不会在一个方向完成时取消另一个方向的复制，防止数据丢失
+    let (n1, n2) = tokio::io::copy_bidirectional(&mut stream1, &mut stream2).await?;
+    
+    log::debug!("Bridge complete: stream1->stream2: {} bytes, stream2->stream1: {} bytes", n1, n2);
     log::info!("Bridge streams closed");
     Ok(())
 }

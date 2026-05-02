@@ -149,23 +149,41 @@ impl StaticFilePlugin {
     /// 提供文件
     async fn serve_file(&self, file_path: &str, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let path = Path::new(file_path);
+        
+        // 检查路径是否在允许目录内，防止路径遍历攻击
+        let canonical_path = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                let response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nFile not found";
+                conn.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+        
+        let base_path = Path::new(&self.local_path).canonicalize()?;
+        if !canonical_path.starts_with(base_path) {
+            // 检测到路径遍历攻击
+            let response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nAccess forbidden";
+            conn.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
 
         // 检查文件是否存在
-        if !path.exists() {
+        if !canonical_path.exists() {
             let response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nFile not found";
             conn.write_all(response.as_bytes()).await?;
             return Ok(());
         }
 
         // 检查是否是文件
-        if !path.is_file() {
+        if !canonical_path.is_file() {
             let response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nForbidden";
             conn.write_all(response.as_bytes()).await?;
             return Ok(());
         }
 
         // 读取文件内容
-        let mut file = File::open(path)?;
+        let mut file = File::open(&canonical_path)?;
         let mut content = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut content)?;
 
