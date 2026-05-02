@@ -2,7 +2,16 @@ use async_trait::async_trait;
 use rust_frp_config::{AuthConfig, OidcConfig};
 use ring::hmac;
 use ring::digest;
+use ring::constant_time;
 use base64::encode;
+
+/// 常量时间比较函数，防止时序攻击
+fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    constant_time::verify_slices_are_equal(a, b).is_ok()
+}
 
 /// 认证验证器 trait
 #[async_trait]
@@ -35,7 +44,8 @@ impl TokenAuthVerifier {
 #[async_trait]
 impl AuthVerifier for TokenAuthVerifier {
     async fn verify_login(&self, _user: &str, token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if token == self.token {
+        // 使用 ring 的 constant_time_eq 进行安全比较，防止时序攻击
+        if constant_time_compare(token.as_bytes(), self.token.as_bytes()) {
             Ok(())
         } else {
             Err(Box::new(std::io::Error::new(
