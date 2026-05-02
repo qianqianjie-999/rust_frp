@@ -139,11 +139,23 @@ pub struct ProxyStatusRespMsg {
     pub error: String,
 }
 
+/// 最大消息大小 (10MB)，防止内存耗尽攻击
+const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+
 /// 消息读取器
 pub async fn read_message<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
     let mut len_buf = [0; 4];
     conn.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    
+    // 检查消息大小是否在安全范围内
+    if len > MAX_MESSAGE_SIZE {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("message size too large: {} bytes (max: {})", len, MAX_MESSAGE_SIZE),
+        )));
+    }
+    
     let mut msg_buf = vec![0; len];
     conn.read_exact(&mut msg_buf).await?;
     let msg: Message = serde_json::from_slice(&msg_buf)?;
