@@ -199,7 +199,7 @@ impl ConnPool {
     pub async fn get(&self) -> Result<PooledConn, std::io::Error> {
         // 获取许可
         let _permit = self.semaphore.acquire().await.map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to acquire semaphore: {}", e))
+            std::io::Error::other(format!("Failed to acquire semaphore: {}", e))
         })?;
 
         // 首先尝试从池中获取空闲连接

@@ -83,17 +83,37 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::io::AsyncWriteExt;
-use warp::Filter;
+use axum::{Router, routing::get, Json, extract::State};
 use rust_frp_config::ClientConfig;
 use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager, NewWorkConnMsg};
 use rust_frp_net::{ConnManager, TlsConfig};
 use rust_frp_auth::AuthManager;
 use rust_frp_util::{get_timestamp, rand_id, retry::{RetryConfig, retry, ConnectionError}};
 
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("no work conn handler for proxy: {0}")]
+    NoWorkConnHandler(String),
+    #[error("WorkConnManager not set")]
+    WorkConnManagerNotSet,
+    #[error("{0}")]
+    Other(String),
+}
+
+type WorkConnSenderMap = RwLock<std::collections::HashMap<String, mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>>;
+
 /// 工作连接管理器
 pub struct WorkConnManager {
     // proxy_name -> sender for incoming connections (with initial data)
-    work_conn_senders: RwLock<std::collections::HashMap<String, mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>>,
+    work_conn_senders: WorkConnSenderMap,
+}
+
+impl Default for WorkConnManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkConnManager {
@@ -132,6 +152,12 @@ pub struct ClientProxyManager {
     listeners: RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::net::TcpListener>>>,
     work_conn_handlers: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     work_conn_manager: Option<Arc<WorkConnManager>>,
+}
+
+impl Default for ClientProxyManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClientProxyManager {
@@ -375,6 +401,12 @@ impl ProxyManager for ClientProxyManager {
 /// 客户端访问者管理器
 pub struct ClientVisitorManager {
     visitors: RwLock<std::collections::HashMap<String, rust_frp_config::VisitorConfig>>,
+}
+
+impl Default for ClientVisitorManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClientVisitorManager {
@@ -648,6 +680,13 @@ pub struct WebServer {
     server: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Web 服务器共享状态
+#[derive(Clone)]
+struct WebServerState {
+    proxy_manager: Arc<ClientProxyManager>,
+    visitor_manager: Arc<ClientVisitorManager>,
+}
+
 impl WebServer {
     pub fn new(config: &rust_frp_config::WebServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", config.addr, config.port).parse::<SocketAddr>()?;
@@ -658,44 +697,48 @@ impl WebServer {
     }
 
     pub async fn start(&mut self, client: &Client) -> Result<(), Box<dyn std::error::Error>> {
-        let client1 = client.clone();
-        let client2 = client.clone();
-
-        // 健康检查
-        let health = warp::path!("health").map(|| {
-            warp::reply::json(&serde_json::json!({
-                "status": "ok",
-                "timestamp": get_timestamp(),
-            }))
+        let state = Arc::new(WebServerState {
+            proxy_manager: client.proxy_manager.clone(),
+            visitor_manager: client.visitor_manager.clone(),
         });
 
-        // 代理列表
-        let proxies = warp::path!("proxies").and_then(move || {
-            let client = client1.clone();
-            async move {
-                let proxies = client.proxy_manager.proxies.read().await;
-                let proxy_list: Vec<rust_frp_config::ProxyConfig> = proxies.values().cloned().collect();
-                Ok::<_, warp::Rejection>(warp::reply::json(&proxy_list))
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .route("/proxies", get(proxies_handler))
+            .route("/visitors", get(visitors_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        let handle = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                log::error!("Web server error: {:?}", e);
             }
         });
-
-        // 访问者列表
-        let visitors = warp::path!("visitors").and_then(move || {
-            let client = client2.clone();
-            async move {
-                let visitors = client.visitor_manager.visitors.read().await;
-                let visitor_list: Vec<rust_frp_config::VisitorConfig> = visitors.values().cloned().collect();
-                Ok::<_, warp::Rejection>(warp::reply::json(&visitor_list))
-            }
-        });
-
-        let routes = health.or(proxies).or(visitors);
-        let server = warp::serve(routes).bind(self.addr);
-        let handle = tokio::spawn(server);
         self.server = Some(handle);
 
         Ok(())
     }
+}
+
+async fn health_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "timestamp": get_timestamp(),
+    }))
+}
+
+async fn proxies_handler(
+    State(state): State<Arc<WebServerState>>,
+) -> Json<Vec<rust_frp_config::ProxyConfig>> {
+    let proxies = state.proxy_manager.proxies.read().await;
+    Json(proxies.values().cloned().collect())
+}
+
+async fn visitors_handler(
+    State(state): State<Arc<WebServerState>>,
+) -> Json<Vec<rust_frp_config::VisitorConfig>> {
+    let visitors = state.visitor_manager.visitors.read().await;
+    Json(visitors.values().cloned().collect())
 }
 
 /// 客户端服务
@@ -875,8 +918,7 @@ impl Client {
             match msg {
                 Message::RegisterProxyResp(resp) => {
                     if !resp.error.is_empty() {
-                        return Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Err(Box::new(std::io::Error::other(
                             format!("Failed to register proxy {}: {}", proxy.name, resp.error),
                         )));
                     }
@@ -919,12 +961,12 @@ impl Client {
             os: std::env::consts::OS.to_string(),
             hostname: hostname.clone(),
             pool_count: self.config.transport.pool_count,
-            user: self.config.user.clone().unwrap_or_else(|| "".to_string()),
+            user: self.config.user.clone().unwrap_or_default(),
             client_id: self.config.client_id.clone().unwrap_or(hostname),
             version: "0.1.0".to_string(),
             timestamp: get_timestamp(),
             run_id: run_id.clone(),
-            token: self.config.auth.token.clone().unwrap_or_else(|| "".to_string()),
+            token: self.config.auth.token.clone().unwrap_or_default(),
             metas: std::collections::HashMap::new(),
             client_spec: None,
         };

@@ -499,6 +499,12 @@ impl PluginManager {
     }
 }
 
+impl Default for PluginManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Unix 域套接字插件工厂
 struct UnixDomainSocketPluginFactory {}
 

@@ -47,6 +47,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::{SocketAddr, ToSocketAddrs};
 
+#[derive(Debug, thiserror::Error)]
+pub enum UtilError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid address: {0}")]
+    InvalidAddress(String),
+}
+
 /// 获取当前时间戳（秒）
 pub fn get_timestamp() -> i64 {
     SystemTime::now()
@@ -79,9 +87,72 @@ pub fn rand_id(len: usize) -> String {
 pub async fn bridge_connections(
     conn1: tokio::net::TcpStream,
     conn2: tokio::net::TcpStream,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    bridge_streams(conn1, conn2).await
+) -> Result<(), std::io::Error> {
+    let (mut r1, mut w1) = tokio::io::split(conn1);
+    let (mut r2, mut w2) = tokio::io::split(conn2);
+
+    let s_to_c = tokio::io::copy(&mut r1, &mut w2);
+    let c_to_s = tokio::io::copy(&mut r2, &mut w1);
+
+    tokio::select! {
+        r = s_to_c => { r.map(|_| ())?; }
+        r = c_to_s => { r.map(|_| ())?; }
+    }
+
+    Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_timestamp() {
+        let ts1 = get_timestamp();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let ts2 = get_timestamp();
+        assert!(ts2 >= ts1);
+    }
+
+    #[test]
+    fn test_rand_id_length() {
+        let id = rand_id(16);
+        assert_eq!(id.len(), 16);
+    }
+
+    #[test]
+    fn test_rand_id_uniqueness() {
+        let id1 = rand_id(32);
+        let id2 = rand_id(32);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_rand_id_zero_length() {
+        let id = rand_id(0);
+        assert_eq!(id.len(), 0);
+    }
+
+    #[test]
+    fn test_rand_id_alphanumeric() {
+        let id = rand_id(100);
+        for c in id.chars() {
+            assert!(c.is_ascii_alphanumeric());
+        }
+    }
+
+    #[test]
+    fn test_parse_addr_valid() {
+        let addr = parse_addr("127.0.0.1:8080").unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_parse_addr_invalid() {
+        assert!(parse_addr("invalid_address").is_err());
+    }
+}
+
 
 /// 桥接任意两个双向流，实现双向数据转发
 /// 支持 TcpStream、TLS stream 等任何实现 AsyncRead + AsyncWrite 的类型

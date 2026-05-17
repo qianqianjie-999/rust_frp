@@ -127,10 +127,36 @@ use rust_frp_net::{TcpListener, UdpListener, TlsConfig, ConnManager};
 use rust_frp_auth::AuthManager;
 use rust_frp_util::get_timestamp;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("authentication failed: {0}")]
+    Auth(String),
+    #[error("proxy not found: {0}")]
+    ProxyNotFound(String),
+    #[error("port not allowed: {0}")]
+    PortNotAllowed(u16),
+    #[error("proxy already exists: {0}")]
+    ProxyAlreadyExists(String),
+    #[error("work conn request timeout")]
+    WorkConnTimeout,
+    #[error("run ID mismatch")]
+    RunIdMismatch,
+    #[error("{0}")]
+    Other(String),
+}
+
 /// 工作连接管理器
 pub struct WorkConnManager {
     /// 等待工作连接的通道 (proxy_name, sender)
     pending_conns: RwLock<std::collections::HashMap<String, mpsc::Sender<tokio::net::TcpStream>>>,
+}
+
+impl Default for WorkConnManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkConnManager {
@@ -180,6 +206,12 @@ pub struct ServerWorkConnManager {
     pending: RwLock<std::collections::HashMap<String, PendingWorkConn>>,
     /// 请求计数器，用于生成唯一 key
     request_counter: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for ServerWorkConnManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServerWorkConnManager {
@@ -391,6 +423,12 @@ pub struct HttpVhostRouter {
     proxy_configs: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
 }
 
+impl Default for HttpVhostRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HttpVhostRouter {
     pub fn new() -> Self {
         Self {
@@ -455,6 +493,12 @@ pub struct MonitorMetrics {
     bytes_sent: AtomicUsize,
     bytes_received: AtomicUsize,
     start_time: Instant,
+}
+
+impl Default for MonitorMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MonitorMetrics {
@@ -538,6 +582,7 @@ pub struct Control {
 }
 
 impl Control {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conn: ControlConn,
         run_id: String,
@@ -782,6 +827,12 @@ pub struct ControlManager {
     clients: RwLock<std::collections::HashMap<String, ClientInfo>>,
 }
 
+impl Default for ControlManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ControlManager {
     pub fn new() -> Self {
         Self {
@@ -839,9 +890,11 @@ impl ControlManager {
 }
 
 /// 服务器代理管理器
+type ListenerMap = Arc<RwLock<std::collections::HashMap<String, (std::sync::Arc<tokio::net::TcpListener>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>>;
+
 pub struct ServerProxyManager {
     proxies: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
-    listeners: Arc<RwLock<std::collections::HashMap<String, (std::sync::Arc<tokio::net::TcpListener>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>>,
+    listeners: ListenerMap,
     http_vhost_router: Arc<HttpVhostRouter>,
     /// 代理所有权映射 (proxy_name -> run_id)
     proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
@@ -1203,6 +1256,12 @@ pub struct ServerVisitorManager {
     visitors: RwLock<std::collections::HashMap<String, rust_frp_config::VisitorConfig>>,
 }
 
+impl Default for ServerVisitorManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServerVisitorManager {
     pub fn new() -> Self {
         Self {
@@ -1249,21 +1308,21 @@ fn create_routes(
         .route("/logout", axum::routing::get(logout_handler))
         .with_state(server);
 
-    if user.is_some() && password.is_some() {
+    if let (Some(ref user_val), Some(ref password_val)) = (&user, &password) {
         log::info!("Web server authentication enabled");
-        let web_user = user.clone().unwrap();
-        let web_password = password.clone().unwrap();
+        let web_user = user_val.clone();
+        let web_password = password_val.clone();
         
         std::thread::spawn(move || {
             std::env::set_var("FRP_WEB_USER", web_user);
             std::env::set_var("FRP_WEB_PASSWORD", web_password);
         });
         
-        let user = user.unwrap();
-        let password = password.unwrap();
+        let auth_user = user_val.clone();
+        let auth_password = password_val.clone();
         app.layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
-            let user = user.clone();
-            let password = password.clone();
+            let user = auth_user.clone();
+            let password = auth_password.clone();
             async move {
                 let path = request.uri().path();
                 
@@ -1353,8 +1412,7 @@ async fn proxies_handler(
     
     let proxy_list: Vec<serde_json::Value> = proxies.values().map(|proxy| {
         let client_id = owners.get(&proxy.name)
-            .and_then(|run_id| client_map.get(run_id))
-            .map(|s| s.clone())
+            .and_then(|run_id| client_map.get(run_id)).cloned()
             .unwrap_or_else(|| "-".to_string());
         
         serde_json::json!({
@@ -1941,10 +1999,11 @@ impl Server {
             Some(name) => name,
             None => {
                 log::warn!("no proxy found for host: {}", request_info.host);
+                let body = format!("Proxy not found for host: {}", request_info.host);
+                let content_len = body.len();
                 let response = format!(
                     "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                    request_info.host.len() + 24,
-                    format!("Proxy not found for host: {}", request_info.host)
+                    content_len, body
                 );
                 conn.write_all(response.as_bytes()).await?;
                 return Ok(());
@@ -2091,10 +2150,11 @@ impl Server {
             Some(name) => name,
             None => {
                 log::warn!("no proxy found for host: {}", request_info.host);
+                let body = format!("Proxy not found for host: {}", request_info.host);
+                let content_len = body.len();
                 let response = format!(
                     "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                    request_info.host.len() + 24,
-                    format!("Proxy not found for host: {}", request_info.host)
+                    content_len, body
                 );
                 conn.write_all(response.as_bytes()).await?;
                 return Ok(());
