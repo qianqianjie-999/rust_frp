@@ -29,4 +29,11 @@ warp = "0.3"
 hostname = "0.3"
 ring = "0.16"
 base64 = "0.13"
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "auth"] }
+rustls = "0.23"
+tokio-rustls = "0.25"
+rustls-pemfile = "2.0"
+urlencoding = "2.1"
 

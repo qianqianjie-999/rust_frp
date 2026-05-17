@@ -1,8 +1,9 @@
 [target.x86_64-unknown-linux-musl]
-rustflags = [
-    "-C", "target-feature=+crt-static",
-    "-C", "link-self-contained=yes",
-]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-s"]
 
-[build]
-target = "x86_64-unknown-linux-musl"
+[profile.release]
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true

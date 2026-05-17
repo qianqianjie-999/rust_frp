@@ -1,3 +1,49 @@
+//! FRP 工具函数模块
+//!
+//! 该模块提供了 FRP 项目中常用的工具函数，包括：
+//!
+//! ## 主要功能
+//!
+//! 1. **时间戳获取**
+//!    - `get_timestamp()`: 获取当前 Unix 时间戳（秒）
+//!
+//! 2. **地址解析**
+//!    - `parse_addr()`: 将地址字符串解析为 SocketAddr
+//!    - 支持域名解析
+//!
+//! 3. **随机 ID 生成**
+//!    - `rand_id()`: 生成指定长度的随机字符串
+//!    - 用于生成唯一的 run_id、client_id 等标识符
+//!
+//! 4. **连接桥接**
+//!    - `bridge_connections()`: 桥接两个 TCP 连接，实现双向数据转发
+//!    - `bridge_streams()`: 桥接任意两个异步流，支持更广泛的类型
+//!
+//! 5. **重试机制**
+//!    - `retry()`: 执行带重试的操作
+//!    - 支持指数退避策略
+//!    - 可配置最大重试次数和延迟
+//!
+//! ## 使用示例
+//!
+//! ```rust,ignore
+//! // 生成随机 ID
+//! let run_id = rand_id(16);
+//!
+//! // 桥接两个连接
+//! bridge_connections(conn1, conn2).await?;
+//!
+//! // 带重试的操作
+//! let result = retry(&config, "connect", || async {
+//!     connect_to_server().await
+//! }).await?;
+//! ```
+//!
+//! ## 安全性
+//!
+//! - 随机 ID 使用安全的随机数生成器
+//! - 连接桥接保证数据完整性
+
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::{SocketAddr, ToSocketAddrs};
 

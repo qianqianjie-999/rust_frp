@@ -1,3 +1,69 @@
+//! FRP 插件系统模块
+//!
+//! 该模块实现了 FRP 的插件系统，允许在代理连接上执行自定义处理逻辑。
+//!
+//! ## 支持的插件类型
+//!
+//! 1. **UnixDomainSocketPlugin (Unix 域套接字)**
+//!    - 将外部连接转发到 Unix 域套接字
+//!    - 常用于本地服务暴露
+//!
+//! 2. **StaticFilePlugin (静态文件)**
+//!    - 提供本地文件作为 HTTP 响应
+//!    - 支持路径前缀剥离
+//!    - 内置路径遍历攻击防护
+//!
+//! 3. **HttpProxyPlugin (HTTP 代理)**
+//!    - 实现 HTTP CONNECT 代理功能
+//!    - 支持隧道穿过防火墙
+//!
+//! 4. **Socks5Plugin (SOCKS5 代理)**
+//!    - 实现 SOCKS5 协议
+//!    - 支持域名和 IPv4 地址
+//!
+//! ## 架构图
+//!
+//! ```text
+//!                    ┌─────────────────────┐
+//!                    │   PluginManager      │
+//!                    │  (插件管理器)        │
+//!                    └─────────────────────┘
+//!                              │
+//!              ┌───────────────┼───────────────┐
+//!              ▼               ▼               ▼
+//!        ┌──────────┐    ┌──────────┐    ┌──────────┐
+//!        │  Unix    │    │  Static  │    │  SOCKS5  │
+//!        │  Domain  │    │  File    │    │  Proxy   │
+//!        │  Socket  │    │          │    │          │
+//!        └──────────┘    └──────────┘    └──────────┘
+//!              │               │               │
+//!              └───────────────┴───────────────┘
+//!                              │
+//!                              ▼
+//!                    ┌─────────────────────┐
+//!                    │    Plugin trait      │
+//!                    │  handle(conn) -> ()  │
+//!                    └─────────────────────┘
+//! ```
+//!
+//! ## 安全性
+//!
+//! - 静态文件插件防止路径遍历攻击
+//! - 使用规范化路径比较
+//! - 验证文件在允许目录内
+//!
+//! ## 使用示例
+//!
+//! ```toml
+//! [[proxies]]
+//! name = "unix_sock"
+//! type = "tcp"
+//! remote_port = 6000
+//! [proxies.plugin]
+//! type = "unix_domain_socket"
+//! unix_path = "/var/run/docker.sock"
+//! ```
+
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
