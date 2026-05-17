@@ -1787,7 +1787,14 @@ impl Server {
                     let am = auth_manager.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Self::process_work_conn(conn, cm, wcm, am).await {
-                            log::error!("Failed to process work connection: {:?}", e);
+                            if e.to_string().to_lowercase().contains("connection reset")
+                                || e.to_string().to_lowercase().contains("connection aborted")
+                                || e.to_string().to_lowercase().contains("broken pipe")
+                            {
+                                log::debug!("Work connection closed (peer disconnected): {:?}", e);
+                            } else {
+                                log::error!("Failed to process work connection: {:?}", e);
+                            }
                         }
                     });
                 }
@@ -1896,7 +1903,14 @@ impl Server {
 
                         tokio::spawn(async move {
                             if let Err(e) = Self::handle_http_vhost_connection(conn, router, po, cm, wcm, am).await {
-                                log::error!("handle http vhost connection error: {:?}", e);
+                                if e.to_string().to_lowercase().contains("connection reset")
+                                    || e.to_string().to_lowercase().contains("connection aborted")
+                                    || e.to_string().to_lowercase().contains("broken pipe")
+                                {
+                                    log::debug!("HTTP vhost connection closed (peer disconnected): {:?}", e);
+                                } else {
+                                    log::error!("handle http vhost connection error: {:?}", e);
+                                }
                             }
                             metrics_clone.decrement_connections();
                         });
@@ -1944,7 +1958,14 @@ impl Server {
                             match tls_config.accept(conn).await {
                                 Ok(tls_conn) => {
                                     if let Err(e) = Self::handle_https_vhost_connection(tls_conn, router, po, cm, wcm, am).await {
-                                        log::error!("handle https vhost connection error: {:?}", e);
+                                        if e.to_string().to_lowercase().contains("connection reset")
+                                            || e.to_string().to_lowercase().contains("connection aborted")
+                                            || e.to_string().to_lowercase().contains("broken pipe")
+                                        {
+                                            log::debug!("HTTPS vhost connection closed (peer disconnected): {:?}", e);
+                                        } else {
+                                            log::error!("handle https vhost connection error: {:?}", e);
+                                        }
                                     }
                                 }
                                 Err(e) => {
