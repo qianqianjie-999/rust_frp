@@ -1,8 +1,35 @@
+//! FRP 网络层模块
+//!
+//! 该模块提供了 FRP (Fast Reverse Proxy) 的核心网络抽象，包括：
+//!
+//! ## 主要组件
+//!
+//! 1. **连接抽象 (FrpConn trait)**
+//!    - 统一的异步 I/O 接口，支持 TCP、TLS、WebSocket 等多种连接类型
+//!    - 实现了 `AsyncRead` 和 `AsyncWrite` trait，便于数据流操作
+//!
+//! 2. **TLS 加密支持**
+//!    - 支持自定义证书和内置自签名证书
+//!    - 客户端可配置为信任内置证书，简化部署
+//!
+//! 3. **WebSocket 支持**
+//!    - 支持通过 WebSocket 协议进行连接，适用于复杂网络环境
+//!
+//! 4. **连接池管理**
+//!    - 支持 TCP 连接复用，减少连接建立开销
+//!    - 支持连接池配置（大小、超时、空闲时间等）
+//!
+//! ## 安全性
+//!
+//! - TLS 1.2 及以上版本
+//! - 内置自签名证书，方便快速部署
+//! - 支持自定义证书，可用于生产环境
+
 use std::net::SocketAddr;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_openssl::SslStream;
-use openssl::ssl::SslContext;
+use openssl::ssl::{SslContext, SslVerifyMode};
 use openssl::x509::X509;
 use openssl::pkey::PKey;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -267,6 +294,23 @@ impl TlsConfig {
         })
     }
 
+    /// 创建客户端 TLS 配置，信任内置自签名证书
+    /// 将内置证书添加到 trust store 并启用证书验证
+    pub fn new_client_trusting_builtin() -> Result<Self, openssl::error::ErrorStack> {
+        let mut ctx = SslContext::builder(openssl::ssl::SslMethod::tls_client())?;
+        ctx.set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))?;
+
+        let cert_pem = include_bytes!("../cert/frp.crt");
+        let cert = X509::from_pem(cert_pem)?;
+        ctx.cert_store_mut().add_cert(cert)?;
+        ctx.set_verify(SslVerifyMode::PEER);
+
+        Ok(Self {
+            acceptor: None,
+            connector: Some(ctx.build()),
+        })
+    }
+
     /// 创建使用内置自签名证书的服务器 TLS 配置
     pub fn new_server_with_builtin_cert() -> Result<Self, openssl::error::ErrorStack> {
         // 内置自签名证书
@@ -283,6 +327,16 @@ impl TlsConfig {
             acceptor: Some(ctx.build()),
             connector: None,
         })
+    }
+
+    /// 获取内置证书的 PEM 数据（用于 Web 服务器 HTTPS）
+    pub fn get_builtin_cert_pem() -> &'static [u8] {
+        include_bytes!("../cert/frp.crt")
+    }
+
+    /// 获取内置私钥的 PEM 数据（用于 Web 服务器 HTTPS）
+    pub fn get_builtin_key_pem() -> &'static [u8] {
+        include_bytes!("../cert/frp.key")
     }
 
     pub async fn accept(&self, stream: TokioTcpStream) -> Result<SslStream<TokioTcpStream>, std::io::Error> {

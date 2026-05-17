@@ -1,3 +1,84 @@
+//! FRP 客户端模块
+//!
+//! 该模块实现了 FRP 客户端（frpc）的核心功能。
+//!
+//! ## 客户端架构
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                         Client                                  │
+//! │  (主客户端结构，管理所有子组件)                                   │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                              │
+//!         ┌────────────────────┼────────────────────┐
+//!         ▼                    ▼                    ▼
+//! ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+//! │ ClientControl │   │ClientProxyMgr  │   │ClientVisitorMgr│
+//! │ (控制连接)     │   │ (代理管理)     │   │ (访问者管理)   │
+//! └───────────────┘   └───────────────┘   └───────────────┘
+//!         │                    │                    │
+//!         ▼                    ▼                    ▼
+//! ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+//! │ WorkConnMgr   │   │  Connector    │   │  Connector    │
+//! │ (工作连接管理) │   │ (网络连接)     │   │               │
+//! └───────────────┘   └───────────────┘   └───────────────┘
+//! ```
+//!
+//! ## 核心流程
+//!
+//! ### 1. 启动流程
+//! ```text
+//! Client::start()
+//!   ├── 启动 Web 服务器（可选）
+//!   ├── login() - 登录到服务器
+//!   │     ├── 建立 TCP/TLS 连接
+//!   │     ├── 发送 LoginMsg
+//!   │     └── 接收 LoginRespMsg
+//!   ├── 注册所有代理 (register_proxy)
+//!   │     └── 发送 RegisterProxyMsg
+//!   ├── 启动所有代理 (add_proxy)
+//!   │     └── 创建工作连接处理器
+//!   └── 运行控制循环 (run)
+//!         ├── 处理服务器消息
+//!         └── 监听信号退出
+//! ```
+//!
+//! ### 2. 工作连接流程
+//! ```text
+//! 服务器                          客户端
+//!   │                               │
+//!   │--- ReqWorkConnMsg ----------->│
+//!   │                               │
+//!   │                        establish_work_connection()
+//!   │                               │
+//!   │                        连接工作端口 (server_port + 1000)
+//!   │                               │
+//!   │<---- NewWorkConnMsg ----------│
+//!   │                               │
+//!   │                               │
+//! ```
+//!
+//! ## 安全性
+//!
+//! - TLS 加密连接（默认启用）
+//! - HMAC 签名验证
+//! - Token 认证
+//! - 连接重试机制
+//!
+//! ## 配置示例
+//!
+//! ```toml
+//! server_addr = "127.0.0.1"
+//! server_port = 9300
+//!
+//! [[proxies]]
+//! name = "ssh"
+//! type = "tcp"
+//! local_ip = "127.0.0.1"
+//! local_port = 22
+//! remote_port = 6000
+//! ```
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -270,6 +351,25 @@ impl ProxyManager for ClientProxyManager {
             Ok(None)
         }
     }
+
+    async fn clear(&self) {
+        // 停止所有工作连接处理器
+        let handlers = self.work_conn_handlers.write().await;
+        for (_, handle) in handlers.iter() {
+            handle.abort();
+        }
+        drop(handlers);
+
+        // 清空所有映射
+        let mut proxies = self.proxies.write().await;
+        proxies.clear();
+        let mut listeners = self.listeners.write().await;
+        listeners.clear();
+        let mut work_conn_handlers = self.work_conn_handlers.write().await;
+        work_conn_handlers.clear();
+        
+        log::info!("Proxy manager cleared");
+    }
 }
 
 /// 客户端访问者管理器
@@ -298,6 +398,12 @@ impl VisitorManager for ClientVisitorManager {
         visitors.remove(name);
         Ok(())
     }
+
+    async fn clear(&self) {
+        let mut visitors = self.visitors.write().await;
+        visitors.clear();
+        log::info!("Visitor manager cleared");
+    }
 }
 
 /// 客户端连接器
@@ -310,7 +416,7 @@ impl Connector {
     pub fn new(config: rust_frp_config::ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let tls_config = if let Some(tls) = &config.transport.tls {
             if tls.enable {
-                Some(TlsConfig::new_client()?)
+                Some(TlsConfig::new_client_trusting_builtin()?)
             } else {
                 None
             }
@@ -378,7 +484,7 @@ impl ClientControl {
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut msg_count = 0u32;
-        let ping_interval: u32 = 10; // 每 10 个消息周期发送一次 ping
+        let _ping_interval: u32 = 10; // 每 10 个消息周期发送一次 ping
         let mut last_ping_time = std::time::Instant::now();
         
         log::debug!("ClientControl::run started, waiting for messages...");
@@ -644,59 +750,95 @@ impl Client {
             self.web_server = Some(web_server);
         }
 
-        // 登录到服务器
-        self.login().await.map_err(|e| e.to_string())?;
-
-        // 克隆代理配置到临时向量
-        let proxies = self.config.proxies.clone();
-        
-        log::info!("Number of proxies: {}", proxies.len());
-
-        // 注册所有代理
-        for proxy in &proxies {
-            log::info!("Registering proxy: {}", proxy.name);
-            self.register_proxy(proxy).await.map_err(|e| e.to_string())?;
-        }
-
-        // 启动所有代理
-        for proxy in &proxies {
-            log::info!("Starting proxy: {} on local port {}", proxy.name, proxy.local_port);
-            self.proxy_manager.add_proxy(proxy.clone()).await.map_err(|e| e.to_string())?;
-        }
-
-        // 启动所有访问者
-        for visitor in &self.config.visitors {
-            self.visitor_manager.add_visitor(visitor.clone()).await.map_err(|e| e.to_string())?;
-        }
-
         // 设置信号处理
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-        log::info!("Client started, waiting for signals...");
+        // 重连配置
+        let mut reconnect_delay_secs = 1u64;
+        let max_reconnect_delay = 60u64;
 
-        // 运行控制循环，同时监听信号
-        tokio::select! {
-            _ = async {
-                if let Some(control) = &self.control {
-                    let mut control = control.lock().await;
-                    control.run().await
-                } else {
-                    Ok(())
+        log::info!("Client started, entering main loop with auto-reconnect...");
+
+        loop {
+            tokio::select! {
+                // 主重连循环
+                _ = async {
+                    // 登录到服务器
+                    if let Err(e) = self.login().await {
+                        log::error!("Login failed: {}", e);
+                        return;
+                    }
+
+                    // 克隆代理配置到临时向量
+                    let proxies = self.config.proxies.clone();
+                    
+                    log::info!("Number of proxies: {}", proxies.len());
+
+                    // 注册所有代理
+                    for proxy in &proxies {
+                        log::info!("Registering proxy: {}", proxy.name);
+                        if let Err(e) = self.register_proxy(proxy).await {
+                            log::error!("Failed to register proxy {}: {}", proxy.name, e);
+                        }
+                    }
+
+                    // 启动所有代理
+                    for proxy in &proxies {
+                        log::info!("Starting proxy: {} on local port {}", proxy.name, proxy.local_port);
+                        if let Err(e) = self.proxy_manager.add_proxy(proxy.clone()).await {
+                            log::error!("Failed to add proxy {}: {}", proxy.name, e);
+                        }
+                    }
+
+                    // 启动所有访问者
+                    for visitor in &self.config.visitors {
+                        if let Err(e) = self.visitor_manager.add_visitor(visitor.clone()).await {
+                            log::error!("Failed to add visitor: {}", e);
+                        }
+                    }
+
+                    // 运行控制循环
+                    if let Some(control) = &self.control {
+                        let mut control = control.lock().await;
+                        if let Err(e) = control.run().await {
+                            log::error!("Control loop error: {:?}", e);
+                        }
+                    }
+                } => {
+                    // 连接断开
                 }
-            } => {
-                log::info!("Control loop ended");
+                // 信号处理
+                _ = sigint.recv() => {
+                    log::info!("Received SIGINT, shutting down gracefully...");
+                    self.graceful_shutdown().await?;
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    log::info!("Received SIGTERM, shutting down gracefully...");
+                    self.graceful_shutdown().await?;
+                    break;
+                }
             }
-            _ = sigint.recv() => {
-                log::info!("Received SIGINT, shutting down gracefully...");
-                self.graceful_shutdown().await?;
+
+            // 如果是正常关闭（通过信号），不再重连
+            if self.control.is_none() {
+                break;
             }
-            _ = sigterm.recv() => {
-                log::info!("Received SIGTERM, shutting down gracefully...");
-                self.graceful_shutdown().await?;
-            }
+
+            // 重连逻辑：指数退避
+            log::warn!("Connection lost, attempting to reconnect in {} seconds...", reconnect_delay_secs);
+            tokio::time::sleep(tokio::time::Duration::from_secs(reconnect_delay_secs)).await;
+            
+            // 增加延迟，但不超过最大值
+            reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay);
+            
+            // 重置代理管理器状态
+            self.proxy_manager.clear().await;
+            self.visitor_manager.clear().await;
         }
 
+        log::info!("Client shutdown completed");
         Ok(())
     }
 
@@ -753,7 +895,7 @@ impl Client {
 
     async fn login(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 连接到服务器
-        let use_tls = self.config.transport.tls.as_ref().map(|t| t.enable).unwrap_or(false);
+        let use_tls = self.config.transport.tls.as_ref().map(|t| t.enable).unwrap_or(true);
         
         let mut conn = if use_tls {
             let tls_conn = self.connector.connect_tls(&self.config.server_addr).await
@@ -768,14 +910,17 @@ impl Client {
         // 生成运行 ID
         let run_id = rand_id(16);
 
+        // 获取主机名
+        let hostname = hostname::get()?.to_string_lossy().to_string();
+        
         // 创建登录消息
         let login_msg = rust_frp_core::LoginMsg {
             arch: std::env::consts::ARCH.to_string(),
             os: std::env::consts::OS.to_string(),
-            hostname: hostname::get()?.to_string_lossy().to_string(),
+            hostname: hostname.clone(),
             pool_count: self.config.transport.pool_count,
             user: self.config.user.clone().unwrap_or_else(|| "".to_string()),
-            client_id: self.config.client_id.clone().unwrap_or_else(|| "".to_string()),
+            client_id: self.config.client_id.clone().unwrap_or(hostname),
             version: "0.1.0".to_string(),
             timestamp: get_timestamp(),
             run_id: run_id.clone(),

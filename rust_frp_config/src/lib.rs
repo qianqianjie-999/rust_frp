@@ -1,28 +1,143 @@
+//! # rust_frp_config - FRP 配置管理模块
+//!
+//! 本模块负责配置文件的解析、验证和处理。
+//!
+//! ## 支持的配置文件格式
+//!
+//! 按优先级尝试解析以下格式：
+//! 1. **TOML** (推荐)
+//! 2. **YAML**
+//! 3. **JSON**
+//!
+//! ## 环境变量替换
+//!
+//! 配置值中可使用 `${VAR_NAME}` 语法引用环境变量：
+//! ```toml
+//! server_addr = "${FRP_SERVER_ADDR}"
+//! token = "${FRP_TOKEN}"
+//! ```
+//!
+//! ## 配置包含 (includes)
+//!
+//! 支持通过 glob 模式包含其他配置文件：
+//! ```toml
+//! includes = ["/etc/frp.d/*.toml"]
+//! ```
+//!
+//! ## 默认值
+//!
+//! 所有配置项都有合理的默认值，可参考各结构的 `Default` 实现。
+
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use glob::glob;
 
-/// 服务器配置
+/// 服务器配置 - 定义 FRP 服务器的所有配置选项
+///
+/// # 配置示例
+///
+/// ```toml
+/// bind_addr = "0.0.0.0"
+/// bind_port = 9300
+/// vhost_http_port = 9090
+/// vhost_https_port = 9091
+///
+/// [web_server]
+/// addr = "0.0.0.0"
+/// port = 7500
+/// user = "admin"
+/// password = "admin"
+///
+/// [transport]
+/// protocol = "tcp"
+/// tls = { enable = true }
+/// tcp_mux = true
+///
+/// [auth]
+/// method = "token"
+/// token = "your_secure_token"
+///
+/// allow_ports = [
+///     { single = 9302 },
+///     { start = 10000, end = 20000 },
+/// ]
+/// ```
+///
+/// # 端口说明
+///
+/// | 端口 | 默认值 | 说明 |
+/// |------|--------|------|
+/// | `bind_port` | 9300 | 控制连接端口 |
+/// | `work_conn_port` | bind_port + 1000 | 工作连接端口 |
+/// | `vhost_http_port` | None | HTTP 虚主机端口 |
+/// | `vhost_https_port` | None | HTTPS 虚主机端口 |
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct ServerConfig {
+    /// 绑定地址，0.0.0.0 表示监听所有网络接口
     pub bind_addr: String,
+
+    /// 控制连接端口，客户端通过此端口连接服务器
     pub bind_port: u16,
+
+    /// KCP 协议绑定端口（可选，UDP）
     pub kcp_bind_port: Option<u16>,
+
+    /// QUIC 协议绑定端口（可选，UDP）
     pub quic_bind_port: Option<u16>,
+
+    /// HTTP 虚主机端口，用于 HTTP 代理
     pub vhost_http_port: Option<u16>,
+
+    /// HTTPS 虚主机端口，用于 HTTPS 代理
     pub vhost_https_port: Option<u16>,
+
+    /// TCP 多路复用 HTTP 连接端口
     pub tcpmux_http_connect_port: Option<u16>,
-    /// 工作连接端口，用于客户端建立工作连接
+
+    /// 工作连接端口，用于工作连接（默认 = bind_port + 1000）
     pub work_conn_port: Option<u16>,
+
+    /// Web Dashboard 配置
     pub web_server: WebServerConfig,
+
+    /// 认证配置
     pub auth: AuthConfig,
+
+    /// 传输层配置
     pub transport: TransportConfig,
-    pub allow_ports: Option<Vec<PortRange>>,
+
+    /// 允许的端口范围列表（白名单）
+    ///
+    /// # 安全说明
+    ///
+    /// **默认拒绝所有端口**！必须显式配置才能使用 TCP 代理。
+    ///
+    /// # 配置示例
+    ///
+    /// ```toml
+    /// allow_ports = [
+    ///     { single = 9302 },        # 允许单个端口
+    ///     { start = 10000, end = 20000 },  # 允许端口范围
+    /// ]
+    /// ```
+    pub allow_ports: Vec<PortRange>,
+
+    /// 自定义 404 页面路径（可选）
     pub custom_404_page: Option<String>,
+
+    /// 配置文件包含模式（glob）
+    ///
+    /// # 示例
+    ///
+    /// ```toml
+    /// includes = ["/etc/frp.d/*.toml"]
+    /// ```
     pub includes: Option<Vec<String>>,
+
+    /// 默认代理配置列表
     pub proxies: Vec<ProxyConfig>,
 }
 
@@ -40,7 +155,7 @@ impl Default for ServerConfig {
             web_server: WebServerConfig::default(),
             auth: AuthConfig::default(),
             transport: TransportConfig::default(),
-            allow_ports: None,
+            allow_ports: Vec::new(),
             custom_404_page: None,
             includes: None,
             proxies: Vec::new(),
@@ -48,19 +163,73 @@ impl Default for ServerConfig {
     }
 }
 
-/// 客户端配置
+/// 客户端配置 - 定义 FRP 客户端的所有配置选项
+///
+/// # 配置示例
+///
+/// ```toml
+/// server_addr = "123.57.86.80"
+/// server_port = 9300
+///
+/// [auth]
+/// method = "token"
+/// token = "your_secure_token"
+///
+/// [transport]
+/// protocol = "tcp"
+/// tls = { enable = true }
+///
+/// [[proxies]]
+/// name = "ssh"
+/// type = "tcp"
+/// local_ip = "127.0.0.1"
+/// local_port = 22
+/// remote_port = 9302
+/// ```
+///
+/// # 代理类型
+///
+/// - `tcp`: TCP 代理
+/// - `udp`: UDP 代理
+/// - `http`: HTTP 代理
+/// - `https`: HTTPS 代理
+/// - `stcp`: 秘密 TCP（需要访问者知道密钥）
+/// - `xtcp`: P2P TCP
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct ClientConfig {
+    /// 服务器地址
     pub server_addr: String,
+
+    /// 服务器控制连接端口
     pub server_port: u16,
+
+    /// 用户名（可选，用于多用户场景）
     pub user: Option<String>,
+
+    /// 客户端 ID（可选，用于多客户端场景）
     pub client_id: Option<String>,
+
+    /// Web Dashboard 配置（可选）
     pub web_server: WebServerConfig,
+
+    /// 认证配置
     pub auth: AuthConfig,
+
+    /// 传输层配置
     pub transport: TransportConfig,
+
+    /// 代理配置列表
     pub proxies: Vec<ProxyConfig>,
+
+    /// 访问者配置列表
+    ///
+    /// # 访问者说明
+    ///
+    /// 访问者用于访问其他客户端暴露的服务（STCP/XTCP 代理类型）
     pub visitors: Vec<VisitorConfig>,
+
+    /// 配置文件包含模式
     pub includes: Option<Vec<String>>,
 }
 
@@ -81,23 +250,50 @@ impl Default for ClientConfig {
     }
 }
 
-/// Web 服务器配置
+/// Web Dashboard 配置
+///
+/// # 启用条件
+///
+/// `port > 0` 时启用 Dashboard 服务
+///
+/// # 访问地址
+///
+/// `http://{addr}:{port}`
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct WebServerConfig {
+    /// 监听地址
     pub addr: String,
+
+    /// 监听端口（0 = 禁用）
     pub port: u16,
+
+    /// Dashboard 用户名
     pub user: Option<String>,
+
+    /// Dashboard 密码
     pub password: Option<String>,
+
+    /// TLS 配置（可选）
     pub tls: Option<TlsConfig>,
 }
 
-/// 认证配置
+/// 认证配置 - 定义客户端认证方式
+///
+/// # 认证方法
+///
+/// - `token`: 基于令牌的认证（默认）
+/// - `oidc`: 基于 OpenID Connect 的认证
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct AuthConfig {
+    /// 认证方法："token" 或 "oidc"
     pub method: String,
+
+    /// 令牌（当 method = "token" 时使用）
     pub token: Option<String>,
+
+    /// OIDC 配置（当 method = "oidc" 时使用）
     pub oidc: Option<OidcConfig>,
 }
 
@@ -111,25 +307,68 @@ impl Default for AuthConfig {
     }
 }
 
-/// OIDC 配置
+/// OpenID Connect 配置
+///
+/// # 说明
+///
+/// OIDC 是一种基于 OAuth 2.0 的身份认证协议，适用于企业 SSO 场景。
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct OidcConfig {
+    /// 发行者 URL
     pub issuer: String,
+
+    /// 受众
     pub audience: String,
+
+    /// OAuth 客户端 ID
     pub client_id: String,
+
+    /// OAuth 客户端密钥
     pub client_secret: String,
+
+    /// Token 端点 URL
     pub token_endpoint_url: String,
 }
 
-/// 传输配置
+/// 传输层配置 - 定义网络传输相关选项
+///
+/// # TCP 多路复用 (tcp_mux)
+///
+/// 启用后，多个请求共享同一个 TCP 连接，减少连接开销：
+///
+/// ```text
+/// 启用前:  客户端 --TCP-- 服务器 (每个请求独立连接)
+/// 启用后:  客户端 --TCP-- 服务器 (多请求复用连接)
+/// ```
+///
+/// # 连接池 (pool_count)
+///
+/// 客户端预建立的工作连接数量，范围 1-1000
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct TransportConfig {
+    /// 传输协议: "tcp", "kcp", "quic", "websocket"
     pub protocol: String,
+
+    /// TLS 配置
+    ///
+    /// # 安全说明
+    ///
+    /// **TLS 默认已启用**（enable = true）
     pub tls: Option<TlsConfig>,
+
+    /// 启用 TCP 多路复用
+    ///
+    /// 多个业务流共享单个 TCP 连接，减少握手延迟
     pub tcp_mux: bool,
+
+    /// 连接池大小
+    ///
+    /// 客户端预建立的工作连接数量。建议值：5-100
     pub pool_count: u32,
+
+    /// 带宽限制（可选），格式如 "1MB" 或 "1GB"
     pub bandwidth_limit: Option<String>,
 }
 
@@ -145,21 +384,61 @@ impl Default for TransportConfig {
     }
 }
 
-/// TLS 配置
+/// TLS 配置 - 定义 TLS/SSL 加密选项
+///
+/// # 模式
+///
+/// ## 1. 内置自签名证书（默认）
+///
+/// 服务器使用内置的自签名证书，客户端自动信任。
+///
+/// ## 2. 自定义证书
+///
+/// ```toml
+/// tls = {
+///     enable = true,
+///     cert_file = "/path/to/cert.pem",
+///     key_file = "/path/to/key.pem"
+/// }
+/// ```
+///
+/// ## 3. 自定义 CA 证书
+///
+/// ```toml
+/// tls = {
+///     enable = true,
+///     trusted_ca_file = "/path/to/ca.pem"
+/// }
+/// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct TlsConfig {
+    /// 是否启用 TLS
+    ///
+    /// # 默认值
+    ///
+    /// **true** - TLS 默认启用
     pub enable: bool,
+
+    /// TLS 证书文件路径（服务器用）
     pub cert_file: Option<String>,
+
+    /// TLS 私钥文件路径（服务器用）
     pub key_file: Option<String>,
+
+    /// 受信任的 CA 证书文件路径（客户端用）
+    ///
+    /// 用于验证服务器证书
     pub trusted_ca_file: Option<String>,
+
+    /// 强制使用 TLS（即使协议不支持 TLS）
     pub force: bool,
 }
 
 impl Default for TlsConfig {
     fn default() -> Self {
         Self {
-            enable: false,
+            enable: true,
             cert_file: None,
             key_file: None,
             trusted_ca_file: None,
@@ -168,81 +447,331 @@ impl Default for TlsConfig {
     }
 }
 
-/// 端口范围
+/// 端口范围 - 定义单个端口或端口范围
+///
+/// # 格式
+///
+/// ## 单端口
+/// ```toml
+/// { single = 9302 }
+/// ```
+///
+/// ## 端口范围
+/// ```toml
+/// { start = 10000, end = 20000 }
+/// ```
+///
+/// # 合并行为
+///
+/// 单端口 `{ single = 80 }` 等价于 `{ start = 80, end = 80 }`
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct PortRange {
+    /// 范围起始端口（包含）
     pub start: Option<u16>,
+
+    /// 范围结束端口（包含）
     pub end: Option<u16>,
+
+    /// 单个端口（与 start/end 互斥）
     pub single: Option<u16>,
 }
 
-/// 代理配置
+/// 代理配置 - 定义单个代理的转发规则
+///
+/// # 代理类型
+///
+/// ## TCP 代理
+///
+/// ```toml
+/// [[proxies]]
+/// name = "ssh"
+/// type = "tcp"
+/// local_ip = "127.0.0.1"
+/// local_port = 22
+/// remote_port = 9302
+/// ```
+///
+/// ## HTTP 代理
+///
+/// ```toml
+/// [[proxies]]
+/// name = "web"
+/// type = "http"
+/// local_ip = "127.0.0.1"
+/// local_port = 80
+/// custom_domains = ["web.example.com"]
+/// ```
+///
+/// # 字段说明
+///
+/// - `name`: 代理唯一名称
+/// - `type`: 代理类型 (tcp/udp/http/https/stcp/xtcp)
+/// - `local_ip`: 本地服务 IP
+/// - `local_port`: 本地服务端口
+/// - `remote_port`: 远程映射端口（TCP/UDP 必需）
+/// - `custom_domains`: 自定义域名（HTTP/HTTPS 代理用）
+/// - `subdomain`: 子域名（HTTP/HTTPS 代理用）
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct ProxyConfig {
+    /// 代理唯一名称
     pub name: String,
+
+    /// 代理类型
+    ///
+    /// 可选值：
+    /// - `tcp`: TCP 代理
+    /// - `udp`: UDP 代理
+    /// - `http`: HTTP 代理
+    /// - `https`: HTTPS 代理
+    /// - `stcp`: 秘密 TCP（需要访问密钥）
+    /// - `xtcp`: P2P TCP
     #[serde(rename = "type")]
     pub r#type: String,
+
+    /// 本地服务 IP 地址
     pub local_ip: String,
+
+    /// 本地服务端口
     pub local_port: u16,
+
+    /// 远程映射端口（TCP/UDP 代理必需）
     pub remote_port: Option<u16>,
+
+    /// 自定义域名列表（HTTP/HTTPS 代理用）
+    ///
+    /// # 示例
+    ///
+    /// ```toml
+    /// custom_domains = ["web.example.com", "api.example.com"]
+    /// ```
     pub custom_domains: Option<Vec<String>>,
+
+    /// 子域名（HTTP/HTTPS 代理用）
+    ///
+    /// 配合服务器的 `subdomain_base` 使用
     pub subdomain: Option<String>,
+
+    /// URL 路径匹配规则（HTTP 代理用）
+    ///
+    /// # 示例
+    ///
+    /// ```toml
+    /// locations = ["/api", "/static"]
+    /// ```
     pub locations: Option<Vec<String>>,
+
+    /// 改写 Host header（HTTP 代理用）
     pub host_header_rewrite: Option<String>,
+
+    /// HTTP 基本认证用户名（HTTP 代理用）
     pub http_user: Option<String>,
+
+    /// HTTP 基本认证密码（HTTP 代理用）
     pub http_password: Option<String>,
+
+    /// 健康检查配置（可选）
     pub health_check: Option<HealthCheckConfig>,
+
+    /// 传输层覆盖配置（可选）
+    ///
+    /// 覆盖全局 transport 配置
     pub transport: Option<TransportConfig>,
+
+    /// 插件配置（可选）
+    ///
+    /// 当使用插件时，local_ip/local_port 被插件替代
     pub plugin: Option<PluginConfig>,
 }
 
-/// 访问者配置
+/// 访问者配置 - 定义如何访问其他客户端的 STCP/XTCP 服务
+///
+/// # 使用场景
+///
+/// 当需要访问部署在其他机器上的 STCP/XTCP 类型代理时使用：
+///
+/// ```toml
+/// [[visitors]]
+/// name = "visit_ssh"
+/// type = "stcp"
+/// server_name = "ssh"           # 被访问的代理名称
+/// secret_key = "your_secret"    # 访问密钥
+/// bind_addr = "127.0.0.1"
+/// bind_port = 9000              # 本地监听端口
+/// ```
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct VisitorConfig {
+    /// 访问者唯一名称
     pub name: String,
+
+    /// 访问者类型：stcp 或 xtcp
     pub r#type: String,
+
+    /// 要访问的代理名称（需与对方客户端配置匹配）
     pub server_name: String,
+
+    /// 共享密钥（需与对方代理配置匹配）
     pub secret_key: Option<String>,
+
+    /// 本地绑定地址
     pub bind_addr: String,
+
+    /// 本地监听端口
+    ///
+    /// 访问者连接此端口即可访问远程服务
     pub bind_port: u16,
+
+    /// 传输层配置（可选）
     pub transport: Option<TransportConfig>,
 }
 
-/// 健康检查配置
+/// 健康检查配置 - 定义代理健康检查规则
+///
+/// # 使用场景
+///
+/// 用于检查本地服务是否正常响应，不健康时自动剔除
+///
+/// # 字段说明
+///
+/// - `type`: 检查类型 "tcp" 或 "http"
+/// - `timeout_seconds`: 超时时间
+/// - `max_failed`: 连续失败次数阈值
+/// - `interval_seconds`: 检查间隔
+/// - `path`: HTTP 检查路径（仅 http 类型）
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct HealthCheckConfig {
+    /// 检查类型: "tcp" 或 "http"
     pub r#type: String,
+
+    /// 超时时间（秒）
     pub timeout_seconds: u32,
+
+    /// 连续失败次数阈值
+    ///
+    /// 超过此值则判定为不健康
     pub max_failed: u32,
+
+    /// 检查间隔（秒）
     pub interval_seconds: u32,
+
+    /// HTTP 检查路径（仅 type = "http" 时使用）
     pub path: Option<String>,
 }
 
-/// 插件配置
+/// 插件配置 - 定义代理使用的插件
+///
+/// # 内置插件
+///
+/// ## Unix Domain Socket
+///
+/// ```toml
+/// [proxy.plugin]
+/// type = "unix_domain_socket"
+/// unix_path = "/var/run/docker.sock"
+/// ```
+///
+/// ## 静态文件服务器
+///
+/// ```toml
+/// [proxy.plugin]
+/// type = "static_file"
+/// local_path = "/var/www/html"
+/// strip_prefix = "/files"
+/// ```
+///
+/// ## HTTP 代理
+///
+/// ```toml
+/// [proxy.plugin]
+/// type = "http_proxy"
+/// ```
+///
+/// ## SOCKS5 代理
+///
+/// ```toml
+/// [proxy.plugin]
+/// type = "socks5"
+/// ```
+///
+/// # 说明
+///
+/// 使用插件后，`local_ip` 和 `local_port` 被插件替代。
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct PluginConfig {
+    /// 插件类型
+    ///
+    /// 可选值：
+    /// - `unix_domain_socket`: Unix 域套接字
+    /// - `static_file`: 静态文件服务
+    /// - `http_proxy`: HTTP 代理
+    /// - `socks5`: SOCKS5 代理
     pub r#type: String,
+
+    /// Unix 域套接字路径（unix_domain_socket 插件用）
     pub unix_path: Option<String>,
+
+    /// 本地文件路径（static_file 插件用）
     pub local_path: Option<String>,
+
+    /// 路径前缀剥离（static_file 插件用）
     pub strip_prefix: Option<String>,
+
+    /// HTTP 用户名（http_proxy 插件用）
     pub http_user: Option<String>,
+
+    /// HTTP 密码（http_proxy 插件用）
     pub http_password: Option<String>,
+
+    /// 本地地址（http_proxy/socks5 插件用）
     pub local_addr: Option<String>,
+
+    /// 证书文件路径（HTTPS 相关插件用）
     pub crt_path: Option<String>,
+
+    /// 私钥文件路径（HTTPS 相关插件用）
     pub key_path: Option<String>,
 }
 
-/// 配置加载器
+/// 配置加载器 - 负责配置的加载、解析和验证
+///
+/// # 功能
+///
+/// 1. 支持 TOML/YAML/JSON 多种格式
+/// 2. 支持配置包含（glob 模式）
+/// 3. 支持环境变量替换
+/// 4. 配置验证
 pub struct ConfigLoader;
 
 impl ConfigLoader {
     /// 从文件加载服务器配置
-    pub fn load_server_config<P: AsRef<Path>>(path: P) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    ///
+    /// # 处理流程
+    ///
+    /// ```text
+    /// 文件读取 -> 格式检测 -> 解析 -> includes合并 -> 环境变量替换 -> 验证
+    /// ```
+    ///
+    /// # 参数
+    ///
+    /// - `path`: 配置文件路径
+    ///
+    /// # 返回值
+    ///
+    /// - 成功: `Ok(ServerConfig)`
+    /// - 失败: `Box<dyn Error>`
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// let config = ConfigLoader::load_server_config("frps.toml")?;
+    /// ```
+    pub fn load_server_config<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
         let mut config: ServerConfig = Self::load_config_from_file(path)?;
         Self::process_includes(&mut config)?;
         Self::replace_environment_variables(&mut config)?;
@@ -251,7 +780,13 @@ impl ConfigLoader {
     }
 
     /// 从文件加载客户端配置
-    pub fn load_client_config<P: AsRef<Path>>(path: P) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+    ///
+    /// # 处理流程
+    ///
+    /// 与 `load_server_config` 类似，但针对客户端配置结构
+    pub fn load_client_config<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
         let mut config = Self::load_config_from_file(path)?;
         Self::process_includes_client(&mut config)?;
         Self::replace_environment_variables_client(&mut config)?;
@@ -259,8 +794,18 @@ impl ConfigLoader {
         Ok(config)
     }
 
-    /// 从文件加载配置
-    fn load_config_from_file<P: AsRef<Path>, T: serde::de::DeserializeOwned + Default>(path: P) -> Result<T, Box<dyn std::error::Error>> {
+    /// 从文件加载配置（通用方法）
+    ///
+    /// # 格式检测
+    ///
+    /// 按 TOML -> YAML -> JSON 顺序尝试解析
+    ///
+    /// # 性能优化
+    ///
+    /// 首次成功的格式会被记录，避免重复尝试
+    fn load_config_from_file<P: AsRef<Path>, T: serde::de::DeserializeOwned + Default>(
+        path: P,
+    ) -> Result<T, Box<dyn std::error::Error>> {
         let mut file = File::open(path)?;
         let mut content = String::new();
         file.read_to_string(&mut content)?;
@@ -268,45 +813,64 @@ impl ConfigLoader {
         Self::parse_config(&content)
     }
 
-    /// 解析配置
-    fn parse_config<T: serde::de::DeserializeOwned + Default>(content: &str) -> Result<T, Box<dyn std::error::Error>> {
+    /// 解析配置内容
+    ///
+    /// # 格式优先级
+    ///
+    /// 1. TOML（首选，推荐）
+    /// 2. YAML
+    /// 3. JSON
+    ///
+    /// # 错误处理
+    ///
+    /// 所有格式都失败时返回错误
+    fn parse_config<T: serde::de::DeserializeOwned + Default>(
+        content: &str,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        // 尝试 TOML
         log::info!("Trying to parse config as TOML");
-        match toml::from_str::<T>(content) {
-            Ok(config) => {
-                log::info!("Successfully parsed config as TOML");
-                return Ok(config);
-            }
-            Err(e) => {
-                log::error!("Failed to parse as TOML: {:?}", e);
-            }
+        if let Ok(config) = toml::from_str::<T>(content) {
+            log::info!("Successfully parsed config as TOML");
+            return Ok(config);
         }
+        log::error!("Failed to parse as TOML");
+
+        // 尝试 YAML
         log::info!("Trying to parse config as YAML");
-        match serde_yaml::from_str::<T>(content) {
-            Ok(config) => {
-                log::info!("Successfully parsed config as YAML");
-                return Ok(config);
-            }
-            Err(e) => {
-                log::error!("Failed to parse as YAML: {:?}", e);
-            }
+        if let Ok(config) = serde_yaml::from_str::<T>(content) {
+            log::info!("Successfully parsed config as YAML");
+            return Ok(config);
         }
+        log::error!("Failed to parse as YAML");
+
+        // 尝试 JSON
         log::info!("Trying to parse config as JSON");
-        match serde_json::from_str(content) {
-            Ok(config) => {
-                log::info!("Successfully parsed config as JSON");
-                return Ok(config);
-            }
-            Err(e) => {
-                log::error!("Failed to parse as JSON: {:?}", e);
-            }
+        if let Ok(config) = serde_json::from_str(content) {
+            log::info!("Successfully parsed config as JSON");
+            return Ok(config);
         }
+        log::error!("Failed to parse as JSON");
+
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Failed to parse config file",
         )))
     }
 
-    /// 处理配置文件包含
+    /// 处理服务器配置文件包含
+    ///
+    /// # includes 机制
+    ///
+    /// 通过 glob 模式匹配多个配置文件并合并：
+    ///
+    /// ```toml
+    /// includes = ["/etc/frp.d/*.toml", "/home/*/frp.conf"]
+    /// ```
+    ///
+    /// # 合并规则
+    ///
+    /// - 标量值：后者覆盖前者
+    /// - 数组（如 proxies）：扩展合并
     fn process_includes(config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         let includes = config.includes.clone();
         if let Some(includes) = includes {
@@ -328,7 +892,9 @@ impl ConfigLoader {
         Ok(())
     }
 
-    /// 处理配置文件包含
+    /// 处理客户端配置文件包含
+    ///
+    /// 与 `process_includes` 类似，但针对客户端配置
     fn process_includes_client(config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
         let includes = config.includes.clone();
         if let Some(includes) = includes {
@@ -351,6 +917,11 @@ impl ConfigLoader {
     }
 
     /// 合并服务器配置
+    ///
+    /// # 合并策略
+    ///
+    /// - 值为零值或空时不覆盖
+    /// - 数组字段（如 proxies）使用 extend 合并
     fn merge_server_config(target: &mut ServerConfig, source: &ServerConfig) {
         if !source.bind_addr.is_empty() {
             target.bind_addr = source.bind_addr.clone();
@@ -377,6 +948,11 @@ impl ConfigLoader {
     }
 
     /// 合并客户端配置
+    ///
+    /// # 合并策略
+    ///
+    /// - 值为 None 或零值时不覆盖
+    /// - proxies 和 visitors 使用 extend 合并
     fn merge_client_config(target: &mut ClientConfig, source: &ClientConfig) {
         if !source.server_addr.is_empty() {
             target.server_addr = source.server_addr.clone();
@@ -394,10 +970,21 @@ impl ConfigLoader {
         target.visitors.extend(source.visitors.clone());
     }
 
-    /// 替换字符串中的环境变量 ${VAR_NAME}
+    /// 替换字符串中的环境变量
+    ///
+    /// # 语法
+    ///
+    /// `${VAR_NAME}`
+    ///
+    /// # 示例
+    ///
+    /// ```toml
+    /// server_addr = "${FRP_SERVER_ADDR}"
+    /// ```
+    ///
+    /// 如果环境变量不存在，替换为空字符串
     fn replace_env_vars(s: &str) -> String {
         let mut result = s.to_string();
-        // 查找 ${...} 模式并替换为环境变量值
         while let Some(start) = result.find("${") {
             if let Some(end) = result[start + 2..].find('}') {
                 let var_name = &result[start + 2..start + 2 + end];
@@ -410,7 +997,7 @@ impl ConfigLoader {
         result
     }
 
-    /// 替换环境变量
+    /// 替换服务器配置中的环境变量
     fn replace_environment_variables(config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         config.bind_addr = Self::replace_env_vars(&config.bind_addr);
         if let Some(ref mut includes) = config.includes {
@@ -424,7 +1011,7 @@ impl ConfigLoader {
         Ok(())
     }
 
-    /// 替换环境变量
+    /// 替换客户端配置中的环境变量
     fn replace_environment_variables_client(config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
         config.server_addr = Self::replace_env_vars(&config.server_addr);
         if let Some(ref mut includes) = config.includes {
@@ -439,6 +1026,10 @@ impl ConfigLoader {
     }
 
     /// 验证服务器配置
+    ///
+    /// # 必填字段
+    ///
+    /// - `bind_port`: 必须大于 0
     fn validate_server_config(config: &ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
         if config.bind_port == 0 {
             return Err(Box::new(std::io::Error::new(
@@ -450,6 +1041,11 @@ impl ConfigLoader {
     }
 
     /// 验证客户端配置
+    ///
+    /// # 必填字段
+    ///
+    /// - `server_addr`: 不能为空
+    /// - `server_port`: 必须大于 0
     fn validate_client_config(config: &ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
         if config.server_addr.is_empty() {
             return Err(Box::new(std::io::Error::new(
