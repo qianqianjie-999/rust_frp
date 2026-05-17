@@ -30,6 +30,18 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use rust_frp_net::FrpConn;
 
+#[derive(Debug, thiserror::Error)]
+pub enum CoreError {
+    #[error("message too large: {0} bytes (max: {1})")]
+    MessageTooLarge(usize, usize),
+    #[error("JSON serialization failed: {0}")]
+    SerializationFailed(#[from] serde_json::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Other(String),
+}
+
 /// 消息类型枚举 - FRP 协议所有消息的联合类型
 ///
 /// # 消息流概述
@@ -66,6 +78,7 @@ use rust_frp_net::FrpConn;
 ///   |<-- PongMsg -------------------|
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     /// 客户端登录请求
     /// 包含客户端基本信息、认证令牌、连接池配置等
@@ -716,4 +729,202 @@ pub trait VisitorManager {
 
     /// 清除所有访问者（用于重连时重置状态）
     async fn clear(&self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_login_msg_serialization() {
+        let msg = LoginMsg {
+            arch: "amd64".to_string(),
+            os: "linux".to_string(),
+            hostname: "test-host".to_string(),
+            pool_count: 10,
+            user: "admin".to_string(),
+            client_id: "client-001".to_string(),
+            version: "1.0.0".to_string(),
+            timestamp: 1234567890,
+            run_id: "run-abc".to_string(),
+            token: "secret".to_string(),
+            metas: std::collections::HashMap::new(),
+            client_spec: Some(ClientSpec {
+                r#type: "frpc".to_string(),
+                always_auth_pass: true,
+            }),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: LoginMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.arch, "amd64");
+        assert_eq!(deserialized.hostname, "test-host");
+        assert_eq!(deserialized.token, "secret");
+    }
+
+    #[test]
+    fn test_login_resp_msg_serialization() {
+        let msg = LoginRespMsg {
+            version: "1.0.0".to_string(),
+            run_id: "server-run-001".to_string(),
+            error: "".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: LoginRespMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.version, "1.0.0");
+        assert_eq!(deserialized.error, "");
+    }
+
+    #[test]
+    fn test_register_proxy_msg_serialization() {
+        let proxy_config = rust_frp_config::ProxyConfig {
+            name: "test-proxy".to_string(),
+            r#type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 8080,
+            remote_port: Some(9302),
+            ..Default::default()
+        };
+        let msg = RegisterProxyMsg {
+            proxy: proxy_config,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: RegisterProxyMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.proxy.name, "test-proxy");
+    }
+
+    #[test]
+    fn test_message_enum_serialization() {
+        let login = Message::Login(LoginMsg {
+            arch: "amd64".to_string(),
+            os: "linux".to_string(),
+            hostname: "h1".to_string(),
+            pool_count: 10,
+            user: "u1".to_string(),
+            client_id: "c1".to_string(),
+            version: "1.0".to_string(),
+            timestamp: 1000,
+            run_id: "r1".to_string(),
+            token: "t1".to_string(),
+            metas: std::collections::HashMap::new(),
+            client_spec: None,
+        });
+        let json = serde_json::to_string(&login).unwrap();
+        let deserialized: Message = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Message::Login(lm) => {
+                assert_eq!(lm.hostname, "h1");
+                assert_eq!(lm.token, "t1");
+            }
+            _ => panic!("Expected Login variant"),
+        }
+    }
+
+    #[test]
+    fn test_ping_pong_serialization() {
+        let ping = Message::Ping(PingMsg { timestamp: 999 });
+        let json = serde_json::to_string(&ping).unwrap();
+        let deserialized: Message = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Message::Ping(p) => assert_eq!(p.timestamp, 999),
+            _ => panic!("Expected Ping variant"),
+        }
+    }
+
+    #[test]
+    fn test_disconnect_msg_serialization() {
+        let msg = DisconnectMsg {
+            reason: "server shutting down".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: DisconnectMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.reason, "server shutting down");
+    }
+
+    #[test]
+    fn test_register_proxy_resp_msg() {
+        let msg = RegisterProxyRespMsg {
+            name: "proxy-1".to_string(),
+            error: "port already in use".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: RegisterProxyRespMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "proxy-1");
+        assert_eq!(deserialized.error, "port already in use");
+    }
+
+    #[test]
+    fn test_req_work_conn_msg() {
+        let msg = ReqWorkConnMsg {
+            proxy_name: "ssh".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: ReqWorkConnMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.proxy_name, "ssh");
+    }
+
+    #[test]
+    fn test_start_work_conn_msg() {
+        let success = StartWorkConnMsg { error: "".to_string() };
+        let json = serde_json::to_string(&success).unwrap();
+        let deserialized: StartWorkConnMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.error, "");
+
+        let fail = StartWorkConnMsg { error: "connection refused".to_string() };
+        let json = serde_json::to_string(&fail).unwrap();
+        let deserialized: StartWorkConnMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.error, "connection refused");
+    }
+
+    #[test]
+    fn test_proxy_status_msg() {
+        let msg = ProxyStatusMsg { name: "web".to_string() };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: ProxyStatusMsg = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "web");
+    }
+
+    #[tokio::test]
+    async fn test_read_write_message_roundtrip() {
+        let msg = Message::Ping(PingMsg { timestamp: 12345 });
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+        let deserialized = read_message(&mut buf.as_slice()).await.unwrap();
+        match deserialized {
+            Message::Ping(p) => assert_eq!(p.timestamp, 12345),
+            _ => panic!("Expected Ping"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_write_message_login_roundtrip() {
+        let msg = Message::Login(LoginMsg {
+            arch: "amd64".to_string(),
+            os: "linux".to_string(),
+            hostname: "h1".to_string(),
+            pool_count: 10,
+            user: "admin".to_string(),
+            client_id: "c1".to_string(),
+            version: "1.0".to_string(),
+            timestamp: 1000,
+            run_id: "r1".to_string(),
+            token: "secret".to_string(),
+            metas: std::collections::HashMap::new(),
+            client_spec: None,
+        });
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+        let deserialized = read_message(&mut buf.as_slice()).await.unwrap();
+        match deserialized {
+            Message::Login(lm) => {
+                assert_eq!(lm.hostname, "h1");
+                assert_eq!(lm.token, "secret");
+            }
+            _ => panic!("Expected Login"),
+        }
+    }
+
+    #[test]
+    fn test_max_message_size_constant() {
+        assert_eq!(MAX_MESSAGE_SIZE, 10 * 1024 * 1024);
+    }
 }

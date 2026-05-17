@@ -55,13 +55,15 @@
 //! - 启用 TLS 加密传输
 
 use std::env;
-use log::{info, error};
+use tracing::{info, error};
 use rust_frp_config::ConfigLoader;
 use rust_frp_server::Server;
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let args: Vec<String> = env::args().collect();
     let config_path = if args.len() > 2 && args[1] == "-c" {

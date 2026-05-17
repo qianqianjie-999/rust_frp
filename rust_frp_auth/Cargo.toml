@@ -11,5 +11,6 @@ serde_json = { workspace = true }
 log = { workspace = true }
 ring = { workspace = true }
 base64 = { workspace = true }
+thiserror = { workspace = true }
 rust_frp_util = { path = "../rust_frp_util" }
 rust_frp_config = { path = "../rust_frp_config" }

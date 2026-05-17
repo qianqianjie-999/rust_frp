@@ -36,6 +36,29 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
 use futures_util::{Sink, Stream};
 
+// TODO: 迁移 openssl → rustls，统一 TLS 方案
+//   当前 rust_frp_net 使用 openssl，但服务端 Web 使用 rustls，存在双轨问题
+//   迁移步骤：
+//   1. 用 tokio-rustls 替代 tokio-openssl
+//   2. 修改 TlsConfig 的 accept/connect 方法
+//   3. 替换内置证书的加载方式
+
+#[derive(Debug, thiserror::Error)]
+pub enum NetError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("TLS error: {0}")]
+    Tls(#[from] openssl::error::ErrorStack),
+    #[error("not a TLS server config")]
+    NotServerConfig,
+    #[error("not a TLS client config")]
+    NotClientConfig,
+    #[error("TLS config not set")]
+    TlsConfigNotSet,
+    #[error("{0}")]
+    Other(String),
+}
+
 /// 网络连接 trait
 #[async_trait::async_trait]
 pub trait FrpConn: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {
@@ -113,10 +136,7 @@ where
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(Some(Err(e))) => {
-                std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                )))
+                std::task::Poll::Ready(Err(std::io::Error::other(e)))
             }
             std::task::Poll::Ready(Some(Ok(_))) => {
                 // 忽略其他类型的消息
@@ -152,18 +172,12 @@ where
                         std::task::Poll::Ready(Ok(buf.len()))
                     }
                     Err(e) => {
-                        std::task::Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e,
-                        )))
+                        std::task::Poll::Ready(Err(std::io::Error::other(e)))
                     }
                 }
             }
             std::task::Poll::Ready(Err(e)) => {
-                std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                )))
+                std::task::Poll::Ready(Err(std::io::Error::other(e)))
             }
             std::task::Poll::Pending => {
                 std::task::Poll::Pending
@@ -180,10 +194,7 @@ where
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(Err(e)) => {
-                std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                )))
+                std::task::Poll::Ready(Err(std::io::Error::other(e)))
             }
             std::task::Poll::Pending => {
                 std::task::Poll::Pending
@@ -200,10 +211,7 @@ where
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(Err(e)) => {
-                std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                )))
+                std::task::Poll::Ready(Err(std::io::Error::other(e)))
             }
             std::task::Poll::Pending => {
                 std::task::Poll::Pending
@@ -344,7 +352,7 @@ impl TlsConfig {
             let ssl = openssl::ssl::Ssl::new(acceptor)?;
             let mut stream = SslStream::new(ssl, stream)?;
             std::pin::Pin::new(&mut stream).accept().await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             Ok(stream)
         } else {
             Err(std::io::Error::new(
@@ -360,7 +368,7 @@ impl TlsConfig {
             ssl.set_hostname(domain)?;
             let mut stream = SslStream::new(ssl, stream)?;
             std::pin::Pin::new(&mut stream).connect().await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             Ok(stream)
         } else {
             Err(std::io::Error::new(
@@ -411,7 +419,7 @@ impl ConnManager {
 
     pub async fn connect_websocket(&self, url: &str) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error> {
         let (stream, _) = connect_async(url).await.map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
+            std::io::Error::other(e)
         })?;
         let remote_addr = "127.0.0.1:0".parse().unwrap(); // TODO: 从连接中获取实际的远程地址
         Ok(WebSocketConn::new(stream, remote_addr))
@@ -420,7 +428,7 @@ impl ConnManager {
     pub async fn accept_websocket(&self, stream: TokioTcpStream) -> Result<WebSocketConn<TokioTcpStream>, std::io::Error> {
         let remote_addr = stream.peer_addr()?;
         let stream = accept_async(stream).await.map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
+            std::io::Error::other(e)
         })?;
         Ok(WebSocketConn::new(stream, remote_addr))
     }
