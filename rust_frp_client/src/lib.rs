@@ -588,7 +588,14 @@ impl ClientControl {
                         &run_id,
                         &config,
                     ).await {
-                        log::error!("Failed to establish work connection for {}: {:?}", proxy_name, e);
+                        if e.to_string().to_lowercase().contains("connection reset")
+                            || e.to_string().to_lowercase().contains("connection aborted")
+                            || e.to_string().to_lowercase().contains("broken pipe")
+                        {
+                            log::debug!("Work connection for {} closed (peer disconnected): {:?}", proxy_name, e);
+                        } else {
+                            log::error!("Failed to establish work connection for {}: {:?}", proxy_name, e);
+                        }
                     } else {
                         log::debug!("工作连接建立成功: proxy={}", proxy_name);
                     }
