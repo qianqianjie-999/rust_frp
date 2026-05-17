@@ -1,13 +1,19 @@
-# Multi-stage build for FRP Server and Client
-# Usage:
+# 静态编译 Dockerfile — 基于 musl + alpine
+# 构建方式：
 #   docker build --target frps -t frps .
 #   docker build --target frpc -t frpc .
+#
+# 特点：
+#   - 使用 x86_64-unknown-linux-musl 进行完全静态链接
+#   - 最终镜像基于 alpine（仅 ~8MB），无需 glibc
+#   - openssl 通过 vendored 特性静态编译
 
-FROM rust:1.80-slim-bookworm AS builder
+FROM rust:1.80-alpine AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache musl-dev perl make
 
 WORKDIR /app
+
 COPY Cargo.toml Cargo.lock ./
 COPY rust_frp_core/Cargo.toml rust_frp_core/
 COPY rust_frp_server/Cargo.toml rust_frp_server/
@@ -32,7 +38,7 @@ RUN mkdir -p rust_frp_core/src rust_frp_server/src rust_frp_client/src \
     echo 'pub fn dummy() {}' > rust_frp_plugin/src/lib.rs && \
     echo 'pub fn dummy() {}' > rust_frp_util/src/lib.rs
 
-RUN cargo build --release \
+RUN cargo build --release --target x86_64-unknown-linux-musl \
     && rm -rf rust_frp_server/src rust_frp_client/src rust_frp_core/src \
     rust_frp_config/src rust_frp_net/src rust_frp_auth/src \
     rust_frp_plugin/src rust_frp_util/src
@@ -42,19 +48,19 @@ RUN touch rust_frp_core/src/lib.rs rust_frp_server/src/lib.rs rust_frp_client/sr
     rust_frp_config/src/lib.rs rust_frp_net/src/lib.rs rust_frp_auth/src/lib.rs \
     rust_frp_plugin/src/lib.rs rust_frp_util/src/lib.rs
 
-RUN cargo build --release
+RUN cargo build --release --target x86_64-unknown-linux-musl
 
-FROM debian:bookworm-slim AS frps
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/rust_frps /usr/local/bin/rust_frps
+FROM alpine:3.21 AS frps
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/rust_frps /usr/local/bin/rust_frps
 COPY frps.toml /etc/frp/frps.toml
 EXPOSE 9300 8080 8443 7500
 ENTRYPOINT ["rust_frps"]
 CMD ["-c", "/etc/frp/frps.toml"]
 
-FROM debian:bookworm-slim AS frpc
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/rust_frpc /usr/local/bin/rust_frpc
+FROM alpine:3.21 AS frpc
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/rust_frpc /usr/local/bin/rust_frpc
 COPY frpc.toml /etc/frp/frpc.toml
 ENTRYPOINT ["rust_frpc"]
 CMD ["-c", "/etc/frp/frpc.toml"]
