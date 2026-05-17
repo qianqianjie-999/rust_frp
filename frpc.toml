@@ -14,32 +14,27 @@ token = "your_secure_token"
 # 传输配置
 [transport]
 protocol = "tcp"
+# TLS 默认已启用（enable = true）
+# 客户端会自动信任服务器的内置自签名证书
+# 如需使用自定义 CA 证书验证，配置 trusted_ca_file
 tls = { enable = true }
 
 # ============================================
 # 代理配置
 # ============================================
 
-# HTTP 代理示例
+# TCP 代理示例 - 将本地 8080 端口映射到服务器 9302 端口
 [[proxies]]
-name = "http_web"
-type = "http"
-local_ip = "127.0.0.1"
-local_port = 8080
-custom_domains = ["web.example.com"]
-
-# TCP 代理示例
-[[proxies]]
-name = "tcp_ssh"
+name = "tcp_app"
 type = "tcp"
 local_ip = "127.0.0.1"
-local_port = 22
+local_port = 8080
 remote_port = 9302
 
-# HTTPS 代理示例
-[[proxies]]
-name = "https_web"
-type = "https"
-local_ip = "127.0.0.1"
-local_port = 8443
-custom_domains = ["secure.example.com"]
+# HTTP 代理示例（如果需要）
+# [[proxies]]
+# name = "http_web"
+# type = "http"
+# local_ip = "127.0.0.1"
+# local_port = 8080
+# custom_domains = ["web.example.com"]

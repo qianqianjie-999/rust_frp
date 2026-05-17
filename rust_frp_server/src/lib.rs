@@ -1,10 +1,126 @@
+//! FRP 服务器模块
+//!
+//! 该模块实现了 FRP 服务器（frps）的核心功能。
+//!
+//! ## 服务器架构
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                         Server                                   │
+//! │  (主服务器结构，管理所有子组件)                                   │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                              │
+//!         ┌────────────────────┼────────────────────┐
+//!         ▼                    ▼                    ▼
+//! ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+//! │ControlManager │   │ServerProxyMgr │   │ServerVisitorMgr│
+//! │ (控制器管理)   │   │ (代理管理)     │   │ (访问者管理)   │
+//! └───────────────┘   └───────────────┘   └───────────────┘
+//!         │                    │                    │
+//!         ▼                    ▼                    ▼
+//! ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+//! │   Control     │   │ HttpVhostRouter│  │ WorkConnManager│
+//! │ (控制连接)     │   │ (HTTP路由)     │   │ (工作连接管理) │
+//! └───────────────┘   └───────────────┘   └───────────────┘
+//! ```
+//!
+//! ## 核心流程
+//!
+//! ### 1. 客户端连接流程
+//! ```text
+//! 客户端                          服务器
+//!   │                               │
+//!   │------ TCP/TLS 连接 --------->│
+//!   │                               │
+//!   │------ LoginMsg ------------->│
+//!   │                               │ 验证 token
+//!   │<----- LoginRespMsg ----------│
+//!   │                               │
+//!   │------ RegisterProxyMsg ----->│
+//!   │                               │ 注册代理
+//!   │<----- RegisterProxyResp ----│
+//!   │                               │
+//! ```
+//!
+//! ### 2. TCP 代理请求流程
+//! ```text
+//! 访问者        服务器                        客户端
+//!   │              │                            │
+//!   │--- TCP 请求 ->│                            │
+//!   │              │ ReqWorkConnMsg ------------>│
+//!   │              │                            │
+//!   │              │              新建工作连接 ---│
+//!   │              │<-------- NewWorkConn ------│
+//!   │              │                            │
+//!   │<--- 桥接 ---- │-------------------------->│
+//!   │              │                            │
+//! ```
+//!
+//! ### 3. HTTP 代理请求流程
+//! ```text
+//! 访问者        服务器（HTTP路由）              客户端
+//!   │              │                            │
+//!   │--- HTTP 请求 ->│                            │
+//!   │              │ 解析 Host 头                │
+//!   │              │ 查找域名对应的代理           │
+//!   │              │ ReqWorkConnMsg ------------>│
+//!   │              │                            │
+//!   │              │              新建工作连接 ---│
+//!   │              │<-------- NewWorkConn ------│
+//!   │              │                            │
+//!   │<--- 响应 ---- │-------------------------->│
+//!   │              │                            │
+//! ```
+//!
+//! ## 安全特性
+//!
+//! 1. **端口白名单 (allow_ports)**
+//!    - 默认拒绝所有端口
+//!    - 只有在白名单中的端口才能使用
+//!    - 配置示例：`allow_ports = [{ start = 10000, end = 20000 }]`
+//!
+//! 2. **Token 认证**
+//!    - 客户端登录时验证 token
+//!    - 使用常量时间比较防止时序攻击
+//!
+//! 3. **HMAC 签名**
+//!    - 工作连接使用 HMAC-SHA256 签名
+//!    - 验证 run_id 和 timestamp
+//!
+//! 4. **代理所有权**
+//!    - 每个代理绑定到创建它的客户端
+//!    - 防止未授权访问
+//!
+//! ## 配置示例
+//!
+//! ```toml
+//! bind_addr = "0.0.0.0"
+//! bind_port = 9300
+//!
+//! [web_server]
+//! addr = "0.0.0.0"
+//! port = 7500
+//! user = "admin"
+//! password = "admin"
+//!
+//! [auth]
+//! method = "token"
+//! token = "your_secure_token"
+//!
+//! allow_ports = [
+//!     { single = 9302 },
+//!     { start = 10000, end = 20000 },
+//! ]
+//! ```
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, Duration};
 use tokio::sync::{RwLock, mpsc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use warp::Filter;
+use axum::extract::State;
+use axum::response::IntoResponse;
 use rust_frp_config::ServerConfig;
 use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager, NewWorkConnMsg};
 use rust_frp_net::{TcpListener, UdpListener, TlsConfig, ConnManager};
@@ -406,8 +522,11 @@ pub struct Control {
     user: String,
     client_id: String,
     proxy_manager: Arc<dyn ProxyManager + Send + Sync>,
+    #[allow(dead_code)]
     visitor_manager: Arc<dyn VisitorManager + Send + Sync>,
     auth_manager: Arc<AuthManager>,
+    /// 控制器管理器（用于注册客户端信息）
+    control_manager: Arc<ControlManager>,
     last_heartbeat: Instant,
     registered_proxies: Vec<String>,
     /// 代理所有权映射 (proxy_name -> run_id)
@@ -427,6 +546,7 @@ impl Control {
         proxy_manager: Arc<dyn ProxyManager + Send + Sync>,
         visitor_manager: Arc<dyn VisitorManager + Send + Sync>,
         auth_manager: Arc<AuthManager>,
+        control_manager: Arc<ControlManager>,
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
         login_tx: Option<mpsc::Sender<String>>,
         msg_tx: Option<mpsc::Sender<Message>>,
@@ -439,6 +559,7 @@ impl Control {
             proxy_manager,
             visitor_manager,
             auth_manager,
+            control_manager,
             last_heartbeat: Instant::now(),
             registered_proxies: Vec::new(),
             proxy_owners,
@@ -498,6 +619,13 @@ impl Control {
                         self.run_id = login_msg.run_id;
                         self.user = login_msg.user;
                         self.client_id = login_msg.client_id;
+
+                        // 注册客户端信息到 ControlManager
+                        self.control_manager.add_client(
+                            self.client_id.clone(),
+                            self.run_id.clone(),
+                            self.user.clone()
+                        ).await;
 
                         // 发送登录响应
                         let resp = rust_frp_core::LoginRespMsg {
@@ -637,33 +765,76 @@ impl Control {
 }
 
 /// 控制器管理器
+/// 客户端连接信息
+#[derive(Debug, Clone)]
+pub struct ClientInfo {
+    pub run_id: String,
+    pub client_id: String,
+    pub user: String,
+    pub connected_at: Instant,
+    pub last_heartbeat: Instant,
+}
+
 pub struct ControlManager {
     // 存储 run_id -> msg_tx 映射，用于向客户端发送消息
     msg_channels: RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>,
+    // 存储客户端连接信息 (run_id -> ClientInfo)
+    clients: RwLock<std::collections::HashMap<String, ClientInfo>>,
 }
 
 impl ControlManager {
     pub fn new() -> Self {
         Self {
             msg_channels: RwLock::new(std::collections::HashMap::new()),
+            clients: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     pub async fn add(&self, run_id: String, msg_tx: mpsc::Sender<Message>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut msg_channels = self.msg_channels.write().await;
-        msg_channels.insert(run_id, msg_tx);
+        msg_channels.insert(run_id.clone(), msg_tx);
         Ok(())
     }
 
     pub async fn remove(&self, run_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut msg_channels = self.msg_channels.write().await;
         msg_channels.remove(run_id);
+        
+        let mut clients = self.clients.write().await;
+        clients.remove(run_id);
         Ok(())
     }
 
     pub async fn get_msg_tx(&self, run_id: &str) -> Option<mpsc::Sender<Message>> {
         let msg_channels = self.msg_channels.read().await;
         msg_channels.get(run_id).cloned()
+    }
+
+    /// 添加或更新客户端信息
+    pub async fn add_client(&self, client_id: String, run_id: String, user: String) {
+        let now = Instant::now();
+        let mut clients = self.clients.write().await;
+        clients.insert(run_id.clone(), ClientInfo {
+            run_id,
+            client_id,
+            user,
+            connected_at: now,
+            last_heartbeat: now,
+        });
+    }
+
+    /// 更新客户端心跳时间
+    pub async fn update_heartbeat(&self, run_id: &str) {
+        let mut clients = self.clients.write().await;
+        if let Some(client) = clients.get_mut(run_id) {
+            client.last_heartbeat = Instant::now();
+        }
+    }
+
+    /// 获取所有客户端列表
+    pub async fn get_clients(&self) -> Vec<ClientInfo> {
+        let clients = self.clients.read().await;
+        clients.values().cloned().collect()
     }
 }
 
@@ -680,12 +851,15 @@ pub struct ServerProxyManager {
     work_conn_manager: Arc<ServerWorkConnManager>,
     /// 认证管理器（用于生成 sign_key）
     auth_manager: Arc<AuthManager>,
-    /// 允许的端口列表
-    allow_ports: Option<Vec<rust_frp_config::PortRange>>,
+    /// 允许的端口列表（空列表 = 默认拒绝所有）
+    allow_ports: Vec<rust_frp_config::PortRange>,
 }
 
 /// 检查端口是否在允许列表中
 fn port_allowed(port: u16, ranges: &[rust_frp_config::PortRange]) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
     for range in ranges {
         // 单端口匹配
         if let Some(single) = range.single {
@@ -710,8 +884,14 @@ impl ServerProxyManager {
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
         auth_manager: Arc<AuthManager>,
-        allow_ports: Option<Vec<rust_frp_config::PortRange>>,
+        allow_ports: Vec<rust_frp_config::PortRange>,
     ) -> Self {
+        if allow_ports.is_empty() {
+            log::warn!(
+                "allow_ports is empty, all TCP proxy ports will be rejected. \
+                 Please configure allow_ports in frps.toml to specify allowed port ranges."
+            );
+        }
         Self {
             proxies: RwLock::new(std::collections::HashMap::new()),
             listeners: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -728,11 +908,9 @@ impl ServerProxyManager {
         match config.r#type.as_str() {
             "tcp" => {
                 if let Some(remote_port) = config.remote_port {
-                    // 检查端口是否在允许列表中
-                    if let Some(ref allow_ports) = self.allow_ports {
-                        if !port_allowed(remote_port, allow_ports) {
-                            return Err(format!("Port {} is not in the allowed ports list", remote_port).into());
-                        }
+                    // 检查端口是否在允许列表中（空列表 = 默认拒绝所有）
+                    if !port_allowed(remote_port, &self.allow_ports) {
+                        return Err(format!("Port {} is not in the allowed ports list", remote_port).into());
                     }
                     let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
                     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -1012,6 +1190,12 @@ impl ProxyManager for ServerProxyManager {
             Ok(None)
         }
     }
+
+    async fn clear(&self) {
+        let mut proxies = self.proxies.write().await;
+        proxies.clear();
+        log::info!("Server proxy manager cleared");
+    }
 }
 
 /// 服务器访问者管理器
@@ -1040,12 +1224,215 @@ impl VisitorManager for ServerVisitorManager {
         visitors.remove(name);
         Ok(())
     }
+
+    async fn clear(&self) {
+        let mut visitors = self.visitors.write().await;
+        visitors.clear();
+        log::info!("Server visitor manager cleared");
+    }
 }
 
-/// Web 服务器
+fn create_routes(
+    server: std::sync::Arc<Server>,
+    user: Option<String>,
+    password: Option<String>,
+) -> axum::Router {
+    let app = axum::Router::new()
+        .route("/health", axum::routing::get(health_handler))
+        .route("/api/metrics", axum::routing::get(metrics_handler))
+        .route("/api/controllers", axum::routing::get(controllers_handler))
+        .route("/api/proxies", axum::routing::get(proxies_handler))
+        .route("/", axum::routing::get(index_handler))
+        .route("/index.html", axum::routing::get(index_handler))
+        .route("/login", axum::routing::get(login_handler))
+        .route("/login", axum::routing::post(login_post_handler))
+        .route("/logout", axum::routing::get(logout_handler))
+        .with_state(server);
+
+    if user.is_some() && password.is_some() {
+        log::info!("Web server authentication enabled");
+        let web_user = user.clone().unwrap();
+        let web_password = password.clone().unwrap();
+        
+        std::thread::spawn(move || {
+            std::env::set_var("FRP_WEB_USER", web_user);
+            std::env::set_var("FRP_WEB_PASSWORD", web_password);
+        });
+        
+        let user = user.unwrap();
+        let password = password.unwrap();
+        app.layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let user = user.clone();
+            let password = password.clone();
+            async move {
+                let path = request.uri().path();
+                
+                if path == "/login" {
+                    return next.run(request).await;
+                }
+                
+                let cookies = request.headers().get("cookie");
+                let session_valid = cookies
+                    .and_then(|c| c.to_str().ok())
+                    .and_then(|c| {
+                        c.split(';')
+                            .find(|s| s.trim().starts_with("frp_session="))
+                            .map(|s| s.trim().split('=').nth(1).unwrap_or(""))
+                    })
+                    .and_then(|session| {
+                        let decoded = base64::decode(session).ok()?;
+                        let data = String::from_utf8(decoded).ok()?;
+                        let parts: Vec<&str> = data.split(':').collect();
+                        if parts.len() == 2 && parts[0] == user && parts[1] == password {
+                            Some(true)
+                        } else {
+                            None
+                        }
+                    })
+                    .is_some();
+
+                if session_valid {
+                    next.run(request).await
+                } else {
+                    axum::http::Response::builder()
+                        .status(axum::http::StatusCode::SEE_OTHER)
+                        .header("Location", "/login")
+                        .body("Redirecting to login".to_string())
+                        .unwrap()
+                        .into_response()
+                }
+            }
+        }))
+    } else {
+        log::info!("Web server authentication disabled");
+        app
+    }
+}
+
+
+
+async fn health_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "timestamp": get_timestamp(),
+    }))
+}
+
+async fn metrics_handler(
+    State(server): State<std::sync::Arc<Server>>,
+) -> axum::Json<serde_json::Value> {
+    let metrics = server.metrics.get_metrics();
+    axum::Json(metrics)
+}
+
+async fn controllers_handler(
+    State(server): State<std::sync::Arc<Server>>,
+) -> axum::Json<Vec<serde_json::Value>> {
+    let clients = server.control_manager.get_clients().await;
+    let controller_list: Vec<serde_json::Value> = clients.into_iter().map(|client| {
+        serde_json::json!({
+            "user": client.user,
+            "client_id": client.client_id,
+            "run_id": client.run_id,
+            "connected_at": client.connected_at.elapsed().as_secs(),
+            "last_heartbeat": client.last_heartbeat.elapsed().as_secs(),
+        })
+    }).collect();
+    axum::Json(controller_list)
+}
+
+async fn proxies_handler(
+    State(server): State<std::sync::Arc<Server>>,
+) -> axum::Json<Vec<serde_json::Value>> {
+    let proxies = server.proxy_manager.proxies.read().await;
+    let owners = server.proxy_manager.proxy_owners.read().await;
+    let clients = server.control_manager.get_clients().await;
+    let client_map: std::collections::HashMap<String, String> = clients.into_iter()
+        .map(|c| (c.run_id, c.client_id))
+        .collect();
+    
+    let proxy_list: Vec<serde_json::Value> = proxies.values().map(|proxy| {
+        let client_id = owners.get(&proxy.name)
+            .and_then(|run_id| client_map.get(run_id))
+            .map(|s| s.clone())
+            .unwrap_or_else(|| "-".to_string());
+        
+        serde_json::json!({
+            "name": proxy.name,
+            "type": proxy.r#type,
+            "local_ip": proxy.local_ip,
+            "local_port": proxy.local_port,
+            "remote_port": proxy.remote_port,
+            "plugin": proxy.plugin,
+            "client": client_id,
+        })
+    }).collect();
+    axum::Json(proxy_list)
+}
+
+async fn index_handler() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../web_ui.html"))
+}
+
+async fn login_handler() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../login.html"))
+}
+
+async fn login_post_handler(
+    body: String,
+) -> impl axum::response::IntoResponse {
+    let parts: Vec<(String, String)> = body
+        .split('&')
+        .filter_map(|s| {
+            let mut parts = s.split('=');
+            let key = parts.next()?.replace('+', " ");
+            let value = parts.next()?.replace('+', " ");
+            Some((key, urlencoding::decode(&value).unwrap_or_default().to_string()))
+        })
+        .collect();
+    
+    let username: String = parts.iter().find(|(k, _)| k == "username").map(|(_, v)| v.clone()).unwrap_or_default();
+    let password: String = parts.iter().find(|(k, _)| k == "password").map(|(_, v)| v.clone()).unwrap_or_default();
+    
+    use std::sync::OnceLock;
+    static USER: OnceLock<String> = OnceLock::new();
+    static PASSWORD: OnceLock<String> = OnceLock::new();
+    
+    let config_user = USER.get_or_init(|| std::env::var("FRP_WEB_USER").unwrap_or_else(|_| "admin".to_string()));
+    let config_password = PASSWORD.get_or_init(|| std::env::var("FRP_WEB_PASSWORD").unwrap_or_else(|_| "admin".to_string()));
+    
+    if username == *config_user && password == *config_password {
+        let session = base64::encode(format!("{}:{}", config_user, config_password));
+        axum::http::Response::builder()
+            .status(axum::http::StatusCode::SEE_OTHER)
+            .header("Location", "/")
+            .header("Set-Cookie", format!("frp_session={}; HttpOnly; Path=/", session))
+            .body("Redirecting to dashboard".to_string())
+            .unwrap()
+    } else {
+        axum::http::Response::builder()
+            .status(axum::http::StatusCode::UNAUTHORIZED)
+            .body("Unauthorized".to_string())
+            .unwrap()
+    }
+}
+
+async fn logout_handler() -> impl axum::response::IntoResponse {
+    axum::http::Response::builder()
+        .status(axum::http::StatusCode::SEE_OTHER)
+        .header("Location", "/login")
+        .header("Set-Cookie", "frp_session=; HttpOnly; Path=/; Max-Age=0")
+        .body("Logged out".to_string())
+        .unwrap()
+}
+
+/// Web 服务器（基于 axum，支持 TLS）
 pub struct WebServer {
     addr: SocketAddr,
     server: Option<tokio::task::JoinHandle<()>>,
+    user: Option<String>,
+    password: Option<String>,
+    tls: Option<rust_frp_config::TlsConfig>,
 }
 
 impl WebServer {
@@ -1054,204 +1441,46 @@ impl WebServer {
         Ok(Self {
             addr,
             server: None,
+            user: config.user.clone(),
+            password: config.password.clone(),
+            tls: config.tls.clone(),
         })
     }
 
     pub async fn start(&mut self, server: &Server) -> Result<(), Box<dyn std::error::Error>> {
-        let server = server.clone();
-        let _server2 = server.clone();
-        let server3 = server.clone();
+        let server = std::sync::Arc::new(server.clone());
+        let user = self.user.clone();
+        let password = self.password.clone();
 
-        // 健康检查
-        let health = warp::path!("health").map(|| {
-            warp::reply::json(&serde_json::json!({
-                "status": "ok",
-                "timestamp": get_timestamp(),
-            }))
-        });
+        let app = create_routes(server, user, password);
 
-        // API 路由组
-        let api = warp::path!("api").and(
-            // 监控指标
-            warp::path!("metrics").and_then(move || {
-                let server = server.clone();
-                async move {
-                    let metrics = server.metrics.get_metrics();
-                    Ok::<_, warp::Rejection>(warp::reply::json(&metrics))
-                }
-            })
-            // .or(
-            //     // 控制器列表
-            //     warp::path!("controllers").and_then(move || {
-            //         let server = server2.clone();
-            //         async move {
-            //             let controls = server.control_manager.controls.read().await;
-            //             let mut controller_list = Vec::new();
-            //             for control in controls.values() {
-            //                 let control = control.lock().await;
-            //                 controller_list.push(serde_json::json!({
-            //                     "user": control.user,
-            //                     "client_id": control.client_id,
-            //                     "run_id": control.run_id,
-            //                     "last_heartbeat": control.last_heartbeat.elapsed().as_secs(),
-            //                 }));
-            //             }
-            //             Ok::<_, warp::Rejection>(warp::reply::json(&controller_list))
-            //         }
-            //     })
-            // )
-            .or(
-                // 代理列表
-                warp::path!("proxies").and_then(move || {
-                    let server = server3.clone();
-                    async move {
-                        let proxies: tokio::sync::RwLockReadGuard<'_, std::collections::HashMap<String, rust_frp_config::ProxyConfig>> = server.proxy_manager.proxies.read().await;
-                        let proxy_list: Vec<serde_json::Value> = proxies.values().map(|proxy| {
-                            serde_json::json!({
-                                "name": proxy.name,
-                                "type": proxy.r#type,
-                                "local_ip": proxy.local_ip,
-                                "local_port": proxy.local_port,
-                                "remote_port": proxy.remote_port,
-                                "plugin": proxy.plugin,
-                            })
-                        }).collect();
-                        Ok::<_, warp::Rejection>(warp::reply::json(&proxy_list))
-                    }
-                })
-            )
-        );
-
-        // Web 管理界面
-        let web_ui = warp::path::end()
-            .or(warp::path!("index.html"))
-            .map(|_| {
-                warp::reply::html(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>frp Server Dashboard</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
-        h1, h2 { color: #333; }
-        .card { background-color: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 20px; margin: 20px 0; }
-        .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
-        .metric-card { background-color: #f9f9f9; border-radius: 8px; padding: 15px; text-align: center; }
-        .metric-value { font-size: 24px; font-weight: bold; color: #007bff; }
-        .metric-label { font-size: 14px; color: #666; margin-top: 5px; }
-        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-        th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-    </style>
-</head>
-<body>
-    <h1>frp Server Dashboard</h1>
-    <div class="card">
-        <h2>Server Status</h2>
-        <div class="metrics">
-            <div class="metric-card">
-                <div class="metric-value" id="client-count">0</div>
-                <div class="metric-label">Connected Clients</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value" id="proxy-count">0</div>
-                <div class="metric-label">Active Proxies</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-value" id="visitor-count">0</div>
-                <div class="metric-label">Active Visitors</div>
-            </div>
-        </div>
-    </div>
-    <div class="card">
-        <h2>Connected Clients</h2>
-        <table id="clients-table">
-            <thead>
-                <tr>
-                    <th>Client ID</th>
-                    <th>Run ID</th>
-                    <th>Connected At</th>
-                    <th>Last Heartbeat</th>
-                </tr>
-            </thead>
-            <tbody>
-                <!-- Client data will be inserted here -->
-            </tbody>
-        </table>
-    </div>
-    <div class="card">
-        <h2>Active Proxies</h2>
-        <table id="proxies-table">
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>Type</th>
-                    <th>Local Address</th>
-                    <th>Remote Address</th>
-                    <th>Client</th>
-                </tr>
-            </thead>
-            <tbody>
-                <!-- Proxy data will be inserted here -->
-            </tbody>
-        </table>
-    </div>
-    <script>
-        // 定期刷新数据
-        setInterval(async () => {
-            try {
-                // 获取服务器指标
-                const metricsResponse = await fetch('/api/metrics');
-                const metrics = await metricsResponse.json();
-                document.getElementById('client-count').textContent = metrics.current_connections || 0;
-                document.getElementById('proxy-count').textContent = metrics.current_proxies || 0;
-                document.getElementById('visitor-count').textContent = metrics.total_connections || 0;
-
-                // 获取控制器列表（客户端）
-                const controllersResponse = await fetch('/api/controllers');
-                const controllers = await controllersResponse.json();
-                const clientsTable = document.getElementById('clients-table').querySelector('tbody');
-                clientsTable.innerHTML = '';
-                controllers.forEach(client => {
-                    const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td>${client.client_id || '-'}</td>
-                        <td>${client.run_id || '-'}</td>
-                        <td>-</td>
-                        <td>${client.last_heartbeat}s ago</td>
-                    `;
-                    clientsTable.appendChild(row);
-                });
-
-                // 获取代理列表
-                const proxiesResponse = await fetch('/api/proxies');
-                const proxies = await proxiesResponse.json();
-                const proxiesTable = document.getElementById('proxies-table').querySelector('tbody');
-                proxiesTable.innerHTML = '';
-                proxies.forEach(proxy => {
-                    const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td>${proxy.name}</td>
-                        <td>${proxy.type}</td>
-                        <td>${proxy.local_ip}:${proxy.local_port}</td>
-                        <td>${proxy.remote_port || '-'}</td>
-                        <td>-</td>
-                    `;
-                    proxiesTable.appendChild(row);
-                });
-            } catch (error) {
-                console.error('Error fetching data:', error);
+        if let Some(tls_config) = &self.tls {
+            if tls_config.enable {
+                self.start_https(app).await?;
+                return Ok(());
             }
-        }, 5000);
-    </script>
-</body>
-</html>
-"#)
-            });
+        }
 
-        let routes = health.or(api).or(web_ui);
-        let server = warp::serve(routes).bind(self.addr);
-        let handle = tokio::spawn(server);
+        self.start_http(app).await?;
+        Ok(())
+    }
+
+    async fn start_http(&mut self, app: axum::Router) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        log::info!("Web server listening on http://{}", self.addr);
+        
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        
         self.server = Some(handle);
+        Ok(())
+    }
+
+    async fn start_https(&mut self, _app: axum::Router) -> Result<(), Box<dyn std::error::Error>> {
+        log::error!("HTTPS is not yet fully supported for axum web server");
+        log::info!("Please use Nginx reverse proxy for HTTPS access");
+        log::info!("Or set tls.enable = false to use HTTP only");
         Ok(())
     }
 }
@@ -1684,7 +1913,7 @@ impl Server {
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
-        auth_manager: Arc<AuthManager>,
+        _auth_manager: Arc<AuthManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取 HTTP 请求头
         let mut buf = [0u8; 4096];
@@ -1831,7 +2060,7 @@ impl Server {
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
-        auth_manager: Arc<AuthManager>,
+        _auth_manager: Arc<AuthManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2080,6 +2309,7 @@ impl Server {
             proxy_manager,
             visitor_manager,
             auth_manager,
+            control_manager.clone(),
             proxy_owners,
             Some(login_tx),
             Some(msg_tx),

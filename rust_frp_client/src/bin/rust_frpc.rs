@@ -1,3 +1,45 @@
+//! FRP 客户端入口程序 (rust_frpc)
+//!
+//! 这是 FRP 客户端的命令行入口点，负责：
+//!
+//! ## 主要职责
+//!
+//! 1. **解析命令行参数**
+//!    - 支持 `-c <config_path>` 指定配置文件
+//!    - 默认配置文件：`frpc.toml`
+//!
+//! 2. **加载配置**
+//!    - 从 TOML 文件加载客户端配置
+//!    - 验证配置项
+//!
+//! 3. **启动客户端**
+//!    - 创建 Client 实例
+//!    - 调用 `client.start()` 启动客户端
+//!
+//! ## 使用方法
+//!
+//! ```bash
+//! # 使用默认配置文件 frpc.toml
+//! rust_frpc
+//!
+//! # 指定配置文件
+//! rust_frpc -c /path/to/config.toml
+//! ```
+//!
+//! ## 配置文件格式
+//!
+//! ```toml
+//! server_addr = "127.0.0.1"
+//! server_port = 9300
+//!
+//! [[proxies]]
+//! name = "ssh"
+//! type = "tcp"
+//! local_ip = "127.0.0.1"
+//! local_port = 22
+//! remote_port = 6000
+//! ```
+
 use std::env;
 use log::{info, error};
 use rust_frp_config::ConfigLoader;

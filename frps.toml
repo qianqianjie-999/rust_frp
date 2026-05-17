@@ -5,7 +5,6 @@
 # 【重要】TOML 格式要求：
 #   - 顶级键值对（如 vhost_http_port）必须写在 [table] 之前！
 #   - [table] 定义之后不能有顶级键值对
-#
 
 # 服务器基本配置（必须在 [table] 之前）
 bind_addr = "0.0.0.0"
@@ -16,17 +15,38 @@ bind_port = 9300
 work_conn_port = 10300
 
 # HTTP/HTTPS 虚主机端口（必须在 [table] 之前）
-# 如果不配置，将使用默认值：HTTP=9090, HTTPS=9091
-vhost_http_port = 9090
-vhost_https_port = 9091
+# 用户配置的 HTTP 端口为 8080或8443（非特权端口）
+vhost_http_port = 8080
+vhost_https_port = 8443
+
+# 端口白名单配置（安全增强）
+# 【重要】默认拒绝所有未明确允许的端口！
+# 必须配置此列表才能正常使用 TCP 代理功能
+allow_ports = [
+    # 单端口示例（remote_port = 9302 需要被允许）
+    { single = 9302 },
+    { single = 9303 },
+    { single = 9304 },
+    # 端口范围示例
+    { start = 10000, end = 20000 },
+]
 
 # Web 服务器配置
+# 【重要安全建议】：
+#   1. 建议仅监听本地地址 127.0.0.1
+#   2. 通过 Nginx 反向代理提供 HTTPS 访问
+#   3. 不要直接暴露在公网(忽略安全 addr = "公网ip")
+#   4. 配置用户名密码认证保护
 [web_server]
-addr = "0.0.0.0"
+addr = "127.0.0.1"
 port = 7500
 user = "admin"
 password = "admin"
-tls = { enable = false }
+
+# Web 服务器 TLS 配置（暂时保留但建议禁用）
+# HTTPS 功能将通过 Nginx 反向代理提供
+[web_server.tls]
+enable = false
 
 # 认证配置
 [auth]
@@ -36,6 +56,8 @@ token = "your_secure_token"
 # 传输配置
 [transport]
 protocol = "tcp"
+# TLS 默认已启用（enable = true）
+# 如需使用自定义证书，配置 cert_file 和 key_file
 tls = { enable = true }
 tcp_mux = true
 pool_count = 10
