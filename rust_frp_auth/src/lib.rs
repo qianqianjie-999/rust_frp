@@ -43,6 +43,31 @@ use ring::digest;
 use ring::constant_time;
 use base64::encode;
 
+/// 认证模块错误类型
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("invalid token")]
+    InvalidToken,
+
+    #[error("token is required for token auth")]
+    TokenRequired,
+
+    #[error("unsupported auth method: {0}")]
+    UnsupportedMethod(String),
+
+    #[error("OIDC config is required for OIDC auth")]
+    OidcConfigRequired,
+
+    #[error("encryption key not set")]
+    EncryptionKeyNotSet,
+
+    #[error("HMAC signing failed")]
+    HmacSignError,
+
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
 /// 安全比较两个字节切片
 ///
 /// # 安全性
@@ -362,11 +387,7 @@ impl AuthManager {
         };
 
         // 从 token 派生加密密钥
-        let encryption_key = if let Some(token) = &auth_config.token {
-            Some(Self::generate_encryption_key(token))
-        } else {
-            None
-        };
+        let encryption_key = auth_config.token.as_ref().map(|token| Self::generate_encryption_key(token));
 
         Ok(Self {
             verifier,
@@ -537,5 +558,154 @@ impl AuthManager {
                 "encryption key not set",
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_time_compare_equal() {
+        assert!(constant_time_compare(b"hello", b"hello"));
+    }
+
+    #[test]
+    fn test_constant_time_compare_different() {
+        assert!(!constant_time_compare(b"hello", b"world"));
+    }
+
+    #[test]
+    fn test_constant_time_compare_different_length() {
+        assert!(!constant_time_compare(b"hello", b"hell"));
+        assert!(!constant_time_compare(b"hi", b"hello"));
+    }
+
+    #[test]
+    fn test_constant_time_compare_empty() {
+        assert!(constant_time_compare(b"", b""));
+    }
+
+    #[tokio::test]
+    async fn test_token_auth_verify_login_success() {
+        let verifier = TokenAuthVerifier::new("secret123");
+        let result = verifier.verify_login("user", "secret123").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_token_auth_verify_login_wrong_token() {
+        let verifier = TokenAuthVerifier::new("secret123");
+        let result = verifier.verify_login("user", "wrong_token").await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_token_auth_generate_sign() {
+        let verifier = TokenAuthVerifier::new("secret123");
+        let sign1 = verifier.generate_sign(1234567890);
+        let sign2 = verifier.generate_sign(1234567890);
+        assert_eq!(sign1, sign2);
+    }
+
+    #[test]
+    fn test_token_auth_generate_sign_different_timestamp() {
+        let verifier = TokenAuthVerifier::new("secret123");
+        let sign1 = verifier.generate_sign(111);
+        let sign2 = verifier.generate_sign(222);
+        assert_ne!(sign1, sign2);
+    }
+
+    #[tokio::test]
+    async fn test_token_auth_verify_work_conn() {
+        let verifier = TokenAuthVerifier::new("secret123");
+        let result = verifier.verify_work_conn("user", "secret123").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_new_token() {
+        let config = AuthConfig {
+            method: "token".to_string(),
+            token: Some("my_token".to_string()),
+            oidc: None,
+        };
+        let manager = AuthManager::new(&config);
+        assert!(manager.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_new_missing_token() {
+        let config = AuthConfig {
+            method: "token".to_string(),
+            token: None,
+            oidc: None,
+        };
+        let manager = AuthManager::new(&config);
+        assert!(manager.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_unsupported_method() {
+        let config = AuthConfig {
+            method: "unknown".to_string(),
+            token: Some("token".to_string()),
+            oidc: None,
+        };
+        let manager = AuthManager::new(&config);
+        assert!(manager.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_encryption_key() {
+        let config = AuthConfig {
+            method: "token".to_string(),
+            token: Some("my_token".to_string()),
+            oidc: None,
+        };
+        let manager = AuthManager::new(&config).unwrap();
+        assert!(manager.encryption_key().is_some());
+        assert_eq!(manager.encryption_key().unwrap().len(), 32);
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_encrypt_decrypt() {
+        let config = AuthConfig {
+            method: "token".to_string(),
+            token: Some("my_token".to_string()),
+            oidc: None,
+        };
+        let manager = AuthManager::new(&config).unwrap();
+        let data = b"hello world";
+        let encrypted = manager.encrypt(data).unwrap();
+        let decrypted = manager.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_verify_login() {
+        let config = AuthConfig {
+            method: "token".to_string(),
+            token: Some("my_token".to_string()),
+            oidc: None,
+        };
+        let manager = AuthManager::new(&config).unwrap();
+        assert!(manager.verify_login("user", "my_token").await.is_ok());
+        assert!(manager.verify_login("user", "wrong").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_generate_work_conn_sign_key() {
+        let config = AuthConfig {
+            method: "token".to_string(),
+            token: Some("my_token".to_string()),
+            oidc: None,
+        };
+        let manager = AuthManager::new(&config).unwrap();
+        let key1 = manager.generate_work_conn_sign_key("run_001").await.unwrap();
+        let key2 = manager.generate_work_conn_sign_key("run_001").await.unwrap();
+        assert_eq!(key1, key2);
+        let key3 = manager.generate_work_conn_sign_key("run_002").await.unwrap();
+        assert_ne!(key1, key3);
     }
 }

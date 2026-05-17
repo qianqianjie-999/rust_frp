@@ -34,6 +34,22 @@ use std::io::Read;
 use std::path::Path;
 use glob::glob;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("TOML parse error: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("YAML parse error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("glob pattern error: {0}")]
+    Glob(#[from] glob::PatternError),
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
+}
+
 /// 服务器配置 - 定义 FRP 服务器的所有配置选项
 ///
 /// # 配置示例
@@ -83,9 +99,13 @@ pub struct ServerConfig {
     pub bind_port: u16,
 
     /// KCP 协议绑定端口（可选，UDP）
+    // TODO: KCP 协议尚未实现
+    #[allow(dead_code)]
     pub kcp_bind_port: Option<u16>,
 
     /// QUIC 协议绑定端口（可选，UDP）
+    // TODO: QUIC 协议尚未实现
+    #[allow(dead_code)]
     pub quic_bind_port: Option<u16>,
 
     /// HTTP 虚主机端口，用于 HTTP 代理
@@ -1060,5 +1080,249 @@ impl ConfigLoader {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_server_config() {
+        let config = ServerConfig::default();
+        assert_eq!(config.bind_addr, "0.0.0.0");
+        assert_eq!(config.bind_port, 7000);
+        assert!(config.vhost_http_port.is_none());
+        assert!(config.allow_ports.is_empty());
+    }
+
+    #[test]
+    fn test_default_client_config() {
+        let config = ClientConfig::default();
+        assert_eq!(config.server_addr, "127.0.0.1");
+        assert_eq!(config.server_port, 7000);
+        assert!(config.proxies.is_empty());
+    }
+
+    #[test]
+    fn test_parse_config_toml() {
+        let toml_str = r#"
+bind_addr = "0.0.0.0"
+bind_port = 9300
+vhost_http_port = 8080
+
+[auth]
+method = "token"
+token = "test_token"
+
+[[allow_ports]]
+single = 8080
+"#;
+        let config: ServerConfig = ConfigLoader::parse_config::<ServerConfig>(toml_str).unwrap();
+        assert_eq!(config.bind_addr, "0.0.0.0");
+        assert_eq!(config.bind_port, 9300);
+        assert_eq!(config.vhost_http_port, Some(8080));
+        assert_eq!(config.auth.token, Some("test_token".to_string()));
+        assert_eq!(config.allow_ports.len(), 1);
+        assert_eq!(config.allow_ports[0].single, Some(8080));
+    }
+
+    #[test]
+    fn test_parse_config_json() {
+        let json_str = r#"{
+            "bind_addr": "0.0.0.0",
+            "bind_port": 9300,
+            "allow_ports": [{"single": 8080}]
+        }"#;
+        let config: ServerConfig = ConfigLoader::parse_config::<ServerConfig>(json_str).unwrap();
+        assert_eq!(config.bind_port, 9300);
+        assert_eq!(config.allow_ports.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_server_config_missing_port() {
+        let config = ServerConfig { bind_port: 0, ..Default::default() };
+        let result = ConfigLoader::validate_server_config(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_server_config_success() {
+        let config = ServerConfig { bind_port: 9300, ..Default::default() };
+        let result = ConfigLoader::validate_server_config(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_config_missing_addr() {
+        let config = ClientConfig { server_addr: "".to_string(), ..Default::default() };
+        let result = ConfigLoader::validate_client_config(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_client_config_missing_port() {
+        let config = ClientConfig { server_port: 0, ..Default::default() };
+        let result = ConfigLoader::validate_client_config(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_client_config_success() {
+        let config = ClientConfig {
+            server_addr: "example.com".to_string(),
+            server_port: 9300,
+            ..Default::default()
+        };
+        let result = ConfigLoader::validate_client_config(&config);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_replace_env_vars_simple() {
+        std::env::set_var("FRP_TEST_ADDR", "10.0.0.1");
+        let result = ConfigLoader::replace_env_vars("${FRP_TEST_ADDR}:8080");
+        assert_eq!(result, "10.0.0.1:8080");
+        std::env::remove_var("FRP_TEST_ADDR");
+    }
+
+    #[test]
+    fn test_replace_env_vars_not_set() {
+        let result = ConfigLoader::replace_env_vars("${NONEXISTENT_VAR}");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_replace_env_vars_multiple() {
+        std::env::set_var("HOST", "localhost");
+        std::env::set_var("PORT", "9300");
+        let result = ConfigLoader::replace_env_vars("${HOST}:${PORT}");
+        assert_eq!(result, "localhost:9300");
+        std::env::remove_var("HOST");
+        std::env::remove_var("PORT");
+    }
+
+    #[test]
+    fn test_port_range_single() {
+        let toml_str = r#"single = 8080"#;
+        let port: PortRange = toml::from_str(toml_str).unwrap();
+        assert_eq!(port.single, Some(8080));
+    }
+
+    #[test]
+    fn test_port_range_range() {
+        let toml_str = r#"start = 10000
+end = 20000"#;
+        let port: PortRange = toml::from_str(toml_str).unwrap();
+        assert_eq!(port.start, Some(10000));
+        assert_eq!(port.end, Some(20000));
+    }
+
+    #[test]
+    fn test_proxy_config_tcp() {
+        let toml_str = r#"
+name = "ssh"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 22
+remote_port = 6000
+"#;
+        let proxy: ProxyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(proxy.name, "ssh");
+        assert_eq!(proxy.r#type, "tcp");
+        assert_eq!(proxy.local_port, 22);
+        assert_eq!(proxy.remote_port, Some(6000));
+    }
+
+    #[test]
+    fn test_proxy_config_http_with_domains() {
+        let toml_str = r#"
+name = "web"
+type = "http"
+local_ip = "127.0.0.1"
+local_port = 80
+custom_domains = ["example.com", "www.example.com"]
+"#;
+        let proxy: ProxyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(proxy.name, "web");
+        assert_eq!(proxy.r#type, "http");
+        assert_eq!(proxy.custom_domains, Some(vec!["example.com".to_string(), "www.example.com".to_string()]));
+    }
+
+    #[test]
+    fn test_tls_config_defaults() {
+        let config = TlsConfig::default();
+        assert!(config.enable);
+        assert!(!config.force);
+        assert!(config.cert_file.is_none());
+        assert!(config.key_file.is_none());
+    }
+
+    #[test]
+    fn test_transport_config_defaults() {
+        let config = TransportConfig::default();
+        assert_eq!(config.protocol, "tcp");
+        assert!(config.tcp_mux);
+        assert_eq!(config.pool_count, 10);
+    }
+
+    #[test]
+    fn test_auth_config_defaults() {
+        let config = AuthConfig::default();
+        assert_eq!(config.method, "token");
+        assert!(config.token.is_none());
+    }
+
+    #[test]
+    fn test_client_config_parse() {
+        let toml_str = r#"
+server_addr = "10.0.0.1"
+server_port = 9300
+
+[auth]
+method = "token"
+token = "my_token"
+
+[[proxies]]
+name = "app1"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 8080
+remote_port = 9302
+"#;
+        let config: ClientConfig = ConfigLoader::parse_config::<ClientConfig>(toml_str).unwrap();
+        assert_eq!(config.server_addr, "10.0.0.1");
+        assert_eq!(config.server_port, 9300);
+        assert_eq!(config.auth.token, Some("my_token".to_string()));
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].name, "app1");
+    }
+
+    #[test]
+    fn test_merge_server_config() {
+        let mut target = ServerConfig::default();
+        let source = ServerConfig {
+            bind_addr: "10.0.0.1".to_string(),
+            bind_port: 9999,
+            ..ServerConfig::default()
+        };
+        ConfigLoader::merge_server_config(&mut target, &source);
+        assert_eq!(target.bind_addr, "10.0.0.1");
+        assert_eq!(target.bind_port, 9999);
+    }
+
+    #[test]
+    fn test_merge_client_config() {
+        let mut target = ClientConfig::default();
+        let source = ClientConfig {
+            server_addr: "10.0.0.1".to_string(),
+            server_port: 9999,
+            user: Some("admin".to_string()),
+            ..ClientConfig::default()
+        };
+        ConfigLoader::merge_client_config(&mut target, &source);
+        assert_eq!(target.server_addr, "10.0.0.1");
+        assert_eq!(target.server_port, 9999);
+        assert_eq!(target.user, Some("admin".to_string()));
     }
 }

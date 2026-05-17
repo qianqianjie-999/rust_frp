@@ -9,6 +9,7 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+thiserror = { workspace = true }
 tokio-openssl = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
