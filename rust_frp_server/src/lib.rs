@@ -1484,13 +1484,12 @@ async fn logout_handler() -> impl axum::response::IntoResponse {
         .unwrap()
 }
 
-/// Web 服务器（基于 axum，支持 TLS）
+/// Web 服务器（基于 axum）
 pub struct WebServer {
     addr: SocketAddr,
     server: Option<tokio::task::JoinHandle<()>>,
     user: Option<String>,
     password: Option<String>,
-    tls: Option<rust_frp_config::TlsConfig>,
 }
 
 impl WebServer {
@@ -1501,7 +1500,6 @@ impl WebServer {
             server: None,
             user: config.user.clone(),
             password: config.password.clone(),
-            tls: config.tls.clone(),
         })
     }
 
@@ -1511,14 +1509,6 @@ impl WebServer {
         let password = self.password.clone();
 
         let app = create_routes(server, user, password);
-
-        if let Some(tls_config) = &self.tls {
-            if tls_config.enable {
-                self.start_https(app).await?;
-                return Ok(());
-            }
-        }
-
         self.start_http(app).await?;
         Ok(())
     }
@@ -1532,13 +1522,6 @@ impl WebServer {
         });
         
         self.server = Some(handle);
-        Ok(())
-    }
-
-    async fn start_https(&mut self, _app: axum::Router) -> Result<(), Box<dyn std::error::Error>> {
-        log::error!("HTTPS is not yet fully supported for axum web server");
-        log::info!("Please use Nginx reverse proxy for HTTPS access");
-        log::info!("Or set tls.enable = false to use HTTP only");
         Ok(())
     }
 }
@@ -1578,7 +1561,7 @@ impl HttpsVhostListener {
         })
     }
 
-    pub async fn accept(&self) -> Result<(tokio_openssl::SslStream<tokio::net::TcpStream>, SocketAddr), std::io::Error> {
+    pub async fn accept(&self) -> Result<(tokio_rustls::server::TlsStream<tokio::net::TcpStream>, SocketAddr), std::io::Error> {
         let (conn, addr) = self.inner.accept().await?;
         let tls_conn = self.tls_config.accept(conn).await?;
         Ok((tls_conn, addr))

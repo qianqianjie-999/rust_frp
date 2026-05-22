@@ -16,8 +16,13 @@ token = "your_secure_token"
 protocol = "tcp"
 # TLS 默认已启用（enable = true）
 # 客户端会自动信任服务器的内置自签名证书
-# 如需使用自定义 CA 证书验证，配置 trusted_ca_file
 tls = { enable = true }
+
+# 可选配置项：
+# 1. 跳过证书验证（适用于自定义自签名证书场景）
+# tls = { enable = true, skip_verify = true }
+# 2. 使用自定义 CA 证书验证服务器证书
+# tls = { enable = true, trusted_ca_file = "/path/to/ca.crt" }
 
 # ============================================
 # 代理配置

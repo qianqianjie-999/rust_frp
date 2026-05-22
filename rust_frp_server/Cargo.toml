@@ -12,7 +12,6 @@ log = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
-tokio-openssl = { workspace = true }
 ring = { workspace = true }
 base64 = { workspace = true }
 rust_frp_util = { path = "../rust_frp_util" }

@@ -293,9 +293,6 @@ pub struct WebServerConfig {
 
     /// Dashboard 密码
     pub password: Option<String>,
-
-    /// TLS 配置（可选）
-    pub tls: Option<TlsConfig>,
 }
 
 /// 认证配置 - 定义客户端认证方式
@@ -451,6 +448,15 @@ pub struct TlsConfig {
     /// 用于验证服务器证书
     pub trusted_ca_file: Option<String>,
 
+    /// 是否跳过服务器证书验证（客户端用）
+    ///
+    /// 适用于使用自定义自签名证书的场景，仅加密连接，不验证证书
+    ///
+    /// # 默认值
+    ///
+    /// **false** - 默认验证服务器证书
+    pub skip_verify: bool,
+
     /// 强制使用 TLS（即使协议不支持 TLS）
     pub force: bool,
 }
@@ -462,6 +468,7 @@ impl Default for TlsConfig {
             cert_file: None,
             key_file: None,
             trusted_ca_file: None,
+            skip_verify: false,
             force: false,
         }
     }
