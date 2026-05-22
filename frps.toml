@@ -43,11 +43,6 @@ port = 7500
 user = "admin"
 password = "admin"
 
-# Web 服务器 TLS 配置（暂时保留但建议禁用）
-# HTTPS 功能将通过 Nginx 反向代理提供
-[web_server.tls]
-enable = false
-
 # 认证配置
 [auth]
 method = "token"

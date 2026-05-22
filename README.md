@@ -6,10 +6,8 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 
 - **TCP 代理**：将内网 TCP 服务暴露到公网，支持任意端口
 - **HTTP 虚拟主机**：基于域名的 HTTP/HTTPS 路由，支持自定义域名和子域名
-- **TLS 加密**：支持内置自签名证书和自定义证书，控制连接和数据连接均默认启用加密
+- **TLS 加密**：使用 rustls 实现，默认使用内置自签名证书（无需额外配置即可使用），也支持自定义证书；控制连接和数据连接均默认启用加密；客户端支持跳过证书验证模式，方便使用自签名证书
 - **HMAC 签名验证**：工作连接使用 HMAC-SHA256 签名，防止连接伪造
-- **插件系统**：支持 Unix Domain Socket、静态文件服务、HTTP 代理、SOCKS5 代理
-- **Web 管理界面**：服务器端 Dashboard 实时查看连接数、代理状态、流量统计
 - **连接池**：内置连接池管理，支持空闲超时和生命周期控制
 - **重试机制**：客户端连接本地服务时使用指数退避重试
 - **端口白名单**：服务器默认拒绝未明确允许的端口，必须配置才能正常使用
@@ -17,50 +15,126 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **多格式配置**：支持 TOML、YAML、JSON 配置格式
 - **优雅关闭**：客户端支持 SIGINT/SIGTERM 信号优雅退出
 
+### ⚠️ 功能开发状态
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| TCP 代理 | ✅ | 完整实现 |
+| HTTP 代理 | ✅ | 完整实现 |
+| HTTPS 代理 | ✅ | 完整实现 |
+| TLS 加密 | ✅ | 使用 rustls，无需 OpenSSL |
+| WebSocket | ⚠️ | 连接支持，HTTP 升级待测 |
+| UDP 代理 | ⚠️ | 配置已定义，未完整实现 |
+| STCP/XTCP (P2P) | ⚠️ | 配置已定义，未实现 |
+| KCP 协议 | ❌ | 未实现 |
+| OIDC 认证 | ❌ | 未实现 |
+| 热重载 | ❌ | 未实现 |
+| 健康检查 | ❌ | 未实现 |
+| 带宽限制 | ❌ | 未实现 |
+
 ## 项目结构
 
 ```
-rust_ffrp/
+rust_frp/
 ├── rust_frp_core/          # 核心协议：消息类型、连接封装、Wire 协议
 ├── rust_frp_server/        # 服务端：控制连接管理、代理转发、vhost 路由
 ├── rust_frp_client/        # 客户端：工作连接建立、本地服务桥接
 ├── rust_frp_config/        # 配置：TOML/YAML/JSON 解析、验证、环境变量
-├── rust_frp_net/           # 网络：TCP/TLS/WebSocket、连接池
+├── rust_frp_net/           # 网络：TCP/TLS/WebSocket、连接池 (rustls)
 ├── rust_frp_auth/          # 认证：Token 认证、HMAC 签名
-├── rust_frp_plugin/        # 插件：Unix Socket、静态文件、HTTP代理、SOCKS5
 ├── rust_frp_util/          # 工具：流桥接、重试、时间戳、随机 ID
 ├── frps.toml               # 服务器配置示例
 ├── frpc.toml               # 客户端配置示例
-└── bin/                    # 编译产物目录
+└── target/                 # 编译产物目录
 ```
 
 ## 快速开始
 
 ### 环境要求
 
-- Rust 1.70+
-- OpenSSL 开发库（`libssl-dev` 或 `openssl-devel`）
+- Rust 1.75+
+- **无需 OpenSSL**（使用纯 Rust 的 rustls 库）
 
 ### 静态编译部署
 
-如需静态编译（适用于 musl libc 环境如 Alpine Linux）：
+静态编译生成的可执行文件不依赖系统动态库，可直接在任何 Linux 系统上运行，无需安装依赖。
+
+**适用场景**：
+- Alpine Linux（无 glibc）
+- 容器镜像（减小体积）
+- 无 sudo 权限的服务器
+- 需要分发单个二进制文件
 
 ```bash
+# 安装 musl 目标
 rustup target add x86_64-unknown-linux-musl
+
+# 安装 musl-tools（Ubuntu/Debian）
+sudo apt-get install musl-tools
+
+# 静态编译（服务器和客户端）
 cargo build --release --target x86_64-unknown-linux-musl
+
+# 编译产物位置
+ls target/x86_64-unknown-linux-musl/release/
+# rust_frps（服务器）
+# rust_frpc（客户端）
 ```
+
+**验证静态编译**：
+```bash
+file target/x86_64-unknown-linux-musl/release/rust_frps
+# 输出示例：ELF 64-bit LSB pie executable, x86-64, static-pie linked
+
+ls -la target/x86_64-unknown-linux-musl/release/rust_frp*
+# -rwxrwxr-x 1 user group 3.2M rust_frps  (服务器)
+# -rwxrwxr-x 1 user group 3.0M rust_frpc  (客户端)
+```
+
+**静态编译优势**：
+- ✅ **无系统依赖**：可在任何 Linux 发行版运行
+- ✅ **Alpine 兼容**：完美支持 musl libc 环境
+- ✅ **容器友好**：减小镜像体积，加速部署
+- ✅ **安全可靠**：不依赖系统库更新
+
+### Windows 交叉编译
+
+```bash
+# 安装 Windows 目标
+rustup target add x86_64-pc-windows-gnu
+
+# 安装交叉编译工具（Ubuntu/Debian）
+sudo apt-get install gcc-mingw-w64-x86-64
+
+# 编译 Windows 版本
+cargo build --release --target x86_64-pc-windows-gnu
+
+# 编译产物
+ls target/x86_64-pc-windows-gnu/release/
+# rust_frps.exe（服务器）
+# rust_frpc.exe（客户端）
+```
+
+### 编译选项说明
+
+| 选项 | 说明 | 适用场景 |
+|------|------|----------|
+| `--release` | 优化编译，生成更小更快的二进制 | 生产环境 |
+| `--target x86_64-unknown-linux-musl` | 静态编译，无系统依赖 | 跨平台部署 |
+| `--target x86_64-pc-windows-gnu` | 交叉编译 Windows 版本 | 为 Windows 用户分发 |
+| `--features "tls"` | 启用 TLS 功能（默认已启用） | 加密通信 |
 
 ### 启动服务器
 
 ```bash
 # 使用默认日志级别（info）
-./rust_frps -c frps.toml
+./target/release/rust_frps -c frps.toml
 
 # 开启 debug 日志（用于调试）
-RUST_LOG=debug ./rust_frps -c frps.toml
+RUST_LOG=debug ./target/release/rust_frps -c frps.toml
 
 # 指定配置文件路径
-RUST_LOG=info ./rust_frps -c /opt/rust_frp/conf/frps.toml
+RUST_LOG=info ./target/release/rust_frps -c /opt/rust_frp/conf/frps.toml
 ```
 
 服务器默认监听：
@@ -72,13 +146,13 @@ RUST_LOG=info ./rust_frps -c /opt/rust_frp/conf/frps.toml
 
 ```bash
 # 使用默认日志级别（info）
-./rust_frpc -c frpc.toml
+./target/release/rust_frpc -c frpc.toml
 
 # 开启 debug 日志（用于调试）
-RUST_LOG=debug ./rust_frpc -c frpc.toml
+RUST_LOG=debug ./target/release/rust_frpc -c frpc.toml
 
 # 指定配置文件路径
-RUST_LOG=debug ./rust_frpc -c /opt/rust_frp/conf/frpc.toml
+RUST_LOG=debug ./target/release/rust_frpc -c /opt/rust_frp/conf/frpc.toml
 ```
 
 ### 日志级别说明
@@ -172,7 +246,7 @@ allow_ports = [
 # 传输配置
 [transport]
 protocol = "tcp"
-# TLS 默认已启用
+# TLS 默认已启用（使用 rustls）
 tls = { enable = true }
 tcp_mux = true
 pool_count = 10
@@ -198,8 +272,11 @@ token = "your_secure_token"
 # 传输配置
 [transport]
 protocol = "tcp"
-# TLS 默认已启用，客户端自动信任服务器内置证书
+# TLS 默认已启用，与原版 frp 行为一致：默认跳过证书验证
 tls = { enable = true }
+
+# 可选：配置自定义 CA 证书进行验证（防止中间人攻击）
+# tls = { enable = true, trusted_ca_file = "/path/to/ca.crt" }
 
 # HTTP 代理
 [[proxies]]
@@ -235,7 +312,7 @@ remote_port = 9302
 - 客户端通过 `work_conn_port` 建立工作连接，用于代理转发
 - 如果不配置 `work_conn_port`，默认使用 `bind_port + 1000`
 
-# Web Dashboard
+## Web Dashboard
 
 > ⚠️ **安全建议**：Dashboard **不建议直接暴露在公网**，如需远程访问，建议通过 Nginx 反向代理提供 HTTPS 访问。
 
@@ -251,9 +328,6 @@ addr = "127.0.0.1"  # 建议仅监听本地
 port = 7500
 user = "admin"
 password = "admin"
-# TLS 配置暂时保留但建议禁用（HTTPS 功能将通过 Nginx 反向代理提供）
-[web_server.tls]
-enable = false
 ```
 
 ### 访问地址
@@ -340,67 +414,6 @@ vhost_https_port = 9091
 tls = { enable = true }
 ```
 
-## 插件系统
-
-### Unix Domain Socket 插件
-
-```toml
-[[proxies]]
-name = "unix_proxy"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = 0
-remote_port = 9306
-
-[proxies.plugin]
-type = "unix_domain_socket"
-unix_path = "/var/run/docker.sock"
-```
-
-### 静态文件插件
-
-```toml
-[[proxies]]
-name = "file_server"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = 0
-remote_port = 9307
-
-[proxies.plugin]
-type = "static_file"
-local_path = "/var/www/html"
-strip_prefix = "/files"
-```
-
-### HTTP 代理插件
-
-```toml
-[[proxies]]
-name = "http_proxy"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = 0
-remote_port = 9308
-
-[proxies.plugin]
-type = "http_proxy"
-```
-
-### SOCKS5 代理插件
-
-```toml
-[[proxies]]
-name = "socks5"
-type = "tcp"
-local_ip = "127.0.0.1"
-local_port = 0
-remote_port = 9309
-
-[proxies.plugin]
-type = "socks5"
-```
-
 ## 安全建议
 
 - 使用强 Token 并定期轮换
@@ -411,7 +424,11 @@ type = "socks5"
   - 配置用户名密码认证
   - 通过 Nginx 反向代理提供 HTTPS 访问
   - 不要直接暴露在公网
-- 如使用自定义证书生产环境，建议配置受信任 CA 签名的证书
+- **TLS 证书验证**：
+  - 默认模式：客户端**跳过证书验证**（与原版 frp 行为一致），开箱即用，无需额外配置
+  - 自定义 CA 验证模式（`trusted_ca_file = "/path/to/ca.crt"`）：使用自定义 CA 证书验证服务器证书，可有效防止中间人攻击
+  - **安全建议**：公网生产环境建议配置 `trusted_ca_file` 使用自签名证书验证，内网环境可使用默认配置
+- **Token 认证**：所有连接必须通过 token 验证，即使绕过 TLS 证书验证，攻击者也无法通过认证
 
 ## 许可证
 
