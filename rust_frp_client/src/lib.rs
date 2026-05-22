@@ -448,7 +448,14 @@ impl Connector {
     pub fn new(config: rust_frp_config::ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let tls_config = if let Some(tls) = &config.transport.tls {
             if tls.enable {
-                Some(TlsConfig::new_client_trusting_builtin()?)
+                // 与原版 frp 保持一致：
+                // - 配置了 trusted_ca_file → 使用 CA 证书验证
+                // - 未配置 trusted_ca_file → 跳过证书验证（默认行为）
+                if let Some(ref ca_file) = tls.trusted_ca_file {
+                    Some(TlsConfig::new_client_with_ca_file(ca_file)?)
+                } else {
+                    Some(TlsConfig::new_client_insecure()?)
+                }
             } else {
                 None
             }
@@ -470,7 +477,7 @@ impl Connector {
         Ok(self.conn_manager.connect_tcp(&addr).await?)
     }
 
-    pub async fn connect_tls(&mut self, domain: &str) -> Result<tokio_openssl::SslStream<tokio::net::TcpStream>, Box<dyn std::error::Error>> {
+    pub async fn connect_tls(&mut self, domain: &str) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
             .parse::<SocketAddr>()?;
         Ok(self.conn_manager.connect_tls(domain, &addr).await?)

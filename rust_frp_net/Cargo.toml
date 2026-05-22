@@ -10,8 +10,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-tokio-openssl = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 rust_frp_util = { path = "../rust_frp_util" }
-openssl = { version = "0.10", features = ["vendored"] }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = "0.26"
