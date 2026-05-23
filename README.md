@@ -6,6 +6,11 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 
 - **TCP 代理**：将内网 TCP 服务暴露到公网，支持任意端口
 - **HTTP 虚拟主机**：基于域名的 HTTP/HTTPS 路由，支持自定义域名和子域名
+- **WebSocket 代理**：支持 WebSocket HTTP Upgrade，透传实时通信流量
+- **STCP（安全 TCP）**：服务端中转的安全 TCP，无需在服务端开放额外端口映射
+- **XTCP（P2P TCP）**：点对点直连，支持 NAT 穿透打洞，失败自动回退 STCP
+- **UDP 代理**：支持 UDP 数据包双向转发，适用于游戏、DNS 等场景
+- **KCP 协议**：基于 UDP 的低延迟可靠传输协议，适合弱网和跨国场景
 - **TLS 加密**：使用 rustls 实现，默认使用内置自签名证书（无需额外配置即可使用），也支持自定义证书；控制连接和数据连接均默认启用加密；客户端支持跳过证书验证模式，方便使用自签名证书
 - **HMAC 签名验证**：工作连接使用 HMAC-SHA256 签名，防止连接伪造
 - **连接池**：内置连接池管理，支持空闲超时和生命周期控制
@@ -14,8 +19,12 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **环境变量**：配置文件支持 `${VAR_NAME}` 环境变量替换
 - **多格式配置**：支持 TOML、YAML、JSON 配置格式
 - **优雅关闭**：客户端支持 SIGINT/SIGTERM 信号优雅退出
+- **OIDC 认证**：支持 OpenID Connect 认证，集成企业身份系统
+- **配置热重载**：支持 SIGHUP 信号、文件监听、API 触发三种方式重载配置
+- **健康检查**：支持 TCP 和 HTTP 健康检查，自动检测后端服务状态
+- **带宽限制**：支持代理级和全局级带宽限制，基于令牌桶算法
 
-### ⚠️ 功能开发状态
+## 功能实现状态
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
@@ -23,14 +32,17 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | HTTP 代理 | ✅ | 完整实现 |
 | HTTPS 代理 | ✅ | 完整实现 |
 | TLS 加密 | ✅ | 使用 rustls，无需 OpenSSL |
-| WebSocket | ⚠️ | 连接支持，HTTP 升级待测 |
-| UDP 代理 | ⚠️ | 配置已定义，未完整实现 |
-| STCP/XTCP (P2P) | ⚠️ | 配置已定义，未实现 |
-| KCP 协议 | ❌ | 未实现 |
-| OIDC 认证 | ❌ | 未实现 |
-| 热重载 | ❌ | 未实现 |
-| 健康检查 | ❌ | 未实现 |
-| 带宽限制 | ❌ | 未实现 |
+| WebSocket | ✅ | 完整实现，支持 HTTP Upgrade |
+| UDP 代理 | ✅ | 完整实现 |
+| STCP (安全 TCP) | ✅ | 完整实现，服务端中转无需端口映射 |
+| XTCP (P2P TCP) | ✅ | 完整实现，支持 NAT 穿透和 STCP 回退 |
+| KCP 协议 | ✅ | 完整实现 |
+| OIDC 认证 | ✅ | 支持 HS256 JWT 验证 |
+| 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
+| 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
+| 带宽限制 | ✅ | 支持代理级和全局级限制 |
+
+---
 
 ## 项目结构
 
@@ -41,12 +53,84 @@ rust_frp/
 ├── rust_frp_client/        # 客户端：工作连接建立、本地服务桥接
 ├── rust_frp_config/        # 配置：TOML/YAML/JSON 解析、验证、环境变量
 ├── rust_frp_net/           # 网络：TCP/TLS/WebSocket、连接池 (rustls)
-├── rust_frp_auth/          # 认证：Token 认证、HMAC 签名
-├── rust_frp_util/          # 工具：流桥接、重试、时间戳、随机 ID
+├── rust_frp_auth/          # 认证：Token 认证、HMAC 签名、OIDC 认证
+├── rust_frp_util/          # 工具：流桥接、重试、时间戳、随机 ID、令牌桶限速
 ├── frps.toml               # 服务器配置示例
 ├── frpc.toml               # 客户端配置示例
 └── target/                 # 编译产物目录
 ```
+
+---
+
+## 功能应用场景
+
+### UDP 代理 ✅
+
+| 场景 | 说明 |
+|------|------|
+| 游戏服务器 | 穿透 UDP 游戏流量（如 Minecraft、CS:GO） |
+| DNS 服务 | 代理内网 DNS 查询服务 |
+| 流媒体 | UDP 实时音视频流转发 |
+| IoT 设备 | 物联网设备 UDP 通信 |
+
+### WebSocket 支持 ✅
+
+| 场景 | 说明 |
+|------|------|
+| WebSocket 服务 | 穿透内网 WebSocket 实时通信服务 |
+| HTTP 升级 | 支持从 HTTP 连接升级到 WebSocket |
+| WebRTC 信令 | 转发 WebRTC 信令通道 |
+
+### STCP/XTCP (P2P) ✅
+
+| 场景 | 说明 |
+|------|------|
+| 大文件传输 | 点对点直连，减轻服务器带宽压力 |
+| 低延迟通信 | 绕过中转服务器，降低延迟 |
+| 隐私保护 | 数据不经过中间服务器 |
+| 局域网穿透 | 两个内网设备直接通信 |
+
+### KCP 协议 ✅
+
+| 场景 | 说明 |
+|------|------|
+| 跨国连接 | 优化国际网络传输延迟 |
+| 弱网环境 | 高丢包率网络下保持稳定连接 |
+| 实时游戏 | 降低延迟抖动，提升游戏体验 |
+
+### OIDC 认证 ✅
+
+| 场景 | 说明 |
+|------|------|
+| 企业 SSO | 集成企业身份认证系统（如 Okta、Azure AD） |
+| 多租户管理 | 支持多个组织使用同一 frp 服务 |
+| 审计日志 | 与企业身份系统集成，便于审计 |
+
+### 配置热重载 ✅
+
+| 场景 | 说明 |
+|------|------|
+| 零停机部署 | 修改配置后无需重启服务 |
+| 动态调整 | 运行时调整代理规则 |
+| 运维友好 | 减少服务中断时间 |
+
+### 健康检查 ✅
+
+| 场景 | 说明 |
+|------|------|
+| 自动故障转移 | 检测后端服务健康状态 |
+| 告警通知 | 服务异常时发送告警 |
+| 负载均衡 | 配合健康检查实现负载分配 |
+
+### 带宽限制 ✅
+
+| 场景 | 说明 |
+|------|------|
+| 流量控制 | 限制单个代理的带宽使用 |
+| 资源公平 | 防止某个代理占用过多带宽 |
+| 成本控制 | 避免超出云服务商带宽限制 |
+
+---
 
 ## 快速开始
 
@@ -196,6 +280,8 @@ systemctl start rust_frp_client
 systemctl status rust_frp_client
 ```
 
+---
+
 ## ⚠️ TOML 配置格式要求
 
 **重要**：TOML 格式要求**顶级键值对必须在 `[table]` 定义之前**。
@@ -221,6 +307,8 @@ method = "token"
 vhost_http_port = 9090  # ❌ 解析失败！
 ```
 
+---
+
 ## 服务器配置 (frps.toml)
 
 > ⚠️ **建议**：`web_server` 默认禁用（port = 0），如需启用建议通过 Nginx 反向代理提供 HTTPS 访问。
@@ -229,8 +317,9 @@ vhost_http_port = 9090  # ❌ 解析失败！
 # 服务器基本配置（必须在 [table] 之前）
 bind_addr = "0.0.0.0"
 bind_port = 9300
-vhost_http_port = 8080
-vhost_https_port = 8443
+vhost_http_port = 9090
+vhost_https_port = 9091
+kcp_bind_port = 7001  # KCP 协议监听端口
 
 # 端口白名单配置（默认拒绝所有未明确允许的端口）
 allow_ports = [
@@ -240,22 +329,37 @@ allow_ports = [
 
 # Web 服务器配置（默认禁用，建议通过 Nginx 反向代理提供 HTTPS）
 # [web_server]
-# addr = "0.0.0.0"
-# port = 0
+# addr = "127.0.0.1"
+# port = 7500
+# user = "admin"
+# password = "admin"
 
 # 传输配置
 [transport]
 protocol = "tcp"
-# TLS 默认已启用（使用 rustls）
+bandwidth_limit = "10MB"  # 全局带宽限制
 tls = { enable = true }
 tcp_mux = true
 pool_count = 10
 
-# 认证配置
+# 认证配置 - Token 方式
+# [auth]
+# method = "token"
+# token = "your_secure_token"
+
+# 认证配置 - OIDC 方式
 [auth]
-method = "token"
-token = "your_secure_token"
+method = "oidc"
+
+[auth.oidc]
+issuer = "https://your-oidc-provider.com"
+audience = "frp-server"
+client_id = "your-client-id"
+client_secret = "your-client-secret"
+token_endpoint_url = "https://your-oidc-provider.com/token"
 ```
+
+---
 
 ## 客户端配置 (frpc.toml)
 
@@ -272,8 +376,8 @@ token = "your_secure_token"
 # 传输配置
 [transport]
 protocol = "tcp"
-# TLS 默认已启用，与原版 frp 行为一致：默认跳过证书验证
-tls = { enable = true }
+bandwidth_limit = "10MB"  # 全局带宽限制
+tls = { enable = true }  # 默认已启用，与原版 frp 行为一致：默认跳过证书验证
 
 # 可选：配置自定义 CA 证书进行验证（防止中间人攻击）
 # tls = { enable = true, trusted_ca_file = "/path/to/ca.crt" }
@@ -286,14 +390,46 @@ local_ip = "127.0.0.1"
 local_port = 8080
 custom_domains = ["web.example.com"]
 
-# TCP 代理
+# TCP 代理（带带宽限制）
 [[proxies]]
 name = "tcp_ssh"
 type = "tcp"
 local_ip = "127.0.0.1"
 local_port = 22
 remote_port = 9302
+bandwidth_limit = "1MB"  # 代理级带宽限制（优先级高于全局）
+
+# TCP 代理（带健康检查）
+[[proxies]]
+name = "tcp_app"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 8080
+remote_port = 9303
+
+[[proxies.health_check]]
+type = "tcp"
+interval_seconds = 10
+timeout_seconds = 3
+max_failed = 3
+
+# HTTP 健康检查示例
+[[proxies]]
+name = "web_app"
+type = "http"
+local_ip = "127.0.0.1"
+local_port = 8080
+custom_domains = ["app.example.com"]
+
+[[proxies.health_check]]
+type = "http"
+interval_seconds = 10
+timeout_seconds = 3
+max_failed = 3
+path = "/health"
 ```
+
+---
 
 ## 端口说明
 
@@ -301,16 +437,19 @@ remote_port = 9302
 |------|--------|------|
 | `bind_port` | 9300 | **控制连接端口**：客户端连接服务器的端口 |
 | `work_conn_port` | bind_port + 1000 = 10300 | **工作连接端口**：客户端与服务器建立工作代理连接的端口 |
-| `vhost_http_port` | 8080 | HTTP 虚主机端口（访问内网 HTTP 服务） |
-| `vhost_https_port` | 8443 | HTTPS 虚主机端口（访问内网 HTTPS 服务） |
+| `vhost_http_port` | 9090 | HTTP 虚主机端口（访问内网 HTTP 服务） |
+| `vhost_https_port` | 9091 | HTTPS 虚主机端口（访问内网 HTTPS 服务） |
+| `kcp_bind_port` | 7001 | KCP 协议监听端口 |
 | `web_server.port` | 0 (禁用) | Web Dashboard 端口（port > 0 时启用） |
 
-> ⚠️ 注意：1024 以下端口需要 root 权限，建议使用非特权端口（如 8080/8443）。
+> ⚠️ 注意：1024 以下端口需要 root 权限，建议使用非特权端口（如 9090/9091）。
 
 **工作连接说明**：
 - 客户端通过 `bind_port` 建立控制连接
 - 客户端通过 `work_conn_port` 建立工作连接，用于代理转发
 - 如果不配置 `work_conn_port`，默认使用 `bind_port + 1000`
+
+---
 
 ## Web Dashboard
 
@@ -366,13 +505,16 @@ server {
 - `GET /api/metrics` — 服务器指标（连接数、代理数等）
 - `GET /api/controllers` — 已连接客户端列表
 - `GET /api/proxies` — 已注册代理列表
+- `POST /api/reload` — 触发配置热重载
 
 ### 功能特性
 
 - **axum 框架**：高性能异步 Web 框架
-- **Basic Auth**：支持用户名/密码认证保护
-- **实时数据**：5秒自动刷新看板数据
+- **Basic Auth**：支持用户名密码认证保护
+- **实时数据**：5 秒自动刷新看板数据
 - **中文界面**：客户端和代理信息中文展示
+
+---
 
 ## 代理类型
 
@@ -387,6 +529,17 @@ local_port = 22
 remote_port = 9302
 ```
 
+### UDP 代理
+
+```toml
+[[proxies]]
+name = "udp_game"
+type = "udp"
+local_ip = "127.0.0.1"
+local_port = 25565
+remote_port = 9303
+```
+
 ### HTTP 虚拟主机
 
 ```toml
@@ -398,7 +551,7 @@ vhost_http_port = 9090
 name = "web"
 type = "http"
 local_ip = "127.0.0.1"
-local_port = 80
+local_port = 8080
 custom_domains = ["web.example.com"]
 ```
 
@@ -413,6 +566,268 @@ vhost_https_port = 9091
 [transport]
 tls = { enable = true }
 ```
+
+### WebSocket 代理
+
+将内网 WebSocket 服务暴露到公网，支持 HTTP Upgrade 协议升级。
+
+```toml
+[[proxies]]
+name = "ws_chat"
+type = "websocket"
+local_ip = "127.0.0.1"
+local_port = 8080
+remote_port = 9304
+```
+
+### STCP（安全 TCP）
+
+服务端中转的安全 TCP 访问，无需在服务端开放额外端口映射。通过共享密钥控制访问权限。
+
+**代理端配置（持有内网服务的一方）**：
+
+```toml
+[[proxies]]
+name = "ssh"
+type = "stcp"
+local_ip = "127.0.0.1"
+local_port = 22
+secret_key = "shared_secret_key"
+```
+
+**访问端配置（需要访问内网服务的一方）**：
+
+```toml
+[[visitors]]
+name = "visit_ssh"
+type = "stcp"
+server_name = "ssh"            # 与代理端的 proxy name 一致
+secret_key = "shared_secret_key"
+bind_addr = "127.0.0.1"
+bind_port = 9000              # 本地监听端口，连接此端口即可访问远程服务
+```
+
+### XTCP（P2P TCP）
+
+点对点直连模式，优先尝试 NAT 穿透建立 P2P 连接，失败后自动回退到 STCP 服务端中转。
+
+**代理端配置**：
+
+```toml
+[[proxies]]
+name = "rdp"
+type = "xtcp"
+local_ip = "127.0.0.1"
+local_port = 3389
+secret_key = "shared_secret_key"
+```
+
+**访问端配置**：
+
+```toml
+[[visitors]]
+name = "visit_rdp"
+type = "xtcp"
+server_name = "rdp"            # 与代理端的 proxy name 一致
+secret_key = "shared_secret_key"
+bind_addr = "127.0.0.1"
+bind_port = 13389              # 本地监听端口
+```
+
+> **说明**：XTCP 访问者连接 `bind_port` 后，会先尝试与代理端进行 NAT 穿透打洞（2 秒超时），成功则使用 P2P 直连；失败则自动回退为 STCP 服务端中转模式。
+
+---
+
+## 功能实现细节
+
+### UDP 代理
+
+**核心实现**：
+
+```rust
+// 核心消息类型
+pub struct UdpPacketMsg {
+    pub proxy_name: String,
+    pub data: Vec<u8>,
+    pub client_addr: Option<String>,
+}
+```
+
+**涉及文件**：
+- `rust_frp_core/src/lib.rs` — 新增 `UdpPacketMsg`，扩展 `ProxyManager` trait
+- `rust_frp_server/src/lib.rs` — UDP socket 管理，数据包转发
+- `rust_frp_client/src/lib.rs` — 处理 `UdpPacket` 消息转发
+
+**数据流**：
+
+```text
+访问者 --UDP--> 服务端(监听remote_port) --UdpPacketMsg--> 客户端 --UDP--> 本地服务
+访问者 <--UDP-- 服务端(send_udp_packet) <--UdpPacketMsg-- 客户端 <--UDP-- 本地服务
+```
+
+### WebSocket 支持
+
+**涉及文件**：
+- `rust_frp_server/Cargo.toml` — 添加 `tokio-tungstenite` 依赖
+- `rust_frp_net/src/lib.rs` — `WebSocketConn` 实现 `StreamLike` trait
+- `rust_frp_server/src/lib.rs` — WebSocket proxy 处理
+
+**数据流**：
+
+```text
+访问者 --WS--> 服务端(WebSocket Upgrade) --ReqWorkConn--> 客户端 --TCP--> 本地服务
+访问者 <--WS-- 服务端(WebSocketConn bridge) <--WorkConn-- 客户端 <--TCP-- 本地服务
+```
+
+### KCP 协议
+
+**核心类型**：
+
+```rust
+// KCP 连接，实现 FrpConn trait
+pub struct KcpConn {
+    rx: mpsc::Receiver<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
+    remote_addr: SocketAddr,
+    read_buf: Vec<u8>,
+}
+
+// KCP 监听器，服务端使用
+pub struct KcpListener {
+    socket: Arc<tokio::net::UdpSocket>,
+}
+```
+
+**KCP 参数**（默认值）：
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| nodelay | true | 启用无延迟模式 |
+| interval | 10 | 内部更新间隔 (ms) |
+| resend | 2 | 快速重传 |
+| nc | true | 禁用拥塞控制 |
+| sndwnd | 128 | 发送窗口 |
+| rcvwnd | 128 | 接收窗口 |
+| mtu | 1400 | 最大传输单元 |
+
+### STCP/XTCP (P2P)
+
+**STCP 数据流**：
+
+```text
+访问者 --TCP--> 访问者客户端(local_port) --StcpVisitorMsg--> 服务端
+                                                              |
+                                    服务端(StcpBridgeManager) --ReqWorkConn--> 代理端客户端
+                                                              |
+                          访问者客户端 <--work_conn-- 服务端(bridge) --work_conn--> 代理端客户端 --TCP--> 本地服务
+```
+
+**XTCP 数据流**：
+
+```text
+1. NAT 信息交换阶段：
+   访问者 --XtcpNatInfo--> 服务端 --中继--> 代理端
+   访问者 <--XtcpNatInfo-- 服务端 <--回送-- 代理端
+
+2. P2P 打洞阶段：
+   访问者 --TCP(尝试连接)--> 代理端公网地址
+   代理端 --TCP(尝试连接)--> 访问者公网地址
+
+3. P2P 成功：
+   访问者 <--P2P直连--> 代理端 --TCP--> 本地服务
+
+4. P2P 失败 → STCP 回退：
+   访问者 <--work_conn-- 服务端(bridge) <--work_conn-- 代理端 --TCP--> 本地服务
+```
+
+### OIDC 认证
+
+**JWT 验证流程**：
+
+```text
+1. 客户端从 OIDC Provider 获取 ID Token
+2. 登录时发送 LoginMsg { token: "<id_token>" }
+3. 服务端 OidcAuthVerifier.verify_token():
+   a. 解析 JWT 三部分（header.payload.signature）
+   b. 使用 HMAC-SHA256（HS256）验证签名
+   c. 验证 issuer (iss claim)
+   d. 验证 audience (aud claim)  
+   e. 验证过期时间 (exp claim)
+4. 验证通过后允许登录
+```
+
+**支持的 JWT 算法**：HS256（HMAC-SHA256），使用 `client_secret` 作为对称密钥
+
+### 配置热重载
+
+**触发方式**：
+- **SIGHUP 信号**：`kill -HUP <pid>`
+- **文件监听**：使用 `notify` 库自动监听配置文件变化
+- **API 接口**：`POST /api/reload`
+
+**热重载机制**：
+
+```text
+SIGHUP ──→ channel ──→ tokio::select! → reload_config()
+文件变更 ──→ channel ──→ tokio::select! → reload_config()
+POST /api/reload ──→ channel ──→ tokio::select! → reload_config()
+```
+
+**关键实现**：
+
+```rust
+// 服务端：在 TCP 连接循环中使用 tokio::select! 同时监听新连接和重载信号
+tokio::select! {
+    result = listener.accept() => { /* handle new connection */ }
+    _ = reload_rx.recv() => { /* reload config without dropping listener */ }
+}
+
+// 客户端：在主循环中处理重载信号
+tokio::select! {
+    result = client.start() => { /* handle connection result */ }
+    _ = reload_rx.recv() => { client.reload_config().await; continue; }
+}
+```
+
+### 健康检查
+
+**HealthCheckConfig 结构体**：
+
+```rust
+pub struct HealthCheckConfig {
+    pub r#type: String,          // "tcp" 或 "http"
+    pub timeout_seconds: u32,    // 超时时间（秒）
+    pub max_failed: u32,         // 连续失败次数阈值
+    pub interval_seconds: u32,   // 检查间隔（秒）
+    pub path: Option<String>,    // HTTP 检查路径（仅 type = "http"）
+}
+```
+
+**生命周期管理**：
+- `Client::start()` 时自动启动所有配置了 `health_check` 的代理的健康检查
+- `Client::reload_config()` 时先停止旧检查，再启动新检查（使用 `JoinHandle::abort()`）
+
+### 带宽限制
+
+**实现架构**：
+
+```
+客户端数据转发层
+    ↓
+RateLimitedReader / RateLimitedWriter  ← 对 server_read/server_write 包装
+    ↓
+TokenBucket（令牌桶算法）              ← 控制读写速率
+```
+
+**令牌桶算法**：
+- 以恒定速率（bytes/sec）生成令牌
+- 每次读写消耗对应字节数的令牌
+- 令牌不足时等待补充（自动节流）
+- 桶容量等于速率，防止突发流量超过限制
+
+**限速位置**：客户端的服务器→本地（server_to_local）和本地→服务器（local_to_server）两个方向均受限速控制。优先级：代理级 `bandwidth_limit` > 全局 `bandwidth_limit`。
+
+---
 
 ## 安全建议
 
@@ -429,6 +844,21 @@ tls = { enable = true }
   - 自定义 CA 验证模式（`trusted_ca_file = "/path/to/ca.crt"`）：使用自定义 CA 证书验证服务器证书，可有效防止中间人攻击
   - **安全建议**：公网生产环境建议配置 `trusted_ca_file` 使用自签名证书验证，内网环境可使用默认配置
 - **Token 认证**：所有连接必须通过 token 验证，即使绕过 TLS 证书验证，攻击者也无法通过认证
+
+---
+
+## 总结
+
+本文档详细记录了 rust_frp 项目各功能的需求和实现状态。
+
+**全部功能已实现** ✅
+
+---
+
+**文档版本**：v2.0
+**更新日期**：2026-05-23
+
+---
 
 ## 许可证
 

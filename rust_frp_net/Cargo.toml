@@ -17,3 +17,5 @@ rust_frp_util = { path = "../rust_frp_util" }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 webpki-roots = "0.26"
+kcp = { workspace = true }
+rand = { workspace = true }
