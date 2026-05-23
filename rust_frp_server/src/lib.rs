@@ -122,10 +122,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use rust_frp_config::ServerConfig;
-use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager, NewWorkConnMsg};
-use rust_frp_net::{TcpListener, UdpListener, TlsConfig, ConnManager};
+use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager, ReqWorkConnMsg, StcpVisitorRespMsg, XtcpNatInfoMsg, XtcpHolePunchMsg};
+use rust_frp_net::{TcpListener, UdpListener, TlsConfig, ConnManager, KcpConn, KcpListener, WebSocketConn};
 use rust_frp_auth::AuthManager;
 use rust_frp_util::get_timestamp;
+use tokio_tungstenite::accept_async;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -575,10 +576,17 @@ pub struct Control {
     registered_proxies: Vec<String>,
     /// 代理所有权映射 (proxy_name -> run_id)
     proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// XTCP 访问者映射 (proxy_name -> visitor_run_id)
+    xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
     /// 登录成功通知通道
     login_tx: Option<mpsc::Sender<String>>,
     /// 消息发送通道（用于发送给客户端）
     msg_tx: Option<mpsc::Sender<Message>>,
+    /// STCP 桥接管理器
+    stcp_bridge_manager: Arc<StcpBridgeManager>,
+    /// 工作连接管理器
+    #[allow(dead_code)]
+    work_conn_manager: Arc<ServerWorkConnManager>,
 }
 
 impl Control {
@@ -593,8 +601,11 @@ impl Control {
         auth_manager: Arc<AuthManager>,
         control_manager: Arc<ControlManager>,
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
         login_tx: Option<mpsc::Sender<String>>,
         msg_tx: Option<mpsc::Sender<Message>>,
+        stcp_bridge_manager: Arc<StcpBridgeManager>,
+        work_conn_manager: Arc<ServerWorkConnManager>,
     ) -> Self {
         Self {
             conn,
@@ -608,8 +619,11 @@ impl Control {
             last_heartbeat: Instant::now(),
             registered_proxies: Vec::new(),
             proxy_owners,
+            xtcp_visitors,
             login_tx,
             msg_tx,
+            stcp_bridge_manager,
+            work_conn_manager,
         }
     }
 
@@ -762,6 +776,180 @@ impl Control {
                                                     log::info!("Control::run finished (graceful disconnect)");
                                                     return Ok(());
                                                 }
+                                                Message::UdpPacket(udp_msg) => {
+                                                    if let Some(addr) = &udp_msg.client_addr {
+                                                        if let Err(e) = self.proxy_manager.send_udp_packet(
+                                                            &udp_msg.proxy_name,
+                                                            &udp_msg.data,
+                                                            addr,
+                                                        ).await {
+                                                            log::error!("Failed to send UDP packet to visitor: {:?}", e);
+                                                        }
+                                                    }
+                                                }
+                                                Message::StcpVisitor(stcp_msg) => {
+                                                    log::info!(
+                                                        "Received STCP visitor request for proxy {} from client {}",
+                                                        stcp_msg.proxy_name,
+                                                        self.run_id
+                                                    );
+
+                                                    let proxy_name = stcp_msg.proxy_name.clone();
+                                                    let visitor_run_id = self.run_id.clone();
+
+                                                    let proxy_run_id = {
+                                                        let owners = self.proxy_owners.read().await;
+                                                        owners.get(&proxy_name).cloned()
+                                                    };
+
+                                                    let proxy_run_id = match proxy_run_id {
+                                                        Some(id) => id,
+                                                        None => {
+                                                            log::error!("No proxy owner found for STCP: {}", proxy_name);
+                                                            let resp = StcpVisitorRespMsg {
+                                                                proxy_name: proxy_name.clone(),
+                                                                error: "proxy not found".to_string(),
+                                                                visitor_run_id: visitor_run_id.clone(),
+                                                            };
+                                                            if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                                                                log::error!("Failed to send StcpVisitorResp: {:?}", e);
+                                                            }
+                                                            continue;
+                                                        }
+                                                    };
+
+                                                    if proxy_run_id == visitor_run_id {
+                                                        self.stcp_bridge_manager.create_bridge(
+                                                            proxy_name.clone()
+                                                        ).await;
+
+                                                        let msg_tx_proxy = self.control_manager.get_msg_tx(&proxy_run_id).await;
+                                                        let msg_tx_visitor = self.control_manager.get_msg_tx(&visitor_run_id).await;
+
+                                                        if let Some(tx) = &msg_tx_proxy {
+                                                            let req = ReqWorkConnMsg {
+                                                                proxy_name: proxy_name.clone(),
+                                                            };
+                                                            if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
+                                                                log::error!("Failed to send ReqWorkConn to proxy: {:?}", e);
+                                                            }
+                                                        }
+
+                                                        if let Some(tx) = &msg_tx_visitor {
+                                                            let req = ReqWorkConnMsg {
+                                                                proxy_name: proxy_name.clone(),
+                                                            };
+                                                            if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
+                                                                log::error!("Failed to send ReqWorkConn to visitor: {:?}", e);
+                                                            }
+                                                        }
+
+                                                        let resp = StcpVisitorRespMsg {
+                                                            proxy_name: proxy_name.clone(),
+                                                            error: String::new(),
+                                                            visitor_run_id: visitor_run_id.clone(),
+                                                        };
+                                                        if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                                                            log::error!("Failed to send StcpVisitorResp: {:?}", e);
+                                                        }
+                                                    } else {
+                                                        log::error!("STCP proxy {} owned by another client", proxy_name);
+                                                        let resp = StcpVisitorRespMsg {
+                                                            proxy_name: proxy_name.clone(),
+                                                            error: "proxy owned by another client".to_string(),
+                                                            visitor_run_id,
+                                                        };
+                                                        if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                                                            log::error!("Failed to send StcpVisitorResp: {:?}", e);
+                                                        }
+                                                    }
+                                                }
+                                                Message::XtcpNatInfo(xtcp_msg) => {
+                                                    log::info!(
+                                                        "Received XTCP NAT info for proxy {} from {}",
+                                                        xtcp_msg.proxy_name,
+                                                        self.run_id
+                                                    );
+
+                                                    let proxy_name = xtcp_msg.proxy_name.clone();
+                                                    let from_run_id = self.run_id.clone();
+
+                                                    let owner_run_id = {
+                                                        let owners = self.proxy_owners.read().await;
+                                                        owners.get(&proxy_name).cloned()
+                                                    };
+
+                                                    let owner_run_id = match owner_run_id {
+                                                        Some(id) => id,
+                                                        None => {
+                                                            log::error!("No proxy owner found for XTCP: {}", proxy_name);
+                                                            continue;
+                                                        }
+                                                    };
+
+                                                    let relay = XtcpNatInfoMsg {
+                                                        proxy_name: proxy_name.clone(),
+                                                        run_id: from_run_id.clone(),
+                                                        nat_type: xtcp_msg.nat_type.clone(),
+                                                        local_addr: xtcp_msg.local_addr.clone(),
+                                                        public_addr: xtcp_msg.public_addr.clone(),
+                                                    };
+
+                                                    if from_run_id != owner_run_id {
+                                                        // 来自 visitor，存储 visitor run_id 并中继给 proxy owner
+                                                        {
+                                                            let mut visitors = self.xtcp_visitors.write().await;
+                                                            visitors.insert(proxy_name.clone(), from_run_id.clone());
+                                                        }
+                                                        log::info!("XTCP visitor registered: {} -> {}", proxy_name, from_run_id);
+
+                                                        let target_tx = self.control_manager.get_msg_tx(&owner_run_id).await;
+                                                        if let Some(tx) = &target_tx {
+                                                            if let Err(e) = tx.send(Message::XtcpNatInfo(relay)).await {
+                                                                log::error!("Failed to relay XTCP NAT info to owner: {:?}", e);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // 来自 proxy owner，中继给 visitor
+                                                        let visitor_run_id = {
+                                                            let visitors = self.xtcp_visitors.read().await;
+                                                            visitors.get(&proxy_name).cloned()
+                                                        };
+
+                                                        match visitor_run_id {
+                                                            Some(vid) => {
+                                                                let target_tx = self.control_manager.get_msg_tx(&vid).await;
+                                                                if let Some(tx) = &target_tx {
+                                                                    if let Err(e) = tx.send(Message::XtcpNatInfo(relay)).await {
+                                                                        log::error!("Failed to relay XTCP NAT info to visitor: {:?}", e);
+                                                                    } else {
+                                                                        log::info!("Relayed XTCP NAT info from owner {} to visitor {}", from_run_id, vid);
+                                                                    }
+                                                                }
+                                                            }
+                                                            None => {
+                                                                log::info!("No XTCP visitor yet for proxy {}, NAT info from owner stored", proxy_name);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Message::XtcpHolePunch(hp_msg) => {
+                                                    let to_run_id = hp_msg.to_run_id.clone();
+                                                    let relay = XtcpHolePunchMsg {
+                                                        proxy_name: hp_msg.proxy_name.clone(),
+                                                        from_run_id: hp_msg.from_run_id.clone(),
+                                                        to_run_id: to_run_id.clone(),
+                                                        peer_local_addr: hp_msg.peer_local_addr.clone(),
+                                                        peer_public_addr: hp_msg.peer_public_addr.clone(),
+                                                    };
+
+                                                    let target_tx = self.control_manager.get_msg_tx(&to_run_id).await;
+                                                    if let Some(tx) = &target_tx {
+                                                        if let Err(e) = tx.send(Message::XtcpHolePunch(relay)).await {
+                                                            log::error!("Failed to relay XTCP hole punch: {:?}", e);
+                                                        }
+                                                    }
+                                                }
                                                 _ => {
                                                     log::warn!("unexpected message in loop: {:?}", msg);
                                                 }
@@ -889,12 +1077,88 @@ impl ControlManager {
     }
 }
 
+/// STCP 桥接状态，用于等待两个客户端的工连接并桥接
+struct StcpBridgeState {
+    conn1: Option<tokio::net::TcpStream>,
+    conn2: Option<tokio::net::TcpStream>,
+}
+
+/// STCP 桥接管理器，用于协调两个客户端的工作连接
+pub struct StcpBridgeManager {
+    bridges: RwLock<std::collections::HashMap<String, StcpBridgeState>>,
+}
+
+impl Default for StcpBridgeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StcpBridgeManager {
+    pub fn new() -> Self {
+        Self {
+            bridges: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub async fn create_bridge(&self, bridge_id: String) {
+        let mut bridges = self.bridges.write().await;
+        bridges.insert(bridge_id, StcpBridgeState {
+            conn1: None,
+            conn2: None,
+        });
+    }
+
+    /// 添加连接并尝试桥接。
+    /// 返回 Some((c1, c2)) 表示桥接已就绪
+    /// 返回 None 表示连接已存储（等待另一半）
+    /// 返回 Err 表示没有此桥接（连接未消耗）
+    pub async fn add_conn_and_try_bridge(
+        &self,
+        bridge_id: &str,
+        conn: tokio::net::TcpStream,
+    ) -> Result<Option<(tokio::net::TcpStream, tokio::net::TcpStream)>, tokio::net::TcpStream> {
+        let mut bridges = self.bridges.write().await;
+        if let Some(state) = bridges.get_mut(bridge_id) {
+            if state.conn1.is_none() {
+                state.conn1 = Some(conn);
+                Ok(None)
+            } else if state.conn2.is_none() {
+                state.conn2 = Some(conn);
+                let mut state = bridges.remove(bridge_id).unwrap();
+                let c1 = state.conn1.take().unwrap();
+                let c2 = state.conn2.take().unwrap();
+                Ok(Some((c1, c2)))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Err(conn)
+        }
+    }
+
+    pub async fn cleanup(&self, bridge_id: &str) {
+        let mut bridges = self.bridges.write().await;
+        bridges.remove(bridge_id);
+    }
+}
+
 /// 服务器代理管理器
 type ListenerMap = Arc<RwLock<std::collections::HashMap<String, (std::sync::Arc<tokio::net::TcpListener>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>>;
+
+/// UDP 代理会话信息，用于跟踪访问者地址以便回传响应
+#[derive(Debug, Clone)]
+struct UdpProxySession {
+    socket: Arc<tokio::net::UdpSocket>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+type UdpSocketMap = Arc<RwLock<std::collections::HashMap<String, UdpProxySession>>>;
 
 pub struct ServerProxyManager {
     proxies: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
     listeners: ListenerMap,
+    udp_sessions: UdpSocketMap,
     http_vhost_router: Arc<HttpVhostRouter>,
     /// 代理所有权映射 (proxy_name -> run_id)
     proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
@@ -948,6 +1212,7 @@ impl ServerProxyManager {
         Self {
             proxies: RwLock::new(std::collections::HashMap::new()),
             listeners: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            udp_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
             http_vhost_router,
             proxy_owners,
             control_manager,
@@ -996,6 +1261,7 @@ impl ServerProxyManager {
                                     let control_manager = control_manager.clone();
                                     let work_conn_manager = work_conn_manager.clone();
                                     let auth_manager = auth_manager.clone();
+                                    let _ = &auth_manager;
                                     let plugin_config = plugin_config.clone();
 
                                     tokio::spawn(async move {
@@ -1067,46 +1333,21 @@ impl ServerProxyManager {
                                             return;
                                         }
 
-                                        // 5. 生成 sign_key 并发送 NewWorkConn 给客户端
-                                        log::debug!("开始生成 sign_key: proxy={}, run_id={}", proxy_name_clone, run_id);
-                                        let sign_key = match auth_manager.generate_work_conn_sign_key(&run_id).await {
-                                            Ok(key) => {
-                                                log::debug!("sign_key 生成成功: proxy={}, key_len={}", proxy_name_clone, key.len());
-                                                key
+                                        // 5. 发送 ReqWorkConn 给客户端
+                                        log::debug!("发送 ReqWorkConn 到客户端: proxy={}", proxy_name_clone);
+
+                                        let req_work_conn_msg = rust_frp_core::ReqWorkConnMsg {
+                                            proxy_name: proxy_name_clone.clone(),
+                                        };
+                                        match msg_tx.send(Message::ReqWorkConn(req_work_conn_msg)).await {
+                                            Ok(_) => {
+                                                log::debug!("=== ReqWorkConn 消息发送成功 (via channel) ===");
                                             }
                                             Err(e) => {
-                                                log::error!("Failed to generate sign_key: {:?}", e);
-                                                String::new()
-                                            }
-                                        };
-                                        log::debug!("准备创建 NewWorkConn 消息: proxy={}", proxy_name_clone);
-                                        let _new_work_conn_msg = NewWorkConnMsg {
-                                            run_id: run_id.clone(),
-                                            proxy_name: proxy_name_clone.clone(),
-                                            timestamp: get_timestamp(),
-                                            sign_key,
-                                            use_encryption: false,
-                                            use_compression: false,
-                                        };
-                                        log::debug!("NewWorkConn 消息创建完成: proxy={}", proxy_name_clone);
-
-                                        {
-                                            // 发送 ReqWorkConn 消息，请求客户端建立工作连接
-                                            log::debug!("发送 ReqWorkConn 消息到客户端: proxy={}", proxy_name_clone);
-
-                                            let req_work_conn_msg = rust_frp_core::ReqWorkConnMsg {
-                                                proxy_name: proxy_name_clone.clone(),
-                                            };
-                                            match msg_tx.send(Message::ReqWorkConn(req_work_conn_msg)).await {
-                                                Ok(_) => {
-                                                    log::debug!("=== ReqWorkConn 消息发送成功 (via channel) ===");
-                                                }
-                                                Err(e) => {
-                                                    log::error!("=== ReqWorkConn 消息发送失败 ===");
-                                                    log::error!("Failed to send ReqWorkConn to client: proxy={}, error={:?}", proxy_name_clone, e);
-                                                    let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
-                                                    return;
-                                                }
+                                                log::error!("=== ReqWorkConn 消息发送失败 ===");
+                                                log::error!("Failed to send ReqWorkConn to client: proxy={}, error={:?}", proxy_name_clone, e);
+                                                let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+                                                return;
                                             }
                                         }
 
@@ -1187,6 +1428,180 @@ impl ServerProxyManager {
                     log::info!("HTTPS proxy {} registered with domains: {:?}", config.name, config.custom_domains);
                 }
             }
+            "udp" => {
+                if let Some(remote_port) = config.remote_port {
+                    if !port_allowed(remote_port, &self.allow_ports) {
+                        return Err(format!("Port {} is not in the allowed ports list", remote_port).into());
+                    }
+                    let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
+                    let socket = tokio::net::UdpSocket::bind(&addr).await?;
+                    let socket = Arc::new(socket);
+                    let socket_clone = socket.clone();
+                    let proxy_name = config.name.clone();
+                    let proxy_owners = self.proxy_owners.clone();
+                    let control_manager = self.control_manager.clone();
+                    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                    let running_clone = running.clone();
+
+                    self.udp_sessions.write().await.insert(config.name.clone(), UdpProxySession {
+                        socket: socket.clone(),
+                        running: running.clone(),
+                    });
+
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65535];
+                        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(1),
+                                socket_clone.recv_from(&mut buf),
+                            ).await {
+                                Ok(Ok((n, src_addr))) => {
+                                    let data = buf[..n].to_vec();
+                                    let run_id = {
+                                        let owners = proxy_owners.read().await;
+                                        owners.get(&proxy_name).cloned()
+                                    };
+                                    if let Some(run_id) = run_id {
+                                        if let Some(msg_tx) = control_manager.get_msg_tx(&run_id).await {
+                                            let udp_msg = rust_frp_core::UdpPacketMsg {
+                                                proxy_name: proxy_name.clone(),
+                                                data,
+                                                client_addr: Some(src_addr.to_string()),
+                                            };
+                                            let _ = msg_tx.send(Message::UdpPacket(udp_msg)).await;
+                                        }
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    log::error!("UDP recv error for proxy {}: {:?}", proxy_name, e);
+                                    break;
+                                }
+                                Err(_) => {
+                                    continue;
+                                }
+                            }
+                        }
+                        log::info!("UDP proxy {} stopped", proxy_name);
+                    });
+
+                    log::info!("UDP proxy {} listening on {}", config.name, addr);
+                } else {
+                    return Err("UDP proxy requires remote_port".into());
+                }
+            }
+            "websocket" => {
+                if let Some(remote_port) = config.remote_port {
+                    if !port_allowed(remote_port, &self.allow_ports) {
+                        return Err(format!("Port {} is not in the allowed ports list", remote_port).into());
+                    }
+                    let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
+                    let listener = tokio::net::TcpListener::bind(&addr).await?;
+                    let proxy_name = config.name.clone();
+                    let listeners = self.listeners.clone();
+                    let listener_arc = std::sync::Arc::new(listener);
+                    let listener_clone = listener_arc.clone();
+                    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                    let running_clone = running.clone();
+                    let proxy_owners = self.proxy_owners.clone();
+                    let control_manager = self.control_manager.clone();
+                    let work_conn_manager = self.work_conn_manager.clone();
+                    let auth_manager = self.auth_manager.clone();
+
+                    tokio::spawn(async move {
+                        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            match listener_clone.accept().await {
+                                Ok((visitor_conn, visitor_addr)) => {
+                                    log::info!("new WebSocket connection for proxy {} from {}", proxy_name, visitor_addr);
+
+                                    let proxy_name_clone = proxy_name.clone();
+                                    let proxy_owners = proxy_owners.clone();
+                                    let control_manager = control_manager.clone();
+                                    let work_conn_manager = work_conn_manager.clone();
+                                    let _auth_manager = auth_manager.clone();
+
+                                    tokio::spawn(async move {
+                                        let ws_stream = match accept_async(visitor_conn).await {
+                                            Ok(ws) => ws,
+                                            Err(e) => {
+                                                log::error!("WebSocket upgrade failed for proxy {}: {:?}", proxy_name_clone, e);
+                                                return;
+                                            }
+                                        };
+
+                                        let run_id = {
+                                            let owners = proxy_owners.read().await;
+                                            owners.get(&proxy_name_clone).cloned()
+                                        };
+
+                                        let run_id = match run_id {
+                                            Some(id) => id,
+                                            None => {
+                                                log::error!("No owner found for proxy: {}", proxy_name_clone);
+                                                return;
+                                            }
+                                        };
+
+                                        let msg_tx = match control_manager.get_msg_tx(&run_id).await {
+                                            Some(tx) => tx,
+                                            None => {
+                                                log::error!("Message channel not found for run_id: {}", run_id);
+                                                return;
+                                            }
+                                        };
+
+                                        let (tx, rx) = tokio::sync::oneshot::channel::<Result<tokio::net::TcpStream, String>>();
+                                        let key = work_conn_manager.generate_key(&proxy_name_clone);
+                                        if let Err(e) = work_conn_manager.register_request(
+                                            key.clone(),
+                                            proxy_name_clone.clone(),
+                                            run_id.clone(),
+                                            tx,
+                                        ).await {
+                                            log::error!("Failed to register work conn request: {}", e);
+                                            return;
+                                        }
+
+                                        let req_work_conn_msg = rust_frp_core::ReqWorkConnMsg {
+                                            proxy_name: proxy_name_clone.clone(),
+                                        };
+                                        if let Err(e) = msg_tx.send(Message::ReqWorkConn(req_work_conn_msg)).await {
+                                            log::error!("Failed to send ReqWorkConn: {:?}", e);
+                                            return;
+                                        }
+
+                                        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+                                            Ok(Ok(Ok(work_conn))) => {
+                                                log::info!("Got work conn for WebSocket proxy {}, bridging", proxy_name_clone);
+                                                let ws_conn = WebSocketConn::new(ws_stream, visitor_addr);
+                                                if let Err(e) = rust_frp_util::bridge_streams(ws_conn, work_conn).await {
+                                                    log::error!("WebSocket bridge error for proxy {}: {:?}", proxy_name_clone, e);
+                                                }
+                                            }
+                                            Ok(Ok(Err(e))) => {
+                                                log::error!("Work conn error for proxy {}: {}", proxy_name_clone, e);
+                                            }
+                                            Ok(Err(_)) => {
+                                                log::error!("Work conn channel closed for proxy {}", proxy_name_clone);
+                                            }
+                                            Err(_) => {
+                                                log::error!("Timeout waiting for work conn for proxy {}", proxy_name_clone);
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    log::error!("accept WebSocket connection error: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        log::info!("WebSocket proxy {} stopped", proxy_name);
+                    });
+
+                    let mut listeners = listeners.write().await;
+                    listeners.insert(config.name.clone(), (listener_arc, running));
+                }
+            }
             _ => {
                 log::warn!("unsupported proxy type: {}", config.r#type);
             }
@@ -1200,18 +1615,39 @@ impl ServerProxyManager {
         // 从 HTTP 虚拟主机路由器中注销
         self.http_vhost_router.unregister_proxy(name).await;
         
+        // 停止 TCP 监听器
         let mut listeners = self.listeners.write().await;
-        log::info!("Listeners: {:?}", listeners);
         if let Some((_, running)) = listeners.remove(name) {
-            // 设置running标志为false，停止任务
             running.store(false, std::sync::atomic::Ordering::Relaxed);
-            // 等待一段时间，让任务有时间停止
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            log::info!("stopped proxy: {}", name);
-        } else {
-            log::info!("Proxy {} not found in listeners", name);
+            log::info!("stopped TCP proxy: {}", name);
+        }
+
+        // 停止 UDP 会话
+        let mut udp_sessions = self.udp_sessions.write().await;
+        if let Some(session) = udp_sessions.remove(name) {
+            session.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            log::info!("stopped UDP proxy: {}", name);
         }
         Ok(())
+    }
+
+    /// 发送 UDP 数据包到指定访问者
+    pub async fn send_udp_packet(
+        &self,
+        proxy_name: &str,
+        data: &[u8],
+        client_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let udp_sessions = self.udp_sessions.read().await;
+        if let Some(session) = udp_sessions.get(proxy_name) {
+            let addr: SocketAddr = client_addr.parse()?;
+            session.socket.send_to(data, &addr).await?;
+            Ok(())
+        } else {
+            Err(format!("UDP proxy session not found: {}", proxy_name).into())
+        }
     }
 
     pub fn get_http_vhost_router(&self) -> Arc<HttpVhostRouter> {
@@ -1248,6 +1684,22 @@ impl ProxyManager for ServerProxyManager {
         let mut proxies = self.proxies.write().await;
         proxies.clear();
         log::info!("Server proxy manager cleared");
+    }
+
+    async fn send_udp_packet(
+        &self,
+        proxy_name: &str,
+        data: &[u8],
+        client_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let udp_sessions = self.udp_sessions.read().await;
+        if let Some(session) = udp_sessions.get(proxy_name) {
+            let addr: SocketAddr = client_addr.parse()?;
+            session.socket.send_to(data, &addr).await?;
+            Ok(())
+        } else {
+            Err(format!("UDP proxy session not found: {}", proxy_name).into())
+        }
     }
 }
 
@@ -1306,6 +1758,7 @@ fn create_routes(
         .route("/login", axum::routing::get(login_handler))
         .route("/login", axum::routing::post(login_post_handler))
         .route("/logout", axum::routing::get(logout_handler))
+        .route("/api/reload", axum::routing::post(reload_handler))
         .with_state(server);
 
     if let (Some(ref user_val), Some(ref password_val)) = (&user, &password) {
@@ -1375,6 +1828,37 @@ async fn health_handler() -> axum::Json<serde_json::Value> {
         "status": "ok",
         "timestamp": get_timestamp(),
     }))
+}
+
+async fn reload_handler(
+    State(server): State<std::sync::Arc<Server>>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    if let Some(ref tx) = server.reload_tx {
+        match tx.send(()).await {
+            Ok(_) => (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "success": true,
+                    "message": "Reload signal sent"
+                })),
+            ),
+            Err(_) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "success": false,
+                    "error": "Failed to send reload signal"
+                })),
+            ),
+        }
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "success": false,
+                "error": "Hot reload not configured (config_path not set)"
+            })),
+        )
+    }
 }
 
 async fn metrics_handler(
@@ -1593,10 +2077,20 @@ pub struct Server {
     work_conn_manager: Arc<ServerWorkConnManager>,
     /// 代理所有权映射 (proxy_name -> run_id)
     proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// STCP 桥接管理器
+    stcp_bridge_manager: Arc<StcpBridgeManager>,
+    /// XTCP 访问者映射 (proxy_name -> visitor_run_id)
+    xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// 配置文件路径（用于热重载）
+    config_path: Option<String>,
+    /// 重载信号接收器
+    reload_rx: Option<tokio::sync::mpsc::Receiver<()>>,
+    /// 重载信号发送器（供 WebServer API 使用）
+    reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl Server {
-    pub async fn new(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(config: ServerConfig, config_path: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let auth_manager = Arc::new(AuthManager::new(&config.auth).map_err(|e| e.to_string())?);
         let control_manager = Arc::new(ControlManager::new());
         let http_vhost_router = Arc::new(HttpVhostRouter::new());
@@ -1629,6 +2123,8 @@ impl Server {
         };
 
         let conn_manager = ConnManager::new(tls_config, config.transport.pool_count as usize);
+        let stcp_bridge_manager = Arc::new(StcpBridgeManager::new());
+        let xtcp_visitors = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
         let mut web_server = None;
         if config.web_server.port > 0 {
@@ -1651,6 +2147,11 @@ impl Server {
             metrics,
             work_conn_manager,
             proxy_owners,
+            stcp_bridge_manager,
+            xtcp_visitors,
+            config_path,
+            reload_rx: None,
+            reload_tx: None,
         })
     }
 
@@ -1731,8 +2232,9 @@ impl Server {
         let control_manager = self.control_manager.clone();
         let work_conn_manager = self.work_conn_manager.clone();
         let auth_manager = self.auth_manager.clone();
+        let stcp_bridge_manager_work = self.stcp_bridge_manager.clone();
         tokio::spawn(async move {
-            Self::handle_work_connections(work_conn_listener_clone, control_manager, work_conn_manager, auth_manager).await;
+            Self::handle_work_connections(work_conn_listener_clone, control_manager, work_conn_manager, auth_manager, stcp_bridge_manager_work).await;
         });
 
         self.work_conn_listener = Some(work_conn_listener);
@@ -1747,6 +2249,68 @@ impl Server {
         });
 
         // 开始处理连接
+        log::info!("Starting connection handlers...");
+        
+        // 启动 KCP 连接处理器（如果启用了 KCP）
+        if let Some(ref _udp_listener) = self.udp_listener {
+            log::info!("KCP connection handler enabled");
+            let control_manager = self.control_manager.clone();
+            let proxy_manager = self.proxy_manager.clone();
+            let visitor_manager = self.visitor_manager.clone();
+            let auth_manager = self.auth_manager.clone();
+            let proxy_owners = self.proxy_owners.clone();
+            let metrics = self.metrics.clone();
+            let work_conn_manager = self.work_conn_manager.clone();
+            let stcp_bridge_manager = self.stcp_bridge_manager.clone();
+            let xtcp_visitors = self.xtcp_visitors.clone();
+            let kcp_listener = KcpListener::bind(
+                format!("{}:{}", self.config.bind_addr, self.config.kcp_bind_port.unwrap_or(self.config.bind_port + 1))
+                    .parse::<SocketAddr>()?
+            ).await?;
+            
+            tokio::spawn(async move {
+                loop {
+                    match kcp_listener.accept().await {
+                        Ok((kcp_conn, addr)) => {
+                            log::info!("new KCP connection from: {:?}", addr);
+                            metrics.increment_connections();
+                            let cm = control_manager.clone();
+                            let pm = proxy_manager.clone();
+                            let vm = visitor_manager.clone();
+                            let am = auth_manager.clone();
+                            let po = proxy_owners.clone();
+                            let m = metrics.clone();
+                            let wcm = work_conn_manager.clone();
+                            let sbm = stcp_bridge_manager.clone();
+                            let xv = xtcp_visitors.clone();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_kcp_connection(
+                                    kcp_conn,
+                                    cm,
+                                    pm,
+                                    vm,
+                                    am,
+                                    po,
+                                    xv,
+                                    wcm,
+                                    sbm,
+                                ).await {
+                                    log::error!("handle KCP connection error: {:?}", e);
+                                }
+                                m.decrement_connections();
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("Failed to accept KCP connection: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        
+        // 启动 TCP 连接处理器
         self.handle_tcp_connections().await?;
         Ok(())
     }
@@ -1757,6 +2321,7 @@ impl Server {
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
         auth_manager: Arc<AuthManager>,
+        stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) {
         log::info!("Work connection handler started");
 
@@ -1768,8 +2333,9 @@ impl Server {
                     let cm = control_manager.clone();
                     let wcm = work_conn_manager.clone();
                     let am = auth_manager.clone();
+                    let sbm = stcp_bridge_manager.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::process_work_conn(conn, cm, wcm, am).await {
+                        if let Err(e) = Self::process_work_conn(conn, cm, wcm, am, sbm).await {
                             if e.to_string().to_lowercase().contains("connection reset")
                                 || e.to_string().to_lowercase().contains("connection aborted")
                                 || e.to_string().to_lowercase().contains("broken pipe")
@@ -1797,6 +2363,7 @@ impl Server {
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
         auth_manager: Arc<AuthManager>,
+        stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取客户端发送的 NewWorkConn 消息
         let msg = rust_frp_core::read_message(&mut conn).await?;
@@ -1840,14 +2407,36 @@ impl Server {
                 });
                 rust_frp_core::write_message(&mut conn, &resp).await?;
 
-                // 将工作连接交付给等待的访问者处理器
-                if let Err(e) = work_conn_manager.complete_work_conn(
-                    &work_msg.proxy_name,
-                    &work_msg.run_id,
-                    conn,
+                // 检查是否是 STCP 桥接工作连接（用 proxy_name 作为 bridge_id）
+                match stcp_bridge_manager.add_conn_and_try_bridge(
+                    &work_msg.proxy_name, conn
                 ).await {
-                    log::error!("Failed to complete work conn: {}", e);
-                    return Err(e.into());
+                    Ok(Some((c1, c2))) => {
+                        log::info!("STCP bridge both sides ready for {}, bridging", work_msg.proxy_name);
+                        let proxy_name = work_msg.proxy_name.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = rust_frp_util::bridge_streams(c1, c2).await {
+                                log::error!("STCP bridge error for {}: {:?}", proxy_name, e);
+                            }
+                        });
+                        return Ok(());
+                    }
+                    Ok(None) => {
+                        // 连接已存入 STCP 桥接，等待另一半
+                        return Ok(());
+                    }
+                    Err(conn) => {
+                        // 没有 STCP 桥接，继续正常流程
+                        // 将工作连接交付给等待的访问者处理器
+                        if let Err(e) = work_conn_manager.complete_work_conn(
+                            &work_msg.proxy_name,
+                            &work_msg.run_id,
+                            conn,
+                        ).await {
+                            log::error!("Failed to complete work conn: {}", e);
+                            return Err(e.into());
+                        }
+                    }
                 }
             }
             _ => {
@@ -2292,14 +2881,13 @@ impl Server {
         });
     }
 
-    async fn handle_tcp_connections(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_tcp_connections(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(listener) = &self.tcp_listener {
             let tls_config = if let Some(ref tls) = self.config.transport.tls {
                 if tls.enable {
                     if let (Some(ref cert_file), Some(ref key_file)) = (&tls.cert_file, &tls.key_file) {
                         Some(TlsConfig::new_server(cert_file, key_file)?)
                     } else {
-                        // 使用内置自签名证书
                         Some(TlsConfig::new_server_with_builtin_cert()?)
                     }
                 } else {
@@ -2308,37 +2896,98 @@ impl Server {
             } else {
                 None
             };
-            loop {
-                let (conn, addr) = listener.accept().await?;
-                log::info!("new connection from: {:?}", addr);
-                self.metrics.increment_connections();
-                let control_manager = self.control_manager.clone();
-                let proxy_manager = self.proxy_manager.clone();
-                let visitor_manager = self.visitor_manager.clone();
-                let auth_manager = self.auth_manager.clone();
-                let proxy_owners = self.proxy_owners.clone();
-                let metrics = self.metrics.clone();
-                let tls_config = tls_config.clone();
 
-                tokio::spawn(async move {
-                    if let Err(e) = Self::handle_connection(
-                        conn,
-                        control_manager,
-                        proxy_manager,
-                        visitor_manager,
-                        auth_manager,
-                        proxy_owners,
-                        tls_config,
-                    ).await {
-                        log::error!("handle connection error: {:?}", e);
+            let mut reload_rx = self.reload_rx.take();
+            let config_path = self.config_path.clone();
+
+            loop {
+                if let Some(ref mut rx) = reload_rx {
+                    tokio::select! {
+                        result = listener.accept() => {
+                            let (conn, addr) = match result {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    log::error!("accept error: {:?}", e);
+                                    continue;
+                                }
+                            };
+                            log::info!("new connection from: {:?}", addr);
+                            self.metrics.increment_connections();
+                            let control_manager = self.control_manager.clone();
+                            let proxy_manager = self.proxy_manager.clone();
+                            let visitor_manager = self.visitor_manager.clone();
+                            let auth_manager = self.auth_manager.clone();
+                            let proxy_owners = self.proxy_owners.clone();
+                            let metrics = self.metrics.clone();
+                            let tls_config = tls_config.clone();
+                            let work_conn_manager = self.work_conn_manager.clone();
+                            let stcp_bridge_manager = self.stcp_bridge_manager.clone();
+                            let xtcp_visitors = self.xtcp_visitors.clone();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_connection(
+                                    conn,
+                                    control_manager,
+                                    proxy_manager,
+                                    visitor_manager,
+                                    auth_manager,
+                                    proxy_owners,
+                                    xtcp_visitors,
+                                    tls_config,
+                                    work_conn_manager,
+                                    stcp_bridge_manager,
+                                ).await {
+                                    log::error!("handle connection error: {:?}", e);
+                                }
+                                metrics.decrement_connections();
+                            });
+                        }
+                        _ = rx.recv() => {
+                            log::info!("Reload signal received, reloading config...");
+                            if let Err(e) = reload_server_config(&config_path, &mut self.config, &mut self.auth_manager).await {
+                                log::error!("Reload config failed: {}", e);
+                            }
+                        }
                     }
-                    metrics.decrement_connections();
-                });
+                } else {
+                    let (conn, addr) = listener.accept().await?;
+                    log::info!("new connection from: {:?}", addr);
+                    self.metrics.increment_connections();
+                    let control_manager = self.control_manager.clone();
+                    let proxy_manager = self.proxy_manager.clone();
+                    let visitor_manager = self.visitor_manager.clone();
+                    let auth_manager = self.auth_manager.clone();
+                    let proxy_owners = self.proxy_owners.clone();
+                    let metrics = self.metrics.clone();
+                    let tls_config = tls_config.clone();
+                    let work_conn_manager = self.work_conn_manager.clone();
+                    let stcp_bridge_manager = self.stcp_bridge_manager.clone();
+                    let xtcp_visitors = self.xtcp_visitors.clone();
+
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_connection(
+                            conn,
+                            control_manager,
+                            proxy_manager,
+                            visitor_manager,
+                            auth_manager,
+                            proxy_owners,
+                            xtcp_visitors,
+                            tls_config,
+                            work_conn_manager,
+                            stcp_bridge_manager,
+                        ).await {
+                            log::error!("handle connection error: {:?}", e);
+                        }
+                        metrics.decrement_connections();
+                    });
+                }
             }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         conn: tokio::net::TcpStream,
         control_manager: Arc<ControlManager>,
@@ -2346,7 +2995,10 @@ impl Server {
         visitor_manager: Arc<ServerVisitorManager>,
         auth_manager: Arc<AuthManager>,
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
         tls_config: Option<TlsConfig>,
+        work_conn_manager: Arc<ServerWorkConnManager>,
+        stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = if let Some(tls_config) = tls_config {
             // 处理 TLS 连接
@@ -2375,8 +3027,11 @@ impl Server {
             auth_manager,
             control_manager.clone(),
             proxy_owners,
+            xtcp_visitors,
             Some(login_tx),
             Some(msg_tx),
+            stcp_bridge_manager.clone(),
+            work_conn_manager.clone(),
         );
 
         let cm = control_manager.clone();
@@ -2414,6 +3069,113 @@ impl Server {
 
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_kcp_connection(
+        kcp_conn: KcpConn,
+        control_manager: Arc<ControlManager>,
+        proxy_manager: Arc<ServerProxyManager>,
+        visitor_manager: Arc<ServerVisitorManager>,
+        auth_manager: Arc<AuthManager>,
+        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        work_conn_manager: Arc<ServerWorkConnManager>,
+        stcp_bridge_manager: Arc<StcpBridgeManager>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = ControlConn::new(Box::new(kcp_conn));
+
+        let (login_tx, mut login_rx) = mpsc::channel::<String>(1);
+        let (msg_tx, msg_rx) = mpsc::channel::<Message>(100);
+
+        let mut control = Control::new(
+            conn,
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            proxy_manager,
+            visitor_manager,
+            auth_manager,
+            control_manager.clone(),
+            proxy_owners,
+            xtcp_visitors,
+            Some(login_tx),
+            Some(msg_tx),
+            stcp_bridge_manager.clone(),
+            work_conn_manager.clone(),
+        );
+
+        let cm = control_manager.clone();
+        let msg_tx_clone = control.msg_tx.clone();
+
+        tokio::spawn(async move {
+            let run_handle = tokio::spawn(async move {
+                if let Err(e) = control.run(msg_rx).await {
+                    log::error!("control run error: {:?}", e);
+                }
+            });
+
+            if let Some(run_id) = login_rx.recv().await {
+                log::info!("KCP Control registered for run_id: {}", run_id);
+                if let Some(msg_tx) = msg_tx_clone {
+                    cm.add(run_id.clone(), msg_tx).await.ok();
+                }
+                let _ = run_handle.await;
+                cm.remove(&run_id).await.ok();
+                log::info!("KCP Control unregistered for run_id: {}", run_id);
+            } else {
+                let _ = run_handle.await;
+            }
+        });
+
+        Ok(())
+    }
+
+    /// 热重载配置
+    ///
+    /// 重新加载配置文件，应用新的配置项。
+    /// 注意：不会重新绑定网络端口，仅更新代理/认证等运行时配置。
+    pub async fn reload_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(config_path) = &self.config_path {
+            log::info!("Reloading config from: {}", config_path);
+            let new_config = rust_frp_config::ConfigLoader::load_server_config(config_path)?;
+
+            self.config = new_config;
+            self.auth_manager = Arc::new(
+                AuthManager::new(&self.config.auth).map_err(|e| e.to_string())?
+            );
+
+            log::info!("Config reloaded successfully");
+        }
+        Ok(())
+    }
+
+    pub fn set_reload_rx(&mut self, rx: tokio::sync::mpsc::Receiver<()>) {
+        self.reload_rx = Some(rx);
+    }
+
+    pub fn set_reload_tx(&mut self, tx: tokio::sync::mpsc::Sender<()>) {
+        self.reload_tx = Some(tx);
+    }
+}
+
+/// 从配置文件重载服务端配置（独立函数，避免 select! 中的借用冲突）
+async fn reload_server_config(
+    config_path: &Option<String>,
+    config: &mut ServerConfig,
+    auth_manager: &mut Arc<AuthManager>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = config_path {
+        log::info!("Reloading config from: {}", path);
+        let new_config = rust_frp_config::ConfigLoader::load_server_config(path)?;
+
+        *config = new_config;
+        *auth_manager = Arc::new(
+            AuthManager::new(&config.auth).map_err(|e| e.to_string())?
+        );
+
+        log::info!("Config reloaded successfully");
+    }
+    Ok(())
 }
 
 impl Clone for Server {
@@ -2434,6 +3196,11 @@ impl Clone for Server {
             metrics: self.metrics.clone(),
             work_conn_manager: self.work_conn_manager.clone(),
             proxy_owners: self.proxy_owners.clone(),
+            stcp_bridge_manager: self.stcp_bridge_manager.clone(),
+            xtcp_visitors: self.xtcp_visitors.clone(),
+            config_path: self.config_path.clone(),
+            reload_rx: None,
+            reload_tx: self.reload_tx.clone(),
         }
     }
 }

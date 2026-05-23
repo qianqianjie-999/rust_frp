@@ -47,10 +47,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::{SocketAddr, ToSocketAddrs};
 
+/// 工具模块错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum UtilError {
+    /// I/O 错误
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// 无效地址错误
     #[error("invalid address: {0}")]
     InvalidAddress(String),
 }
@@ -176,5 +179,11 @@ where
 // 导出重试模块
 pub mod retry;
 
+/// 速率限制模块
+///
+/// 提供基于令牌桶算法的带宽限制功能，支持对读写操作进行限速。
+pub mod rate_limiter;
+
 // 重新导出常用类型
 pub use retry::{RetryConfig, RetryResult, retry, retry_with_default, ConnectionError, RetryableError};
+pub use rate_limiter::{TokenBucket, RateLimitedReader, RateLimitedWriter, parse_bandwidth_limit};

@@ -1,61 +1,5 @@
-//! FRP 服务器入口程序 (rust_frps)
-//!
-//! 这是 FRP 服务器的命令行入口点，负责：
-//!
-//! ## 主要职责
-//!
-//! 1. **解析命令行参数**
-//!    - 支持 `-c <config_path>` 指定配置文件
-//!    - 默认配置文件：`frps.toml`
-//!
-//! 2. **加载配置**
-//!    - 从 TOML 文件加载服务器配置
-//!    - 验证配置项
-//!
-//! 3. **启动服务器**
-//!    - 创建 Server 实例
-//!    - 调用 `server.start()` 启动服务器
-//!
-//! ## 使用方法
-//!
-//! ```bash
-//! # 使用默认配置文件 frps.toml
-//! rust_frps
-//!
-//! # 指定配置文件
-//! rust_frps -c /path/to/config.toml
-//! ```
-//!
-//! ## 配置文件格式
-//!
-//! ```toml
-//! bind_addr = "0.0.0.0"
-//! bind_port = 9300
-//!
-//! [web_server]
-//! addr = "0.0.0.0"
-//! port = 7500
-//! user = "admin"
-//! password = "admin"
-//!
-//! [auth]
-//! method = "token"
-//! token = "your_secure_token"
-//!
-//! allow_ports = [
-//!     { single = 9302 },
-//!     { start = 10000, end = 20000 },
-//! ]
-//! ```
-//!
-//! ## 安全建议
-//!
-//! - 生产环境务必修改默认 token
-//! - 配置 `allow_ports` 限制可使用的端口范围
-//! - 启用 TLS 加密传输
-
 use std::env;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use rust_frp_config::ConfigLoader;
 use rust_frp_server::Server;
 
@@ -67,12 +11,12 @@ async fn main() {
 
     let args: Vec<String> = env::args().collect();
     let config_path = if args.len() > 2 && args[1] == "-c" {
-        &args[2]
+        args[2].clone()
     } else {
-        "frps.toml"
+        "frps.toml".to_string()
     };
 
-    let config = match ConfigLoader::load_server_config(config_path) {
+    let config = match ConfigLoader::load_server_config(&config_path) {
         Ok(config) => config,
         Err(e) => {
             error!("Failed to load config: {:?}", e);
@@ -82,13 +26,83 @@ async fn main() {
 
     info!("Starting frps server...");
 
-    let mut server = match Server::new(config).await {
+    let mut server = match Server::new(config, Some(config_path.clone())).await {
         Ok(server) => server,
         Err(e) => {
             error!("Failed to create server: {:?}", e);
             return;
         }
     };
+
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::channel::<()>(16);
+    server.set_reload_rx(reload_rx);
+
+    // 将 reload_tx 存入 server，供 WebServer API 使用
+    server.set_reload_tx(reload_tx.clone());
+
+    // 启动 SIGHUP 信号处理
+    if let Ok(mut sighup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        let tx = reload_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                sighup.recv().await;
+                info!("Received SIGHUP signal, triggering config reload...");
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+    } else {
+        warn!("SIGHUP signal handler not available on this platform");
+    }
+
+    // 启动配置文件监听
+    let watch_path = config_path.clone();
+    let tx = reload_tx.clone();
+    tokio::spawn(async move {
+        use notify::{Event, EventKind, RecursiveMode, Watcher};
+        let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1);
+        let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, EventKind::Modify(_)) {
+                    let _ = watch_tx.blocking_send(());
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("Failed to create file watcher: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = watcher.watch(std::path::Path::new(&watch_path), RecursiveMode::NonRecursive) {
+            warn!("Failed to watch config file {}: {}", watch_path, e);
+            return;
+        }
+        info!("Watching config file for changes: {}", watch_path);
+
+        loop {
+            if watch_rx.recv().await.is_none() {
+                break;
+            }
+            // 防抖：等待文件写入完成
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            info!("Config file changed, triggering config reload...");
+            if tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 启动 Ctrl+C 信号处理
+    if let Ok(mut sigint) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+        tokio::spawn(async move {
+            sigint.recv().await;
+            info!("Received SIGINT, shutting down...");
+            std::process::exit(0);
+        });
+    }
 
     if let Err(e) = server.start().await {
         error!("Failed to start server: {:?}", e);

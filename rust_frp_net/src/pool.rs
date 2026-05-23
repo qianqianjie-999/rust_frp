@@ -82,13 +82,22 @@ impl Default for PoolConfig {
 
 /// 池化连接包装器
 pub struct PooledConn {
+    /// 底层 TCP 连接
     pub conn: TcpStream,
+    /// 连接创建时间
     pub created_at: Instant,
+    /// 最后使用时间
     pub last_used_at: Instant,
+    /// 使用次数
     pub use_count: u64,
 }
 
 impl PooledConn {
+    /// 创建新的池化连接
+    ///
+    /// # 参数
+    ///
+    /// * `conn` - TCP 连接
     pub fn new(conn: TcpStream) -> Self {
         let now = Instant::now();
         Self {
@@ -175,15 +184,27 @@ pub struct ConnPool {
 /// 连接池统计信息
 #[derive(Debug, Default)]
 pub struct PoolStats {
+    /// 总创建连接数
     pub total_created: u64,
+    /// 总复用连接数
     pub total_reused: u64,
+    /// 总关闭连接数
     pub total_closed: u64,
+    /// 总失败连接数
     pub total_failed: u64,
+    /// 当前空闲连接数
     pub current_idle: usize,
+    /// 当前使用中连接数
     pub current_in_use: usize,
 }
 
 impl ConnPool {
+    /// 创建新的连接池
+    ///
+    /// # 参数
+    ///
+    /// * `addr` - 连接目标地址
+    /// * `config` - 连接池配置
     pub fn new(addr: SocketAddr, config: PoolConfig) -> Self {
         let max_size = config.max_size;
         Self {
@@ -357,6 +378,11 @@ pub struct PoolManager {
 }
 
 impl PoolManager {
+    /// 创建新的连接池管理器
+    ///
+    /// # 参数
+    ///
+    /// * `default_config` - 默认连接池配置
     pub fn new(default_config: PoolConfig) -> Self {
         Self {
             pools: RwLock::new(std::collections::HashMap::new()),

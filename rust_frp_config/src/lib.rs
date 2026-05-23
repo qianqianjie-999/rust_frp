@@ -34,18 +34,25 @@ use std::io::Read;
 use std::path::Path;
 use glob::glob;
 
+/// 配置模块错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// I/O 错误
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// TOML 解析错误
     #[error("TOML parse error: {0}")]
     Toml(#[from] toml::de::Error),
+    /// YAML 解析错误
     #[error("YAML parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+    /// JSON 解析错误
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
+    /// glob 模式错误
     #[error("glob pattern error: {0}")]
     Glob(#[from] glob::PatternError),
+    /// 无效配置错误
     #[error("invalid configuration: {0}")]
     Invalid(String),
 }
@@ -533,10 +540,11 @@ pub struct PortRange {
 /// # 字段说明
 ///
 /// - `name`: 代理唯一名称
-/// - `type`: 代理类型 (tcp/udp/http/https/stcp/xtcp)
+/// - `type`: 代理类型 (tcp/udp/http/https/websocket/stcp/xtcp)
 /// - `local_ip`: 本地服务 IP
 /// - `local_port`: 本地服务端口
-/// - `remote_port`: 远程映射端口（TCP/UDP 必需）
+/// - `remote_port`: 远程映射端口（TCP/UDP/WebSocket 必需，stcp/xtcp 不需要）
+/// - `secret_key`: 共享密钥（stcp/xtcp 代理用于认证）
 /// - `custom_domains`: 自定义域名（HTTP/HTTPS 代理用）
 /// - `subdomain`: 子域名（HTTP/HTTPS 代理用）
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -600,6 +608,14 @@ pub struct ProxyConfig {
 
     /// 健康检查配置（可选）
     pub health_check: Option<HealthCheckConfig>,
+
+    /// 带宽限制（可选），格式如 "1MB"、"500KB"、"10GB"
+    ///
+    /// 限制该代理的最大传输速率，覆盖全局 bandwidth_limit
+    pub bandwidth_limit: Option<String>,
+
+    /// 共享密钥（stcp/xtcp 代理用）
+    pub secret_key: Option<String>,
 
     /// 传输层覆盖配置（可选）
     ///

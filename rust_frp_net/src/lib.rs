@@ -97,6 +97,12 @@ impl<S> WebSocketConn<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    /// 创建新的 WebSocket 连接
+    ///
+    /// # 参数
+    ///
+    /// * `stream` - WebSocket 流
+    /// * `remote_addr` - 远程地址
     pub fn new(stream: WebSocketStream<S>, remote_addr: SocketAddr) -> Self {
         Self {
             stream,
@@ -239,11 +245,17 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
+    /// 绑定到指定地址
+    ///
+    /// # 参数
+    ///
+    /// * `addr` - 要绑定的地址
     pub async fn bind(addr: &SocketAddr) -> Result<Self, std::io::Error> {
         let inner = TokioTcpListener::bind(addr).await?;
         Ok(Self { inner })
     }
 
+    /// 接受一个新连接
     pub async fn accept(&self) -> Result<(TokioTcpStream, SocketAddr), std::io::Error> {
         self.inner.accept().await
     }
@@ -255,15 +267,31 @@ pub struct UdpListener {
 }
 
 impl UdpListener {
+    /// 绑定到指定地址
+    ///
+    /// # 参数
+    ///
+    /// * `addr` - 要绑定的地址
     pub async fn bind(addr: &SocketAddr) -> Result<Self, std::io::Error> {
         let inner = TokioUdpSocket::bind(addr).await?;
         Ok(Self { inner })
     }
 
+    /// 从远程地址接收数据
+    ///
+    /// # 参数
+    ///
+    /// * `buf` - 接收数据的缓冲区
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), std::io::Error> {
         self.inner.recv_from(buf).await
     }
 
+    /// 发送数据到指定地址
+    ///
+    /// # 参数
+    ///
+    /// * `buf` - 要发送的数据
+    /// * `addr` - 目标地址
     pub async fn send_to(&self, buf: &[u8], addr: &SocketAddr) -> Result<usize, std::io::Error> {
         self.inner.send_to(buf, addr).await
     }
@@ -387,7 +415,7 @@ impl TlsConfig {
 
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
         for cert in certs {
-            root_store.add(cert).map_err(|e| NetError::Tls(e))?;
+            root_store.add(cert).map_err(NetError::Tls)?;
         }
 
         let config = tokio_rustls::rustls::ClientConfig::builder()
@@ -424,7 +452,7 @@ impl TlsConfig {
         
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
         for cert in root_certs {
-            root_store.add(cert).map_err(|e| NetError::Tls(e))?;
+            root_store.add(cert).map_err(NetError::Tls)?;
         }
 
         let config = tokio_rustls::rustls::ClientConfig::builder()
@@ -450,7 +478,7 @@ impl TlsConfig {
             .ok_or_else(|| NetError::Other("No certificate found in builtin cert".to_string()))?;
 
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-        root_store.add(cert_der).map_err(|e| NetError::Tls(e))?;
+        root_store.add(cert_der).map_err(NetError::Tls)?;
 
         let config = tokio_rustls::rustls::ClientConfig::builder()
             .with_root_certificates(Arc::new(root_store))
@@ -507,10 +535,15 @@ impl TlsConfig {
         include_bytes!("../cert/frp.key")
     }
 
+    /// 接受 TLS 连接（服务端）
+    ///
+    /// # 参数
+    ///
+    /// * `stream` - 底层 TCP 流
     pub async fn accept(&self, stream: TokioTcpStream) -> Result<server::TlsStream<TokioTcpStream>, std::io::Error> {
         if let Some(config) = &self.server_config {
             let acceptor = TlsAcceptor::from(config.clone());
-            acceptor.accept(stream).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            acceptor.accept(stream).await.map_err(std::io::Error::other)
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -519,12 +552,18 @@ impl TlsConfig {
         }
     }
 
+    /// 建立 TLS 连接（客户端）
+    ///
+    /// # 参数
+    ///
+    /// * `domain` - 服务器域名
+    /// * `stream` - 底层 TCP 流
     pub async fn connect(&self, domain: &str, stream: TokioTcpStream) -> Result<client::TlsStream<TokioTcpStream>, std::io::Error> {
         if let Some(config) = &self.client_config {
             let server_name = ServerName::try_from(domain.to_string())
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid server name"))?;
             let connector = TlsConnector::from(config.clone());
-            connector.connect(server_name, stream).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            connector.connect(server_name, stream).await.map_err(std::io::Error::other)
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -535,12 +574,21 @@ impl TlsConfig {
 }
 
 /// 网络连接管理器
+///
+/// 统一管理所有网络连接，包括 TCP、TLS、WebSocket 和 KCP 连接。
 pub struct ConnManager {
+    /// TLS 配置
     pub tls_config: Option<TlsConfig>,
     pool_manager: PoolManager,
 }
 
 impl ConnManager {
+    /// 创建新的连接管理器
+    ///
+    /// # 参数
+    ///
+    /// * `tls_config` - TLS 配置
+    /// * `max_pool_size` - 连接池最大大小
     pub fn new(tls_config: Option<TlsConfig>, max_pool_size: usize) -> Self {
         let pool_config = PoolConfig {
             max_size: max_pool_size,
@@ -553,11 +601,22 @@ impl ConnManager {
         }
     }
 
+    /// 建立 TCP 连接（使用连接池）
+    ///
+    /// # 参数
+    ///
+    /// * `addr` - 目标地址
     pub async fn connect_tcp(&self, addr: &SocketAddr) -> Result<PooledConn, std::io::Error> {
         let pool = self.pool_manager.get_or_create_pool(*addr).await;
         pool.get().await
     }
 
+    /// 建立 TLS 连接（使用连接池）
+    ///
+    /// # 参数
+    ///
+    /// * `domain` - 服务器域名
+    /// * `addr` - 目标地址
     pub async fn connect_tls(&self, domain: &str, addr: &SocketAddr) -> Result<client::TlsStream<TokioTcpStream>, std::io::Error> {
         let pooled = self.connect_tcp(addr).await?;
         if let Some(tls_config) = &self.tls_config {
@@ -570,6 +629,11 @@ impl ConnManager {
         }
     }
 
+    /// 建立 WebSocket 连接
+    ///
+    /// # 参数
+    ///
+    /// * `url` - WebSocket 服务地址
     pub async fn connect_websocket(&self, url: &str) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error> {
         let (stream, _) = connect_async(url).await.map_err(|e| {
             std::io::Error::other(e)
@@ -578,6 +642,23 @@ impl ConnManager {
         Ok(WebSocketConn::new(stream, remote_addr))
     }
 
+    /// 建立 KCP 连接
+    ///
+    /// # 参数
+    ///
+    /// * `addr` - 目标地址
+    pub async fn connect_kcp(&self, addr: &SocketAddr) -> Result<KcpConn, NetError> {
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(NetError::Io)?;
+        socket.connect(addr).await.map_err(NetError::Io)?;
+        let socket = std::sync::Arc::new(socket);
+        KcpConn::new(socket, *addr, None).await
+    }
+
+    /// 接受 WebSocket 连接
+    ///
+    /// # 参数
+    ///
+    /// * `stream` - 底层 TCP 流
     pub async fn accept_websocket(&self, stream: TokioTcpStream) -> Result<WebSocketConn<TokioTcpStream>, std::io::Error> {
         let remote_addr = stream.peer_addr()?;
         let stream = accept_async(stream).await.map_err(|e| {
@@ -586,16 +667,24 @@ impl ConnManager {
         Ok(WebSocketConn::new(stream, remote_addr))
     }
 
+    /// 将连接放回连接池
+    ///
+    /// # 参数
+    ///
+    /// * `addr` - 连接目标地址
+    /// * `conn` - 要放回的连接
     pub async fn put_back(&self, addr: SocketAddr, conn: PooledConn) {
         if let Some(pool) = self.pool_manager.get_pool(addr).await {
             pool.put(conn).await;
         }
     }
 
+    /// 获取 TLS 配置
     pub fn get_tls_config(&self) -> Option<&TlsConfig> {
         self.tls_config.as_ref()
     }
 
+    /// 获取连接池管理器
     pub fn get_pool_manager(&self) -> &PoolManager {
         &self.pool_manager
     }
@@ -605,4 +694,260 @@ impl ConnManager {
 pub mod pool;
 
 // 重新导出连接池类型
+
+/// KCP 协议的输出适配器，将 KCP 输出通过 channel 传递给异步 UDP 写任务
+struct KcpChannelOutput {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl std::io::Write for KcpChannelOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let data = buf.to_vec();
+        let _ = self.tx.try_send(data);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// KCP 连接，实现了 AsyncRead + AsyncWrite + FrpConn
+///
+/// 内部通过后台任务维护 KCP 会话，将 UDP 数据包与 KCP 协议进行转换。
+pub struct KcpConn {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    remote_addr: SocketAddr,
+    read_buf: Vec<u8>,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+impl KcpConn {
+    /// 创建新的 KCP 连接（客户端）
+    ///
+    /// # 参数
+    ///
+    /// * `socket` - UDP socket
+    /// * `remote_addr` - 远程地址
+    /// * `conv` - KCP 会话 ID（可选，默认为随机值）
+    pub async fn new(
+        socket: std::sync::Arc<tokio::net::UdpSocket>,
+        remote_addr: SocketAddr,
+        conv: Option<u32>,
+    ) -> Result<Self, NetError> {
+        let conv = conv.unwrap_or_else(rand::random::<u32>);
+        Self::create_impl(socket, remote_addr, conv, None).await
+    }
+
+    /// 接受 KCP 连接（服务端）
+    ///
+    /// # 参数
+    ///
+    /// * `socket` - UDP socket
+    /// * `first_packet` - 收到的第一个数据包（用于提取 conv）
+    /// * `remote_addr` - 远程地址
+    pub async fn accept(
+        socket: std::sync::Arc<tokio::net::UdpSocket>,
+        first_packet: &[u8],
+        remote_addr: SocketAddr,
+    ) -> Result<Self, NetError> {
+        let conv = if first_packet.len() >= 4 {
+            u32::from_le_bytes([first_packet[0], first_packet[1], first_packet[2], first_packet[3]])
+        } else {
+            rand::random::<u32>()
+        };
+        Self::create_impl(socket, remote_addr, conv, Some(first_packet.to_vec())).await
+    }
+
+    async fn create_impl(
+        socket: std::sync::Arc<tokio::net::UdpSocket>,
+        remote_addr: SocketAddr,
+        conv: u32,
+        initial_input: Option<Vec<u8>>,
+    ) -> Result<Self, NetError> {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let (user_tx, mut user_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let (user_rx_tx, user_rx_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+
+        let socket_clone = socket.clone();
+
+        let handle = tokio::spawn(async move {
+            let kcp_output = KcpChannelOutput { tx: out_tx };
+            let mut kcp = kcp::Kcp::new(conv, kcp_output);
+
+            kcp.set_nodelay(true, 10, 2, true);
+            kcp.set_wndsize(128, 128);
+            let _ = kcp.set_mtu(1400);
+
+            if let Some(data) = initial_input {
+                let _ = kcp.input(&data);
+            }
+
+            let mut buf = vec![0u8; 65535];
+            let mut recv_buf = vec![0u8; 65535];
+            let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(10));
+
+            loop {
+                tokio::select! {
+                    _ = tick_interval.tick() => {
+                        // 使用毫秒时间戳
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u32;
+                        let _ = kcp.update(now_ms);
+                        // 更新后 flush 以发送 ACK 和重传数据
+                        let _ = kcp.flush();
+                    }
+
+                    recv_result = socket_clone.recv_from(&mut buf) => {
+                        match recv_result {
+                            Ok((n, src)) if src == remote_addr => {
+                                let _ = kcp.input(&buf[..n]);
+                                while let Ok(n) = kcp.recv(&mut recv_buf) {
+                                    if user_rx_tx.send(recv_buf[..n].to_vec()).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok((_n, _src)) => {}
+                            Err(_e) => {
+                                break;
+                            }
+                        }
+                    }
+
+                    Some(out_data) = out_rx.recv() => {
+                        let _ = socket_clone.send_to(&out_data, &remote_addr).await;
+                    }
+
+                    Some(user_data) = user_rx.recv() => {
+                        let _ = kcp.send(&user_data);
+                        let _ = kcp.flush();
+                        while let Ok(n) = kcp.recv(&mut recv_buf) {
+                            if user_rx_tx.send(recv_buf[..n].to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            rx: user_rx_rx,
+            tx: user_tx,
+            remote_addr,
+            read_buf: Vec::new(),
+            _handle: handle,
+        })
+    }
+}
+
+impl AsyncRead for KcpConn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.read_buf.is_empty() {
+            let len = std::cmp::min(self.read_buf.len(), buf.remaining());
+            buf.put_slice(&self.read_buf[..len]);
+            self.read_buf.drain(..len);
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(data)) => {
+                let len = std::cmp::min(data.len(), buf.remaining());
+                buf.put_slice(&data[..len]);
+                if len < data.len() {
+                    self.read_buf.extend_from_slice(&data[len..]);
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(None) => {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "KCP connection closed",
+                )))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for KcpConn {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let data = buf.to_vec();
+        let len = data.len();
+        match self.tx.try_send(data) {
+            Ok(_) => std::task::Poll::Ready(Ok(len)),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Channel is full, would block
+                std::task::Poll::Pending
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "KCP send channel closed",
+                )))
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl FrpConn for KcpConn {
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        Some(self.remote_addr)
+    }
+}
+
+/// KCP 监听器，用于服务端接受 KCP 连接
+pub struct KcpListener {
+    socket: std::sync::Arc<tokio::net::UdpSocket>,
+}
+
+impl KcpListener {
+    pub async fn bind(addr: SocketAddr) -> Result<Self, std::io::Error> {
+        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        Ok(Self {
+            socket: std::sync::Arc::new(socket),
+        })
+    }
+
+    pub async fn accept(&self) -> Result<(KcpConn, SocketAddr), NetError> {
+        let mut buf = vec![0u8; 65535];
+        let (n, src_addr) = self.socket.recv_from(&mut buf).await
+            .map_err(NetError::Io)?;
+
+        let first_packet = buf[..n].to_vec();
+        let conn = KcpConn::accept(
+            self.socket.clone(),
+            &first_packet,
+            src_addr,
+        ).await?;
+
+        Ok((conn, src_addr))
+    }
+}
 pub use pool::{ConnPool, PoolManager, PoolConfig, PoolStats, PooledConn};
