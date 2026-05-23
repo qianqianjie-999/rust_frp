@@ -129,6 +129,30 @@ pub enum Message {
 
     /// 连接断开通知
     Disconnect(DisconnectMsg),
+
+    /// UDP 数据包转发消息
+    /// 用于 UDP 代理中在客户端和服务器之间转发 UDP 数据包
+    UdpPacket(UdpPacketMsg),
+
+    /// STCP 访问者请求消息
+    /// 当访问者客户端有本地连接时，通过控制连接发送此消息给服务器
+    StcpVisitor(StcpVisitorMsg),
+
+    /// STCP 访问者响应消息
+    /// 服务器响应 STCP 访问者请求
+    StcpVisitorResp(StcpVisitorRespMsg),
+
+    /// STCP 启动工作连接消息（双向）
+    /// 服务器告诉客户端创建到指定地址的工作连接（用于 STCP 桥接）
+    StcpStartWorkConn(StcpStartWorkConnMsg),
+
+    /// XTCP NAT 信息交换消息
+    /// 用于 P2P 穿透前交换 NAT 地址信息
+    XtcpNatInfo(XtcpNatInfoMsg),
+
+    /// XTCP 打洞消息
+    /// 用于 P2P 穿透时发送打洞包
+    XtcpHolePunch(XtcpHolePunchMsg),
 }
 
 /// 登录消息 - 客户端连接服务器时发送的第一个消息
@@ -409,6 +433,133 @@ pub struct PongMsg {
 pub struct DisconnectMsg {
     /// 断开原因
     pub reason: String,
+}
+
+/// UDP 数据包消息 - 用于 UDP 代理的数据转发
+///
+/// # 使用场景
+///
+/// UDP 代理中，服务器和客户端之间通过控制连接转发 UDP 数据包：
+///
+/// ```text
+/// Visitor         Server                  Client
+///   |               |                       |
+///   |-- UDP packet ->|                       |
+///   |               |-- UdpPacketMsg ------>|
+///   |               |                       |-- UDP packet --> local service
+///   |               |                       |
+///   |               |<-- UdpPacketMsg ------|
+///   |<-- UDP packet -|                       |
+/// ```
+///
+/// # 字段说明
+///
+/// - `proxy_name`: 代理名称，用于区分不同的 UDP 代理
+/// - `data`: UDP 数据包内容
+/// - `client_addr`: 访问者的源地址（可选），用于服务器→客户端方向
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UdpPacketMsg {
+    /// 代理名称
+    pub proxy_name: String,
+    /// UDP 数据包内容
+    pub data: Vec<u8>,
+    /// 访问者源地址（可选）
+    pub client_addr: Option<String>,
+}
+
+/// STCP 访问者请求消息 - 访问者客户端请求建立 STCP 连接
+///
+/// # 使用场景
+///
+/// 当 STCP 访问者客户端有本地连接到达时，通过控制连接发送此消息给服务器，
+/// 服务器匹配对应的 STCP 代理并协调建立双向工作连接。
+///
+/// # 字段说明
+///
+/// - `proxy_name`: 要访问的代理名称（对应 server_name）
+/// - `run_id`: 访问者客户端的运行 ID
+/// - `timestamp`: 时间戳
+/// - `sign_key`: HMAC 签名密钥（基于 secret_key）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StcpVisitorMsg {
+    pub proxy_name: String,
+    pub run_id: String,
+    pub timestamp: i64,
+    pub sign_key: String,
+}
+
+/// STCP 访问者响应消息 - 服务器响应 STCP 访问者请求
+///
+/// # 字段说明
+///
+/// - `proxy_name`: 代理名称
+/// - `error`: 错误信息（空表示成功）
+/// - `visitor_run_id`: 访问者客户端运行 ID（成功时返回）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StcpVisitorRespMsg {
+    pub proxy_name: String,
+    pub error: String,
+    pub visitor_run_id: String,
+}
+
+/// STCP 启动工作连接消息 - 服务器通知客户端创建 STCP 工作连接
+///
+/// 服务器向代理持有者和访问者双方发送此消息，要求双方创建到服务器的工作连接。
+///
+/// # 字段说明
+///
+/// - `proxy_name`: 代理名称
+/// - `role`: "proxy" 或 "visitor"
+/// - `peer_run_id`: 对方的运行 ID
+/// - `timestamp`: 时间戳
+/// - `sign_key`: 签名密钥
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StcpStartWorkConnMsg {
+    pub proxy_name: String,
+    pub role: String,
+    pub peer_run_id: String,
+    pub timestamp: i64,
+    pub sign_key: String,
+}
+
+/// XTCP NAT 信息消息 - 交换 NAT 类型和地址信息
+///
+/// 用于 XTCP P2P 穿透前，双方交换各自的 NAT 信息和候选地址。
+///
+/// # 字段说明
+///
+/// - `proxy_name`: 代理名称
+/// - `run_id`: 发送者的运行 ID
+/// - `nat_type`: NAT 类型（如 "easy", "hard", "unknown"）
+/// - `local_addr`: 本地地址
+/// - `public_addr`: 公网地址（服务器观察到的）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct XtcpNatInfoMsg {
+    pub proxy_name: String,
+    pub run_id: String,
+    pub nat_type: String,
+    pub local_addr: String,
+    pub public_addr: String,
+}
+
+/// XTCP 打洞消息 - 用于 P2P NAT 穿透
+///
+/// 双方同时向对方的候选地址发送打洞包以建立直接连接。
+///
+/// # 字段说明
+///
+/// - `proxy_name`: 代理名称
+/// - `from_run_id`: 发送者运行 ID
+/// - `to_run_id`: 目标运行 ID
+/// - `peer_local_addr`: 对方的本地地址
+/// - `peer_public_addr`: 对方的公网地址
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct XtcpHolePunchMsg {
+    pub proxy_name: String,
+    pub from_run_id: String,
+    pub to_run_id: String,
+    pub peer_local_addr: String,
+    pub peer_public_addr: String,
 }
 
 /// 代理状态消息 - 查询代理当前状态
@@ -701,6 +852,14 @@ pub trait ProxyManager {
 
     /// 清除所有代理（用于重连时重置状态）
     async fn clear(&self);
+
+    /// 发送 UDP 数据包到指定访问者（仅服务器端有效实现）
+    async fn send_udp_packet(
+        &self,
+        proxy_name: &str,
+        data: &[u8],
+        client_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// 访问者管理器 trait - 定义访问者连接管理接口

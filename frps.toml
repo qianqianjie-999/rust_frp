@@ -5,25 +5,61 @@
 # 【重要】TOML 格式要求：
 #   - 顶级键值对（如 vhost_http_port）必须写在 [table] 之前！
 #   - [table] 定义之后不能有顶级键值对
+#
 
+# ============================================
 # 服务器基本配置（必须在 [table] 之前）
+# ============================================
+
+# 绑定地址
+# 0.0.0.0 = 监听所有网络接口
+# 127.0.0.1 = 仅监听本地（更安全）
 bind_addr = "0.0.0.0"
+
+# 控制连接端口（客户端通过此端口连接服务器）
 bind_port = 9300
 
 # 工作连接端口（客户端建立工作代理连接的端口）
 # 如果不配置，默认使用 bind_port + 1000 = 10300
 work_conn_port = 10300
 
-# HTTP/HTTPS 虚主机端口（必须在 [table] 之前）
-# 用户配置的 HTTP 端口为 8080或8443（非特权端口）
+# -------------------- KCP 协议支持 --------------------
+# KCP 是一种快速可靠的 UDP 传输协议
+# 适用于：高延迟、高丢包率的网络环境
+# 注意：需要客户端也配置 protocol = "kcp"
+# kcp_bind_port = 9301
+
+# -------------------- QUIC 协议支持 --------------------
+# QUIC 是一种基于 UDP 的多路复用传输协议
+# 适用于：需要低延迟和高可靠性的场景
+# 注意：需要客户端也配置 protocol = "quic"
+# quic_bind_port = 9302
+
+# ============================================
+# HTTP/HTTPS 虚拟主机配置（必须在 [table] 之前）
+# ============================================
+
+# HTTP 虚主机端口
+# 用户配置的 HTTP 端口为 8080（非特权端口）
 vhost_http_port = 8080
+
+# HTTPS 虚主机端口
 vhost_https_port = 8443
 
+# TCP 多路复用 HTTP 连接端口
+# 用于 TCP 多路复用场景下的 HTTP CONNECT 请求
+# tcpmux_http_connect_port = 9304
+
+# ============================================
 # 端口白名单配置（安全增强）
+# ============================================
+#
 # 【重要】默认拒绝所有未明确允许的端口！
-# 必须配置此列表才能正常使用 TCP 代理功能
+# 必须配置此列表才能正常使用 TCP/UDP 代理功能
+#
+
 allow_ports = [
-    # 单端口示例（remote_port = 9302 需要被允许）
+    # 单端口示例
     { single = 9302 },
     { single = 9303 },
     { single = 9304 },
@@ -31,28 +67,145 @@ allow_ports = [
     { start = 10000, end = 20000 },
 ]
 
-# Web 服务器配置
+# ============================================
+# 自定义页面配置
+# ============================================
+
+# 自定义 404 错误页面路径（可选）
+# 当请求的代理不存在时返回此页面
+# custom_404_page = "/etc/frp/404.html"
+
+# ============================================
+# 配置文件包含（可选）
+# ============================================
+#
+# 支持通过 glob 模式包含其他配置文件
+# 用于：将代理配置拆分成多个文件
+#
+
+# includes = ["/etc/frp.d/*.toml"]
+
+# ============================================
+# 默认代理配置（可选）
+# ============================================
+#
+# 定义默认代理配置，所有客户端创建的代理都将继承这些配置
+# 客户端可以在其配置中覆盖这些默认值
+#
+
+# [[proxies]]
+# 客户端将使用此配置作为默认值
+# name = "default_tcp"
+# type = "tcp"
+# local_ip = "127.0.0.1"
+# local_port = 8080
+# remote_port = 9302
+
+# ============================================
+# Web 服务器配置（Dashboard）
+# ============================================
+#
 # 【重要安全建议】：
 #   1. 建议仅监听本地地址 127.0.0.1
 #   2. 通过 Nginx 反向代理提供 HTTPS 访问
-#   3. 不要直接暴露在公网(忽略安全 addr = "公网ip")
+#   3. 不要直接暴露在公网
 #   4. 配置用户名密码认证保护
+#
+
 [web_server]
 addr = "127.0.0.1"
 port = 7500
 user = "admin"
 password = "admin"
 
+# ============================================
 # 认证配置
+# ============================================
+
 [auth]
+# 认证方法: "token" 或 "oidc"
+# - token: 基于令牌的简单认证
+# - oidc: 基于 OpenID Connect 的企业级认证
 method = "token"
+
+# 令牌认证（当 method = "token" 时使用）
 token = "your_secure_token"
 
+# OIDC 认证配置（当 method = "oidc" 时使用）
+# 适用于企业 SSO 场景，与身份提供商集成
+# [auth.oidc]
+# issuer = "https://auth.example.com"
+# audience = "frp-service"
+# client_id = "frp-server"
+# client_secret = "frp-server-secret"
+# token_endpoint_url = "https://auth.example.com/oauth/token"
+
+# ============================================
 # 传输配置
+# ============================================
+
 [transport]
+# 传输协议: "tcp", "kcp", "quic", "websocket"
+# 默认: "tcp"
 protocol = "tcp"
+
+# TLS 配置
 # TLS 默认已启用（enable = true）
-# 如需使用自定义证书，配置 cert_file 和 key_file
+# 服务器使用内置自签名证书，客户端自动信任
 tls = { enable = true }
+
+# TLS 配置完整示例：
+# 1. 使用内置默认证书（已启用）
+# tls = { enable = true }
+# 2. 使用自定义证书和私钥
+# tls = {
+#     enable = true,
+#     cert_file = "/path/to/server.crt",
+#     key_file = "/path/to/server.key"
+# }
+
+# 启用 TCP 多路复用
+# 多个业务流共享单个 TCP 连接，减少握手延迟
+# 默认: true
 tcp_mux = true
+
+# 连接池大小
+# 服务器预建立的工作连接数量，建议值：5-100
+# 默认: 10
 pool_count = 10
+
+# ============================================
+# 配置示例说明
+# ============================================
+
+# 1. 基本 TCP 代理
+#    - 服务器：bind_port = 9300，allow_ports 包含 9302
+#    - 客户端：type = "tcp"，remote_port = 9302
+
+# 2. HTTP 代理
+#    - 服务器：vhost_http_port = 8080
+#    - 客户端：type = "http"，custom_domains = ["web.example.com"]
+
+# 3. HTTPS 代理
+#    - 服务器：vhost_https_port = 8443
+#    - 客户端：type = "https"，custom_domains = ["secure.example.com"]
+
+# 4. UDP 代理
+#    - 服务器：allow_ports 包含所需 UDP 端口
+#    - 客户端：type = "udp"，remote_port = 9303
+
+# 5. STCP/XTCP 代理
+#    - 服务器：无需特殊配置
+#    - 客户端：type = "stcp" 或 "xtcp"，secret_key = "密钥"
+
+# 6. WebSocket 代理
+#    - 服务器：无需特殊配置
+#    - 客户端：transport = { protocol = "websocket" }
+
+# 7. KCP/QUIC 代理
+#    - 服务器：kcp_bind_port 或 quic_bind_port
+#    - 客户端：transport = { protocol = "kcp" 或 "quic" }
+
+# 8. OIDC 企业认证
+#    - 服务器：[auth] method = "oidc"，配置完整的 OIDC 参数
+#    - 客户端：同样配置 method = "oidc" 和对应参数

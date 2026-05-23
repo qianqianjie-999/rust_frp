@@ -41,7 +41,6 @@ use rust_frp_config::{AuthConfig, OidcConfig};
 use ring::hmac;
 use ring::digest;
 use ring::constant_time;
-use base64::encode;
 
 /// 认证模块错误类型
 #[derive(Debug, thiserror::Error)]
@@ -189,7 +188,7 @@ impl TokenAuthVerifier {
         let msg = format!("{}{}", self.token, timestamp);
         let key = hmac::Key::new(hmac::HMAC_SHA256, self.token.as_bytes());
         let tag = hmac::sign(&key, msg.as_bytes());
-        encode(tag.as_ref())
+        base64::encode(tag.as_ref())
     }
 }
 
@@ -282,21 +281,122 @@ impl OidcAuthVerifier {
 
     /// 验证 OIDC 令牌
     ///
+    /// 支持 HS256 (HMAC-SHA256) 签名算法
+    ///
     /// # 验证步骤
     ///
-    /// 1. 验证 JWT 签名（使用发行者的公钥）
-    /// 2. 验证发行者 (iss claim)
-    /// 3. 验证受众 (aud claim)
-    /// 4. 验证过期时间 (exp claim)
-    /// 5. 验证生效时间 (iat claim)
+    /// 1. 解析 JWT 三部分 (header.payload.signature)
+    /// 2. 验证 HS256 签名（使用 client_secret）
+    /// 3. 验证发行者 (iss claim)
+    /// 4. 验证受众 (aud claim)
+    /// 5. 验证过期时间 (exp claim)
     async fn verify_token(
         &self,
-        _token: &str,
+        token: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // TODO: 实现完整的 OIDC 验证逻辑
-        // 1. 获取 OIDC Provider 的 JWKS
-        // 2. 验证 JWT 签名
-        // 3. 验证声明
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid JWT: expected 3 parts (header.payload.signature)",
+            )));
+        }
+
+        let header_b64 = parts[0];
+        let payload_b64 = parts[1];
+        let signature_b64 = parts[2];
+
+        // 验证 HS256 签名
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, self.client_secret.as_bytes());
+        let expected_tag = hmac::sign(&key, signing_input.as_bytes());
+
+        let signature = base64::decode_config(signature_b64, base64::STANDARD_NO_PAD)
+            .or_else(|_| base64::decode_config(signature_b64, base64::URL_SAFE_NO_PAD))
+            .or_else(|_| base64::decode(signature_b64))
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Failed to decode JWT signature: {}", e),
+                )
+            })?;
+
+        ring::constant_time::verify_slices_are_equal(expected_tag.as_ref(), &signature)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "JWT signature verification failed",
+                )
+            })?;
+
+        // 解码 payload 并验证声明
+        let payload_json = base64::decode_config(payload_b64, base64::STANDARD_NO_PAD)
+            .or_else(|_| base64::decode_config(payload_b64, base64::URL_SAFE_NO_PAD))
+            .or_else(|_| base64::decode(payload_b64))
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Failed to decode JWT payload: {}", e),
+                )
+            })?;
+
+        let payload_str = String::from_utf8(payload_json).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("JWT payload is not valid UTF-8: {}", e),
+            )
+        })?;
+
+        let claims: serde_json::Value = serde_json::from_str(&payload_str).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Failed to parse JWT claims: {}", e),
+            )
+        })?;
+
+        // 验证 iss (发行者)
+        if !self.issuer.is_empty() {
+            let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
+            if iss != self.issuer {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("JWT issuer mismatch: expected '{}', got '{}'", self.issuer, iss),
+                )));
+            }
+        }
+
+        // 验证 aud (受众)
+        if !self.audience.is_empty() {
+            let aud_matches = match claims.get("aud") {
+                Some(serde_json::Value::String(s)) => s == &self.audience,
+                Some(serde_json::Value::Array(arr)) => {
+                    arr.iter().any(|v| v.as_str() == Some(&self.audience))
+                }
+                _ => false,
+            };
+            if !aud_matches {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("JWT audience mismatch: expected '{}'", self.audience),
+                )));
+            }
+        }
+
+        // 验证 exp (过期时间)
+        if let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if exp < now {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "JWT token has expired",
+                )));
+            }
+        }
+
+        log::info!("OIDC JWT token verified successfully");
         Ok(())
     }
 }
@@ -551,7 +651,7 @@ impl AuthManager {
             let msg = format!("work_conn:{}", run_id);
             let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
             let tag = hmac::sign(&hmac_key, msg.as_bytes());
-            Ok(encode(tag.as_ref()))
+            Ok(base64::encode(tag.as_ref()))
         } else {
             Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -707,5 +807,213 @@ mod tests {
         assert_eq!(key1, key2);
         let key3 = manager.generate_work_conn_sign_key("run_002").await.unwrap();
         assert_ne!(key1, key3);
+    }
+
+    fn create_test_jwt(
+        client_secret: &str,
+        issuer: &str,
+        audience: &str,
+        exp_offset_secs: i64,
+    ) -> String {
+        let header = r#"{"alg":"HS256","typ":"JWT"}"#;
+        let header_b64 = base64::encode_config(header.as_bytes(), base64::STANDARD_NO_PAD);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let payload = serde_json::json!({
+            "iss": issuer,
+            "aud": audience,
+            "exp": now + exp_offset_secs,
+            "iat": now,
+            "sub": "test_user",
+            "name": "Test User"
+        });
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let payload_b64 = base64::encode_config(payload_json.as_bytes(), base64::STANDARD_NO_PAD);
+
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, client_secret.as_bytes());
+        let tag = hmac::sign(&key, signing_input.as_bytes());
+        let signature_b64 = base64::encode_config(tag.as_ref(), base64::STANDARD_NO_PAD);
+
+        format!("{}.{}.{}", header_b64, payload_b64, signature_b64)
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_new_oidc() {
+        let config = AuthConfig {
+            method: "oidc".to_string(),
+            token: None,
+            oidc: Some(OidcConfig {
+                issuer: "https://issuer.example.com".to_string(),
+                audience: "frp-server".to_string(),
+                client_id: "frp-client".to_string(),
+                client_secret: "oidc_secret".to_string(),
+                token_endpoint_url: "https://issuer.example.com/token".to_string(),
+            }),
+        };
+        let manager = AuthManager::new(&config);
+        assert!(manager.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_auth_manager_new_oidc_missing_config() {
+        let config = AuthConfig {
+            method: "oidc".to_string(),
+            token: None,
+            oidc: None,
+        };
+        let manager = AuthManager::new(&config);
+        assert!(manager.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_oidc_verify_valid_token() {
+        let oidc_config = OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "frp-server".to_string(),
+            client_id: "frp-client".to_string(),
+            client_secret: "oidc_secret".to_string(),
+            token_endpoint_url: "https://issuer.example.com/token".to_string(),
+        };
+        let verifier = OidcAuthVerifier::new(&oidc_config);
+
+        let token = create_test_jwt(
+            "oidc_secret",
+            "https://issuer.example.com",
+            "frp-server",
+            3600,
+        );
+
+        let result = verifier.verify_login("test_user", &token).await;
+        assert!(result.is_ok(), "Valid JWT should pass: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_oidc_verify_invalid_signature() {
+        let oidc_config = OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "frp-server".to_string(),
+            client_id: "frp-client".to_string(),
+            client_secret: "oidc_secret".to_string(),
+            token_endpoint_url: "https://issuer.example.com/token".to_string(),
+        };
+        let verifier = OidcAuthVerifier::new(&oidc_config);
+
+        let token = create_test_jwt(
+            "wrong_secret",
+            "https://issuer.example.com",
+            "frp-server",
+            3600,
+        );
+
+        let result = verifier.verify_login("test_user", &token).await;
+        assert!(result.is_err(), "JWT with wrong signature should fail");
+    }
+
+    #[tokio::test]
+    async fn test_oidc_verify_wrong_issuer() {
+        let oidc_config = OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "frp-server".to_string(),
+            client_id: "frp-client".to_string(),
+            client_secret: "oidc_secret".to_string(),
+            token_endpoint_url: "https://issuer.example.com/token".to_string(),
+        };
+        let verifier = OidcAuthVerifier::new(&oidc_config);
+
+        let token = create_test_jwt(
+            "oidc_secret",
+            "https://wrong-issuer.example.com",
+            "frp-server",
+            3600,
+        );
+
+        let result = verifier.verify_login("test_user", &token).await;
+        assert!(result.is_err(), "JWT with wrong issuer should fail");
+    }
+
+    #[tokio::test]
+    async fn test_oidc_verify_wrong_audience() {
+        let oidc_config = OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "frp-server".to_string(),
+            client_id: "frp-client".to_string(),
+            client_secret: "oidc_secret".to_string(),
+            token_endpoint_url: "https://issuer.example.com/token".to_string(),
+        };
+        let verifier = OidcAuthVerifier::new(&oidc_config);
+
+        let token = create_test_jwt(
+            "oidc_secret",
+            "https://issuer.example.com",
+            "wrong-audience",
+            3600,
+        );
+
+        let result = verifier.verify_login("test_user", &token).await;
+        assert!(result.is_err(), "JWT with wrong audience should fail");
+    }
+
+    #[tokio::test]
+    async fn test_oidc_verify_expired_token() {
+        let oidc_config = OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "frp-server".to_string(),
+            client_id: "frp-client".to_string(),
+            client_secret: "oidc_secret".to_string(),
+            token_endpoint_url: "https://issuer.example.com/token".to_string(),
+        };
+        let verifier = OidcAuthVerifier::new(&oidc_config);
+
+        let token = create_test_jwt(
+            "oidc_secret",
+            "https://issuer.example.com",
+            "frp-server",
+            -60,
+        );
+
+        let result = verifier.verify_login("test_user", &token).await;
+        assert!(result.is_err(), "Expired JWT should fail");
+    }
+
+    #[tokio::test]
+    async fn test_oidc_verify_invalid_token_format() {
+        let oidc_config = OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "frp-server".to_string(),
+            client_id: "frp-client".to_string(),
+            client_secret: "oidc_secret".to_string(),
+            token_endpoint_url: "https://issuer.example.com/token".to_string(),
+        };
+        let verifier = OidcAuthVerifier::new(&oidc_config);
+
+        let result = verifier.verify_login("test_user", "not-a-jwt").await;
+        assert!(result.is_err(), "Malformed JWT should fail");
+    }
+
+    #[tokio::test]
+    async fn test_oidc_verify_work_conn() {
+        let oidc_config = OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "frp-server".to_string(),
+            client_id: "frp-client".to_string(),
+            client_secret: "oidc_secret".to_string(),
+            token_endpoint_url: "https://issuer.example.com/token".to_string(),
+        };
+        let verifier = OidcAuthVerifier::new(&oidc_config);
+
+        let token = create_test_jwt(
+            "oidc_secret",
+            "https://issuer.example.com",
+            "frp-server",
+            3600,
+        );
+
+        let result = verifier.verify_work_conn("test_user", &token).await;
+        assert!(result.is_ok(), "Valid JWT should pass work conn verification: {:?}", result.err());
     }
 }

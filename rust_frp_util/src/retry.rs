@@ -132,8 +132,11 @@ pub trait RetryableError: std::error::Error {
 /// 重试结果
 #[derive(Debug)]
 pub struct RetryResult<T> {
+    /// 操作成功后返回的值
     pub value: T,
+    /// 总共尝试的次数
     pub attempts: u32,
+    /// 总延迟时间
     pub total_delay: Duration,
 }
 
@@ -212,10 +215,15 @@ where
 /// 连接错误类型
 #[derive(Debug)]
 pub enum ConnectionError {
+    /// I/O 错误
     Io(std::io::Error),
+    /// 连接超时
     Timeout,
+    /// 连接被拒绝
     Refused,
+    /// 连接被重置
     Reset,
+    /// 其他错误
     Other(String),
 }
 

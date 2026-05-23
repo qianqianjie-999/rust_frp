@@ -180,15 +180,19 @@ impl ClientProxyManager {
         proxy_name: String,
         local_addr: SocketAddr,
         mut receiver: mpsc::Receiver<(tokio::net::TcpStream, Vec<u8>)>,
+        bandwidth_limit: Option<String>,
     ) {
         let proxy_name_clone = proxy_name.clone();
+        let rate_bytes_per_sec = bandwidth_limit
+            .as_deref()
+            .and_then(rust_frp_util::parse_bandwidth_limit);
+
         let handle = tokio::spawn(async move {
             log::info!("Starting work connection handler for proxy: {}", proxy_name_clone);
-            
+
             while let Some((mut server_conn, initial_data)) = receiver.recv().await {
                 log::info!("Received work connection for proxy: {}", proxy_name_clone);
-                
-                // 使用重试机制连接到本地服务
+
                 let retry_config = RetryConfig::fast();
                 let connect_result = retry(
                     &retry_config,
@@ -200,7 +204,7 @@ impl ClientProxyManager {
                         })
                     }
                 ).await;
-                
+
                 match connect_result {
                     Ok(retry_result) => {
                         let mut local_conn = retry_result.value;
@@ -221,29 +225,55 @@ impl ClientProxyManager {
                         }
                         
                         // 双向转发数据
-                        let (mut server_read, mut server_write) = server_conn.split();
-                        let (mut local_read, mut local_write) = local_conn.split();
-                        
-                        // 从服务器到本地
-                        let server_to_local = async {
-                            match tokio::io::copy(&mut server_read, &mut local_write).await {
-                                Ok(n) => log::info!("Server to local: {} bytes transferred", n),
-                                Err(e) => log::error!("Server to local error: {:?}", e),
+                        if let Some(rate) = rate_bytes_per_sec {
+                            let (server_read, server_write) = server_conn.split();
+                            let (mut local_read, mut local_write) = local_conn.split();
+
+                            let mut rate_limited_server_read =
+                                rust_frp_util::RateLimitedReader::new(server_read, rate);
+                            let mut rate_limited_server_write =
+                                rust_frp_util::RateLimitedWriter::new(server_write, rate);
+
+                            let server_to_local = async {
+                                match tokio::io::copy(&mut rate_limited_server_read, &mut local_write).await {
+                                    Ok(n) => log::info!("Server to local: {} bytes transferred (rate: {}B/s)", n, rate),
+                                    Err(e) => log::error!("Server to local error: {:?}", e),
+                                }
+                            };
+
+                            let local_to_server = async {
+                                match tokio::io::copy(&mut local_read, &mut rate_limited_server_write).await {
+                                    Ok(n) => log::info!("Local to server: {} bytes transferred (rate: {}B/s)", n, rate),
+                                    Err(e) => log::error!("Local to server error: {:?}", e),
+                                }
+                            };
+
+                            tokio::select! {
+                                _ = server_to_local => {},
+                                _ = local_to_server => {},
                             }
-                        };
-                        
-                        // 从本地到服务器
-                        let local_to_server = async {
-                            match tokio::io::copy(&mut local_read, &mut server_write).await {
-                                Ok(n) => log::info!("Local to server: {} bytes transferred", n),
-                                Err(e) => log::error!("Local to server error: {:?}", e),
+                        } else {
+                            let (mut server_read, mut server_write) = server_conn.split();
+                            let (mut local_read, mut local_write) = local_conn.split();
+
+                            let server_to_local = async {
+                                match tokio::io::copy(&mut server_read, &mut local_write).await {
+                                    Ok(n) => log::info!("Server to local: {} bytes transferred", n),
+                                    Err(e) => log::error!("Server to local error: {:?}", e),
+                                }
+                            };
+
+                            let local_to_server = async {
+                                match tokio::io::copy(&mut local_read, &mut server_write).await {
+                                    Ok(n) => log::info!("Local to server: {} bytes transferred", n),
+                                    Err(e) => log::error!("Local to server error: {:?}", e),
+                                }
+                            };
+
+                            tokio::select! {
+                                _ = server_to_local => {},
+                                _ = local_to_server => {},
                             }
-                        };
-                        
-                        // 同时运行两个方向的转发
-                        tokio::select! {
-                            _ = server_to_local => {},
-                            _ = local_to_server => {},
                         }
                         
                         log::info!("Work connection closed for proxy: {}", proxy_name_clone);
@@ -270,53 +300,20 @@ impl ClientProxyManager {
 
     pub async fn start_proxy(&self, config: &rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match config.r#type.as_str() {
-            "tcp" => {
+            "tcp" | "http" | "https" | "websocket" => {
                 let local_addr = format!("{}:{}", config.local_ip, config.local_port)
                     .parse::<SocketAddr>()?;
-                log::info!("starting TCP proxy: {} -> {}", config.name, local_addr);
+                log::info!("starting {} proxy: {} -> {}", config.r#type, config.name, local_addr);
                 
                 // 为 TCP 代理创建工作连接通道
                 // 当服务器收到外部连接时，会通过这个通道通知客户端
                 let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
-                self.start_work_conn_handler(config.name.clone(), local_addr, rx).await;
-                
-                // 注册工作连接发送器到 WorkConnManager
-                if let Some(work_conn_manager) = &self.work_conn_manager {
-                    work_conn_manager.register_work_conn_handler(config.name.clone(), tx).await;
-                } else {
-                    log::error!("WorkConnManager not set for proxy: {}", config.name);
-                    return Err("WorkConnManager not set".into());
-                }
-                
-                Ok(())
-            }
-            "http" => {
-                let local_addr = format!("{}:{}", config.local_ip, config.local_port)
-                    .parse::<SocketAddr>()?;
-                log::info!("starting HTTP proxy: {} -> {}", config.name, local_addr);
-                
-                // 为 HTTP 代理创建工作连接通道
-                let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
-                self.start_work_conn_handler(config.name.clone(), local_addr, rx).await;
-                
-                // 注册工作连接发送器到 WorkConnManager
-                if let Some(work_conn_manager) = &self.work_conn_manager {
-                    work_conn_manager.register_work_conn_handler(config.name.clone(), tx).await;
-                } else {
-                    log::error!("WorkConnManager not set for proxy: {}", config.name);
-                    return Err("WorkConnManager not set".into());
-                }
-                
-                Ok(())
-            }
-            "https" => {
-                let local_addr = format!("{}:{}", config.local_ip, config.local_port)
-                    .parse::<SocketAddr>()?;
-                log::info!("starting HTTPS proxy: {} -> {}", config.name, local_addr);
-                
-                // 为 HTTPS 代理创建工作连接通道
-                let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
-                self.start_work_conn_handler(config.name.clone(), local_addr, rx).await;
+                self.start_work_conn_handler(
+                    config.name.clone(),
+                    local_addr,
+                    rx,
+                    config.bandwidth_limit.clone(),
+                ).await;
                 
                 // 注册工作连接发送器到 WorkConnManager
                 if let Some(work_conn_manager) = &self.work_conn_manager {
@@ -376,6 +373,15 @@ impl ProxyManager for ClientProxyManager {
         } else {
             Ok(None)
         }
+    }
+
+    async fn send_udp_packet(
+        &self,
+        _proxy_name: &str,
+        _data: &[u8],
+        _client_addr: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
     }
 
     async fn clear(&self) {
@@ -483,6 +489,12 @@ impl Connector {
         Ok(self.conn_manager.connect_tls(domain, &addr).await?)
     }
 
+    pub async fn connect_kcp(&mut self) -> Result<rust_frp_net::KcpConn, Box<dyn std::error::Error>> {
+        let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
+            .parse::<SocketAddr>()?;
+        Ok(self.conn_manager.connect_kcp(&addr).await?)
+    }
+
     pub async fn connect_websocket(&mut self, url: &str) -> Result<rust_frp_net::WebSocketConn<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Box<dyn std::error::Error>> {
         Ok(self.conn_manager.connect_websocket(url).await?)
     }
@@ -498,6 +510,11 @@ pub struct ClientControl {
     auth_manager: Arc<AuthManager>,
     work_conn_manager: Arc<WorkConnManager>,
     config: ClientConfig,
+    udp_sockets: RwLock<std::collections::HashMap<String, Arc<tokio::net::UdpSocket>>>,
+    udp_resp_tx: tokio::sync::mpsc::Sender<Message>,
+    udp_resp_rx: tokio::sync::mpsc::Receiver<Message>,
+    stcp_visitor_tx: tokio::sync::mpsc::Sender<Message>,
+    stcp_visitor_rx: tokio::sync::mpsc::Receiver<Message>,
 }
 
 impl ClientControl {
@@ -510,6 +527,8 @@ impl ClientControl {
         work_conn_manager: Arc<WorkConnManager>,
         config: ClientConfig,
     ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(256);
+        let (stcp_tx, stcp_rx) = tokio::sync::mpsc::channel::<Message>(100);
         Self {
             conn,
             run_id,
@@ -518,7 +537,16 @@ impl ClientControl {
             auth_manager,
             work_conn_manager,
             config,
+            udp_sockets: RwLock::new(std::collections::HashMap::new()),
+            udp_resp_tx: tx,
+            udp_resp_rx: rx,
+            stcp_visitor_tx: stcp_tx,
+            stcp_visitor_rx: stcp_rx,
         }
+    }
+
+    pub fn stcp_visitor_sender(&self) -> tokio::sync::mpsc::Sender<Message> {
+        self.stcp_visitor_tx.clone()
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -543,29 +571,36 @@ impl ClientControl {
             }
 
             log::debug!("Waiting for message, count: {}", msg_count);
-            
-            // 使用带超时的消息读取，避免永久阻塞
-            let msg_result = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                self.conn.read_message()
-            ).await;
 
-            match msg_result {
-                Ok(Ok(msg)) => {
-                    msg_count += 1;
-                    log::debug!("=== 成功读取消息 ===");
-                    log::debug!("成功读取消息, 计数: {}", msg_count);
-                    self.handle_message(msg).await;
+            tokio::select! {
+                msg_result = self.conn.read_message() => {
+                    match msg_result {
+                        Ok(msg) => {
+                            msg_count += 1;
+                            log::debug!("成功读取消息, 计数: {}", msg_count);
+                            self.handle_message(msg).await;
+                        }
+                        Err(e) => {
+                            log::error!("Failed to read message from connection: {:?}", e);
+                            break;
+                        }
+                    }
                 }
-                Ok(Err(e)) => {
-                    log::error!("=== 消息读取失败 ===");
-                    log::error!("Failed to read message from connection: {:?}", e);
-                    break;
+                udp_msg = self.udp_resp_rx.recv() => {
+                    if let Some(msg) = udp_msg {
+                        log::debug!("Sending UDP response to server");
+                        if let Err(e) = self.conn.write_message(&msg).await {
+                            log::error!("Failed to send UDP response: {:?}", e);
+                        }
+                    }
                 }
-                Err(_) => {
-                    log::warn!("消息读取超时，继续循环...");
-                    // 超时后继续循环，不中断连接
-                    continue;
+                msg = self.stcp_visitor_rx.recv() => {
+                    if let Some(msg) = msg {
+                        log::debug!("Sending STCP visitor message to server");
+                        if let Err(e) = self.conn.write_message(&msg).await {
+                            log::error!("Failed to send STCP visitor message: {:?}", e);
+                        }
+                    }
                 }
             }
         }
@@ -574,7 +609,7 @@ impl ClientControl {
     }
 
     /// 处理消息的通用方法
-    async fn handle_message(&self, msg: Message) {
+    async fn handle_message(&mut self, msg: Message) {
         match msg {
             Message::Pong(pong_msg) => {
                 // 收到 pong 消息，继续循环
@@ -605,6 +640,125 @@ impl ClientControl {
                         }
                     } else {
                         log::debug!("工作连接建立成功: proxy={}", proxy_name);
+                    }
+                });
+            }
+            Message::UdpPacket(udp_msg) => {
+                let proxy_name = udp_msg.proxy_name;
+                let data = udp_msg.data;
+                let client_addr = udp_msg.client_addr.clone();
+
+                let proxy_config = self.config.proxies.iter()
+                    .find(|p| p.name == proxy_name)
+                    .cloned();
+
+                if let Some(cfg) = proxy_config {
+                    let local_addr = format!("{}:{}", cfg.local_ip, cfg.local_port);
+
+                    let socket = {
+                        let mut sockets = self.udp_sockets.write().await;
+                        if let Some(s) = sockets.get(&proxy_name) {
+                            s.clone()
+                        } else {
+                            match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                                Ok(s) => {
+                                    let s = Arc::new(s);
+                                    sockets.insert(proxy_name.clone(), s.clone());
+                                    s
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to bind UDP socket for proxy {}: {:?}", proxy_name, e);
+                                    return;
+                                }
+                            }
+                        }
+                    };
+
+                    if let Err(e) = socket.send_to(&data, &local_addr).await {
+                        log::error!("Failed to send UDP data to {} for proxy {}: {:?}", local_addr, proxy_name, e);
+                        return;
+                    }
+
+                    let resp_tx = self.udp_resp_tx.clone();
+                    let proxy_name_clone = proxy_name.clone();
+                    let client_addr_clone = client_addr.clone();
+                    let socket_clone = socket.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65535];
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            socket_clone.recv_from(&mut buf),
+                        ).await {
+                            Ok(Ok((n, _))) => {
+                                let resp_data = buf[..n].to_vec();
+                                let resp_msg = Message::UdpPacket(rust_frp_core::UdpPacketMsg {
+                                    proxy_name: proxy_name_clone,
+                                    data: resp_data,
+                                    client_addr: client_addr_clone,
+                                });
+                                if let Err(e) = resp_tx.send(resp_msg).await {
+                                    log::error!("Failed to send UDP response via channel: {:?}", e);
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                log::error!("UDP recv error for proxy {}: {:?}", proxy_name_clone, e);
+                            }
+                            Err(_) => {
+                                log::debug!("UDP response timeout for proxy {}", proxy_name_clone);
+                            }
+                        }
+                    });
+                } else {
+                    log::error!("UDP proxy config not found: {}", proxy_name);
+                }
+            }
+            Message::XtcpNatInfo(xtcp_msg) => {
+                log::info!("Received XTCP NAT info from {} for proxy {}", xtcp_msg.run_id, xtcp_msg.proxy_name);
+                let proxy_name = xtcp_msg.proxy_name.clone();
+                let peer_local_addr = xtcp_msg.local_addr.clone();
+                let peer_public_addr = xtcp_msg.public_addr.clone();
+
+                // 如果本地有此 proxy 配置（即 proxy owner），回送自己的 NAT info
+                if let Some(cfg) = self.config.proxies.iter().find(|p| p.name == proxy_name) {
+                    let local_addr = format!("{}:{}", cfg.local_ip, cfg.local_port);
+                    let nat_info = rust_frp_core::XtcpNatInfoMsg {
+                        proxy_name: proxy_name.clone(),
+                        run_id: self.run_id.clone(),
+                        nat_type: "unknown".to_string(),
+                        local_addr,
+                        public_addr: String::new(),
+                    };
+                    if let Err(e) = self.conn.write_message(&Message::XtcpNatInfo(nat_info)).await {
+                        log::error!("Failed to send XTCP NAT info response: {:?}", e);
+                    }
+                }
+
+                // 尝试打洞
+                tokio::spawn(async move {
+                    try_xtcp_hole_punch(&proxy_name, &peer_public_addr, &peer_local_addr).await;
+                });
+            }
+            Message::XtcpHolePunch(hp_msg) => {
+                log::info!("Received XTCP hole punch from {} for proxy {}", hp_msg.from_run_id, hp_msg.proxy_name);
+                let peer_local = hp_msg.peer_local_addr.clone();
+                let peer_public = hp_msg.peer_public_addr.clone();
+
+                tokio::spawn(async move {
+                    let addrs = vec![peer_public, peer_local];
+                    for addr in &addrs {
+                        if addr.is_empty() {
+                            continue;
+                        }
+                        log::info!("XTCP hole punch: trying to connect to {}", addr);
+                        match tokio::net::TcpStream::connect(addr).await {
+                            Ok(_conn) => {
+                                log::info!("XTCP hole punch succeeded to {}", addr);
+                                break;
+                            }
+                            Err(e) => {
+                                log::debug!("XTCP hole punch failed to {}: {:?}", addr, e);
+                            }
+                        }
                     }
                 });
             }
@@ -688,6 +842,170 @@ async fn establish_work_connection(
     Ok(())
 }
 
+/// XTCP 打洞尝试：同时向对端的公网和本地地址发起 TCP 连接
+async fn try_xtcp_hole_punch(proxy_name: &str, peer_public_addr: &str, peer_local_addr: &str) {
+    let addrs: Vec<&str> = vec![peer_public_addr, peer_local_addr]
+        .into_iter()
+        .filter(|a| !a.is_empty())
+        .collect();
+
+    if addrs.is_empty() {
+        log::error!("XTCP hole punch: no valid peer addresses for {}", proxy_name);
+        return;
+    }
+
+    let mut handles = Vec::new();
+    for addr in addrs {
+        let addr = addr.to_string();
+        let name = proxy_name.to_string();
+        handles.push(tokio::spawn(async move {
+            log::info!("XTCP hole punch: trying to connect to {} for {}", addr, name);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::net::TcpStream::connect(&addr),
+            ).await {
+                Ok(Ok(_conn)) => {
+                    log::info!("XTCP hole punch succeeded to {} for {}", addr, name);
+                    Some(addr)
+                }
+                Ok(Err(e)) => {
+                    log::debug!("XTCP hole punch failed to {}: {:?}", addr, e);
+                    None
+                }
+                Err(_) => {
+                    log::debug!("XTCP hole punch timeout to {}", addr);
+                    None
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
+/// 启动 STCP/XTCP 访问者：监听本地端口，当有连接时创建到服务器的工作连接并桥接
+async fn start_stcp_visitor(
+    bind_addr: String,
+    proxy_name: String,
+    stcp_tx: tokio::sync::mpsc::Sender<Message>,
+    run_id: String,
+    config: ClientConfig,
+) {
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("Failed to bind STCP visitor {} on {}: {:?}", proxy_name, bind_addr, e);
+            return;
+        }
+    };
+    log::info!("STCP visitor for {} listening on {}", proxy_name, bind_addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((local_conn, addr)) => {
+                log::info!("STCP visitor accepted connection from {} for {}", addr, proxy_name);
+                let pn = proxy_name.clone();
+                let tx = stcp_tx.clone();
+                let rid = run_id.clone();
+                let cfg = config.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_stcp_visitor_conn(local_conn, pn, tx, rid, cfg).await {
+                        log::error!("STCP visitor connection error: {:?}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                log::error!("STCP visitor accept error: {:?}", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+/// 处理单个 STCP/XTCP 访问者连接
+/// XTCP 先发送 XtcpNatInfo 尝试打洞，超时后回退 STCP 服务端中继
+async fn handle_stcp_visitor_conn(
+    local_conn: tokio::net::TcpStream,
+    proxy_name: String,
+    stcp_tx: tokio::sync::mpsc::Sender<Message>,
+    run_id: String,
+    config: ClientConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let is_xtcp = config.visitors.iter().any(|v| v.server_name == proxy_name && v.r#type == "xtcp");
+    // 也可检查 proxies 中是否有 xtcp 类型
+
+    if is_xtcp {
+        let _timestamp = get_timestamp();
+        let xtcp_msg = rust_frp_core::XtcpNatInfoMsg {
+            proxy_name: proxy_name.clone(),
+            run_id: run_id.clone(),
+            nat_type: "unknown".to_string(),
+            local_addr: String::new(),
+            public_addr: String::new(),
+        };
+
+        if let Err(e) = stcp_tx.send(Message::XtcpNatInfo(xtcp_msg)).await {
+            log::error!("Failed to send XTCP NAT info: {:?}", e);
+        }
+
+        log::info!("XTCP visitor: waiting for hole punch (2s) before STCP fallback for {}", proxy_name);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    let timestamp = get_timestamp();
+    let sign_key = config.auth.token.as_ref()
+        .map(|_| timestamp.to_string())
+        .unwrap_or_default();
+
+    let stcp_msg = rust_frp_core::StcpVisitorMsg {
+        proxy_name: proxy_name.clone(),
+        run_id: run_id.clone(),
+        timestamp,
+        sign_key,
+    };
+
+    if let Err(e) = stcp_tx.send(Message::StcpVisitor(stcp_msg)).await {
+        return Err(format!("Failed to send StcpVisitor: {}", e).into());
+    }
+
+    let work_port = config.server_port + 1000;
+    let work_addr = format!("{}:{}", config.server_addr, work_port);
+    let mut work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
+    log::info!("STCP visitor work conn to: {}", work_addr);
+
+    let work_sign_key = config.auth.token.as_ref()
+        .map(|token| generate_work_conn_sign_key(token, &run_id))
+        .unwrap_or_default();
+
+    let new_work_conn_msg = NewWorkConnMsg {
+        run_id: run_id.clone(),
+        proxy_name: proxy_name.clone(),
+        timestamp: get_timestamp(),
+        sign_key: work_sign_key,
+        use_encryption: false,
+        use_compression: false,
+    };
+    rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
+
+    let resp = rust_frp_core::read_message(&mut work_conn).await?;
+    match resp {
+        Message::StartWorkConn(start_msg) => {
+            if !start_msg.error.is_empty() {
+                return Err(format!("Server error: {}", start_msg.error).into());
+            }
+            log::info!("STCP visitor work conn established for {}", proxy_name);
+        }
+        _ => {
+            return Err("Unexpected response from server".into());
+        }
+    }
+
+    rust_frp_util::bridge_connections(work_conn, local_conn).await?;
+    Ok(())
+}
+
 /// Web 服务器
 pub struct WebServer {
     addr: SocketAddr,
@@ -755,6 +1073,143 @@ async fn visitors_handler(
     Json(visitors.values().cloned().collect())
 }
 
+/// 健康检查器
+///
+/// 定期检查后端服务健康状态，支持 TCP 和 HTTP 两种检查方式。
+pub struct HealthChecker {
+    config: rust_frp_config::ProxyConfig,
+}
+
+impl HealthChecker {
+    pub fn new(config: rust_frp_config::ProxyConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn start(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let hc = self.config.health_check.as_ref();
+            let hc = match hc {
+                Some(c) => c,
+                None => return,
+            };
+
+            let interval = tokio::time::Duration::from_secs(hc.interval_seconds.max(1) as u64);
+            let timeout = tokio::time::Duration::from_secs(hc.timeout_seconds.max(1) as u64);
+            let max_failed = hc.max_failed;
+            let check_type = hc.r#type.clone();
+            let path = hc.path.clone();
+            let target_addr = format!("{}:{}", self.config.local_ip, self.config.local_port);
+            let mut failed_count: u32 = 0;
+
+            loop {
+                tokio::time::sleep(interval).await;
+
+                match check_type.as_str() {
+                    "tcp" => {
+                        let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&target_addr))
+                            .await;
+                        match result {
+                            Ok(Ok(_)) => {
+                                if failed_count > 0 {
+                                    log::warn!(
+                                        "Health check for proxy '{}' recovered (TCP: {})",
+                                        self.config.name, target_addr
+                                    );
+                                }
+                                failed_count = 0;
+                            }
+                            _ => {
+                                failed_count += 1;
+                                log::warn!(
+                                    "Health check for proxy '{}' failed ({}/{}): TCP connect to {}",
+                                    self.config.name, failed_count, max_failed, target_addr
+                                );
+                                if failed_count >= max_failed {
+                                    log::error!(
+                                        "Health check for proxy '{}' exceeded max failures, service marked unhealthy",
+                                        self.config.name
+                                    );
+                                    failed_count = 0;
+                                }
+                            }
+                        }
+                    }
+                    "http" => {
+                        let path = path.clone().unwrap_or_else(|| "/".to_string());
+                        let result = tokio::time::timeout(timeout, async {
+                            let stream = tokio::net::TcpStream::connect(&target_addr).await?;
+                            let (mut reader, mut writer) =
+                                tokio::io::split(tokio::io::BufStream::new(stream));
+                            use tokio::io::AsyncReadExt;
+                            use tokio::io::AsyncWriteExt;
+
+                            let request = format!(
+                                "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                                path, self.config.local_ip
+                            );
+                            writer.write_all(request.as_bytes()).await?;
+
+                            let mut response = String::new();
+                            reader.read_to_string(&mut response).await?;
+
+                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response)
+                        })
+                        .await;
+
+                        match result {
+                            Ok(Ok(response)) => {
+                                if response.contains("200 OK") || response.contains("HTTP/1.") {
+                                    if failed_count > 0 {
+                                        log::warn!(
+                                            "Health check for proxy '{}' recovered (HTTP: {})",
+                                            self.config.name, target_addr
+                                        );
+                                    }
+                                    failed_count = 0;
+                                } else {
+                                    failed_count += 1;
+                                    log::warn!(
+                                        "Health check for proxy '{}' failed ({}/{}): HTTP unexpected response",
+                                        self.config.name, failed_count, max_failed
+                                    );
+                                    if failed_count >= max_failed {
+                                        log::error!(
+                                            "Health check for proxy '{}' exceeded max failures, service marked unhealthy",
+                                            self.config.name
+                                        );
+                                        failed_count = 0;
+                                    }
+                                }
+                            }
+                            _ => {
+                                failed_count += 1;
+                                log::warn!(
+                                    "Health check for proxy '{}' failed ({}/{}): HTTP request to {}",
+                                    self.config.name, failed_count, max_failed, target_addr
+                                );
+                                if failed_count >= max_failed {
+                                    log::error!(
+                                        "Health check for proxy '{}' exceeded max failures, service marked unhealthy",
+                                        self.config.name
+                                    );
+                                    failed_count = 0;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        log::warn!(
+                            "Unsupported health check type '{}' for proxy '{}'",
+                            check_type, self.config.name
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+    }
+}
+
 /// 客户端服务
 pub struct Client {
     config: ClientConfig,
@@ -766,6 +1221,7 @@ pub struct Client {
     connector: Connector,
     web_server: Option<WebServer>,
     config_path: Option<String>,
+    health_check_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Client {
@@ -796,6 +1252,7 @@ impl Client {
             connector,
             web_server,
             config_path,
+            health_check_handles: Vec::new(),
         })
     }
 
@@ -854,6 +1311,30 @@ impl Client {
                             log::error!("Failed to add visitor: {}", e);
                         }
                     }
+
+                    // 启动 STCP/XTCP 访问者监听器
+                    if let Some(control) = &self.control {
+                        let control = control.lock().await;
+                        let stcp_tx = control.stcp_visitor_sender();
+                        let run_id = control.run_id.clone();
+                        drop(control);
+                        for visitor in &self.config.visitors {
+                            if visitor.r#type == "stcp" || visitor.r#type == "xtcp" {
+                                let bind_addr = format!("{}:{}", visitor.bind_addr, visitor.bind_port);
+                                let proxy_name = visitor.server_name.clone();
+                                let stcp_tx = stcp_tx.clone();
+                                let cfg = self.config.clone();
+                                let rid = run_id.clone();
+                                tokio::spawn(async move {
+                                    start_stcp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg).await;
+                                });
+                            }
+                        }
+                    }
+
+                    // 启动健康检查
+                    self.stop_health_checks().await;
+                    self.start_health_checks(&proxies).await;
 
                     // 运行控制循环
                     if let Some(control) = &self.control {
@@ -950,17 +1431,36 @@ impl Client {
     }
 
     async fn login(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 连接到服务器
+        // 根据传输协议选择连接方式
+        let protocol = self.config.transport.protocol.as_str();
         let use_tls = self.config.transport.tls.as_ref().map(|t| t.enable).unwrap_or(true);
         
-        let mut conn = if use_tls {
-            let tls_conn = self.connector.connect_tls(&self.config.server_addr).await
-                .map_err(|e| format!("TLS connection failed: {}", e))?;
-            ControlConn::new(Box::new(tls_conn))
-        } else {
-            let tcp_conn = self.connector.connect().await
-                .map_err(|e| format!("TCP connection failed: {}", e))?;
-            ControlConn::new(Box::new(tcp_conn))
+        let mut conn = match protocol {
+            "kcp" => {
+                let kcp_conn = self.connector.connect_kcp().await
+                    .map_err(|e| format!("KCP connection failed: {}", e))?;
+                ControlConn::new(Box::new(kcp_conn))
+            }
+            "websocket" => {
+                let scheme = if use_tls { "wss" } else { "ws" };
+                let port = self.config.server_port;
+                let url = format!("{}://{}:{}/ws", scheme, self.config.server_addr, port);
+                let ws_conn = self.connector.connect_websocket(&url).await
+                    .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+                ControlConn::new(Box::new(ws_conn))
+            }
+            _ => {
+                // 默认使用 TCP (可能带 TLS)
+                if use_tls {
+                    let tls_conn = self.connector.connect_tls(&self.config.server_addr).await
+                        .map_err(|e| format!("TLS connection failed: {}", e))?;
+                    ControlConn::new(Box::new(tls_conn))
+                } else {
+                    let tcp_conn = self.connector.connect().await
+                        .map_err(|e| format!("TCP connection failed: {}", e))?;
+                    ControlConn::new(Box::new(tcp_conn))
+                }
+            }
         };
 
         // 生成运行 ID
@@ -1025,6 +1525,27 @@ impl Client {
         Ok(())
     }
 
+    pub async fn start_health_checks(&mut self, proxies: &[rust_frp_config::ProxyConfig]) {
+        for proxy in proxies {
+            if proxy.health_check.is_some() {
+                log::info!(
+                    "Starting health check for proxy '{}' (type: {:?})",
+                    proxy.name,
+                    proxy.health_check.as_ref().map(|c| c.r#type.as_str())
+                );
+                let checker = HealthChecker::new(proxy.clone());
+                let handle = checker.start();
+                self.health_check_handles.push(handle);
+            }
+        }
+    }
+
+    pub async fn stop_health_checks(&mut self) {
+        for handle in self.health_check_handles.drain(..) {
+            handle.abort();
+        }
+    }
+
     pub async fn reload_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(config_path) = &self.config_path {
             let new_config = rust_frp_config::ConfigLoader::load_client_config(config_path)?;
@@ -1041,6 +1562,10 @@ impl Client {
             for visitor in &visitors {
                 self.visitor_manager.add_visitor(visitor.clone()).await.map_err(|e| e.to_string())?;
             }
+
+            // 重新启动健康检查
+            self.stop_health_checks().await;
+            self.start_health_checks(&proxies).await;
 
             log::info!("config reloaded successfully");
         }
@@ -1060,6 +1585,7 @@ impl Clone for Client {
             connector: Connector::new(self.config.clone()).unwrap(),
             web_server: None,
             config_path: self.config_path.clone(),
+            health_check_handles: Vec::new(),
         }
     }
 }

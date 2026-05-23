@@ -1,47 +1,5 @@
-//! FRP 客户端入口程序 (rust_frpc)
-//!
-//! 这是 FRP 客户端的命令行入口点，负责：
-//!
-//! ## 主要职责
-//!
-//! 1. **解析命令行参数**
-//!    - 支持 `-c <config_path>` 指定配置文件
-//!    - 默认配置文件：`frpc.toml`
-//!
-//! 2. **加载配置**
-//!    - 从 TOML 文件加载客户端配置
-//!    - 验证配置项
-//!
-//! 3. **启动客户端**
-//!    - 创建 Client 实例
-//!    - 调用 `client.start()` 启动客户端
-//!
-//! ## 使用方法
-//!
-//! ```bash
-//! # 使用默认配置文件 frpc.toml
-//! rust_frpc
-//!
-//! # 指定配置文件
-//! rust_frpc -c /path/to/config.toml
-//! ```
-//!
-//! ## 配置文件格式
-//!
-//! ```toml
-//! server_addr = "127.0.0.1"
-//! server_port = 9300
-//!
-//! [[proxies]]
-//! name = "ssh"
-//! type = "tcp"
-//! local_ip = "127.0.0.1"
-//! local_port = 22
-//! remote_port = 6000
-//! ```
-
 use std::env;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use rust_frp_config::ConfigLoader;
 use rust_frp_client::Client;
 
@@ -53,12 +11,12 @@ async fn main() {
 
     let args: Vec<String> = env::args().collect();
     let config_path = if args.len() > 2 && args[1] == "-c" {
-        &args[2]
+        args[2].clone()
     } else {
-        "frpc.toml"
+        "frpc.toml".to_string()
     };
 
-    let config = match ConfigLoader::load_client_config(config_path) {
+    let config = match ConfigLoader::load_client_config(&config_path) {
         Ok(config) => {
             info!("Loaded config: server_addr={}, server_port={}, proxies_len={}", config.server_addr, config.server_port, config.proxies.len());
             for (i, proxy) in config.proxies.iter().enumerate() {
@@ -74,7 +32,7 @@ async fn main() {
 
     info!("Starting frpc client...");
 
-    let mut client = match Client::new(config, Some(config_path.to_string())) {
+    let mut client = match Client::new(config, Some(config_path.clone())) {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to create client: {:?}", e);
@@ -82,7 +40,100 @@ async fn main() {
         }
     };
 
-    if let Err(e) = client.start().await {
-        error!("Failed to start client: {:?}", e);
+    let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(16);
+
+    // 启动 SIGHUP 信号处理
+    if let Ok(mut sighup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        let tx = reload_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                sighup.recv().await;
+                info!("Received SIGHUP signal, triggering config reload...");
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+    } else {
+        warn!("SIGHUP signal handler not available on this platform");
+    }
+
+    // 启动配置文件监听
+    let watch_path = config_path.clone();
+    let tx = reload_tx.clone();
+    tokio::spawn(async move {
+        use notify::{Event, EventKind, RecursiveMode, Watcher};
+        let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1);
+        let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, EventKind::Modify(_)) {
+                    let _ = watch_tx.blocking_send(());
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!("Failed to create file watcher: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = watcher.watch(std::path::Path::new(&watch_path), RecursiveMode::NonRecursive) {
+            warn!("Failed to watch config file {}: {}", watch_path, e);
+            return;
+        }
+        info!("Watching config file for changes: {}", watch_path);
+
+        loop {
+            if watch_rx.recv().await.is_none() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            info!("Config file changed, triggering config reload...");
+            if tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 启动 Ctrl+C 信号处理
+    if let Ok(mut sigint) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+        tokio::spawn(async move {
+            sigint.recv().await;
+            info!("Received SIGINT, shutting down...");
+            std::process::exit(0);
+        });
+    }
+
+    // 服务主循环（重连 + 重载）
+    let mut first_run = true;
+    loop {
+        if !first_run {
+            info!("Reconnecting to server...");
+        }
+        first_run = false;
+
+        // 处理重载信号
+        let start_result = tokio::select! {
+            result = client.start() => result,
+            _ = reload_rx.recv() => {
+                info!("Reload signal received, reloading config...");
+                if let Err(e) = client.reload_config().await {
+                    error!("Reload config failed: {}", e);
+                }
+                continue;
+            }
+        };
+
+        match start_result {
+            Ok(()) => {
+                info!("Client stopped normally");
+                break;
+            }
+            Err(e) => {
+                error!("Client error: {:?}, reconnecting in 3 seconds...", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            }
+        }
     }
 }
