@@ -248,31 +248,11 @@ impl ClientProxyManager {
                                 }
                             };
 
-                            tokio::select! {
-                                _ = server_to_local => {},
-                                _ = local_to_server => {},
-                            }
+                            futures_util::future::join(server_to_local, local_to_server).await;
                         } else {
-                            let (mut server_read, mut server_write) = server_conn.split();
-                            let (mut local_read, mut local_write) = local_conn.split();
-
-                            let server_to_local = async {
-                                match tokio::io::copy(&mut server_read, &mut local_write).await {
-                                    Ok(n) => log::info!("Server to local: {} bytes transferred", n),
-                                    Err(e) => log::error!("Server to local error: {:?}", e),
-                                }
-                            };
-
-                            let local_to_server = async {
-                                match tokio::io::copy(&mut local_read, &mut server_write).await {
-                                    Ok(n) => log::info!("Local to server: {} bytes transferred", n),
-                                    Err(e) => log::error!("Local to server error: {:?}", e),
-                                }
-                            };
-
-                            tokio::select! {
-                                _ = server_to_local => {},
-                                _ = local_to_server => {},
+                            match rust_frp_util::bridge_streams(server_conn, local_conn).await {
+                                Ok(_) => log::info!("Bidirectional bridge completed for proxy: {}", proxy_name_clone),
+                                Err(e) => log::error!("Bridge error for proxy {}: {:?}", proxy_name_clone, e),
                             }
                         }
                         
@@ -849,7 +829,7 @@ async fn establish_work_connection(
     log::info!("Connected to local service: {}", local_addr);
 
     // 双向桥接工作连接和本地连接
-    rust_frp_util::bridge_connections(work_conn, local_conn).await?;
+    rust_frp_util::bridge_streams(work_conn, local_conn).await?;
     Ok(())
 }
 
@@ -1013,7 +993,7 @@ async fn handle_stcp_visitor_conn(
         }
     }
 
-    rust_frp_util::bridge_connections(work_conn, local_conn).await?;
+    rust_frp_util::bridge_streams(work_conn, local_conn).await?;
     Ok(())
 }
 

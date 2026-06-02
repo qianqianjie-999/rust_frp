@@ -1371,7 +1371,7 @@ impl ServerProxyManager {
                                             Ok(Ok(Ok(work_conn))) => {
                                                 log::info!("Got work conn for proxy {}, bridging with visitor", proxy_name_clone);
                                                 // 7. 桥接访问者连接和工作连接
-                                                if let Err(e) = rust_frp_util::bridge_connections(visitor_conn, work_conn).await {
+                                                if let Err(e) = rust_frp_util::bridge_streams(visitor_conn, work_conn).await {
                                                     log::error!("Bridge error for proxy {}: {:?}", proxy_name_clone, e);
                                                 }
                                             }
