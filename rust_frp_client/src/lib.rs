@@ -515,6 +515,7 @@ pub struct ClientControl {
     udp_resp_rx: tokio::sync::mpsc::Receiver<Message>,
     stcp_visitor_tx: tokio::sync::mpsc::Sender<Message>,
     stcp_visitor_rx: tokio::sync::mpsc::Receiver<Message>,
+    last_pong_time: std::time::Instant,
 }
 
 impl ClientControl {
@@ -542,6 +543,7 @@ impl ClientControl {
             udp_resp_rx: rx,
             stcp_visitor_tx: stcp_tx,
             stcp_visitor_rx: stcp_rx,
+            last_pong_time: std::time::Instant::now(),
         }
     }
 
@@ -573,16 +575,25 @@ impl ClientControl {
             log::debug!("Waiting for message, count: {}", msg_count);
 
             tokio::select! {
-                msg_result = self.conn.read_message() => {
+                msg_result = tokio::time::timeout(std::time::Duration::from_secs(15), self.conn.read_message()) => {
                     match msg_result {
-                        Ok(msg) => {
+                        Ok(Ok(msg)) => {
                             msg_count += 1;
                             log::debug!("成功读取消息, 计数: {}", msg_count);
                             self.handle_message(msg).await;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             log::error!("Failed to read message from connection: {:?}", e);
                             break;
+                        }
+                        Err(_elapsed) => {
+                            if self.last_pong_time.elapsed() > std::time::Duration::from_secs(90) {
+                                log::warn!(
+                                    "Heartbeat timeout (no pong for {:?}), connection dead, reconnecting...",
+                                    self.last_pong_time.elapsed()
+                                );
+                                break;
+                            }
                         }
                     }
                 }
@@ -612,7 +623,7 @@ impl ClientControl {
     async fn handle_message(&mut self, msg: Message) {
         match msg {
             Message::Pong(pong_msg) => {
-                // 收到 pong 消息，继续循环
+                self.last_pong_time = std::time::Instant::now();
                 log::debug!("收到 Pong 消息: timestamp={}", pong_msg.timestamp);
             }
             Message::ReqWorkConn(req_work_conn_msg) => {

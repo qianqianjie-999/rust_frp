@@ -709,10 +709,10 @@ impl Control {
                         // 参考 frp 的设计：同一个任务处理读写，无锁竞争
                         loop {
                             tokio::select! {
-                                // 读取客户端消息
-                                msg_result = self.conn.read_message() => {
+                                // 读取客户端消息（15秒读超时，用于心跳检测）
+                                msg_result = tokio::time::timeout(Duration::from_secs(15), self.conn.read_message()) => {
                                     match msg_result {
-                                        Ok(msg) => {
+                                        Ok(Ok(msg)) => {
                                             match msg {
                                                 Message::Ping(ping_msg) => {
                                                     self.last_heartbeat = Instant::now();
@@ -955,10 +955,21 @@ impl Control {
                                                 }
                                             }
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             log::warn!("Client connection closed unexpectedly: {:?}", e);
                                             self.cleanup_proxies().await;
                                             return Ok(());
+                                        }
+                                        Err(_elapsed) => {
+                                            if self.last_heartbeat.elapsed() > Duration::from_secs(90) {
+                                                log::warn!(
+                                                    "Heartbeat timeout for client {} (no ping for {:?}), cleaning up proxies",
+                                                    self.run_id,
+                                                    self.last_heartbeat.elapsed()
+                                                );
+                                                self.cleanup_proxies().await;
+                                                return Ok(());
+                                            }
                                         }
                                     }
                                 },
@@ -1170,6 +1181,8 @@ pub struct ServerProxyManager {
     auth_manager: Arc<AuthManager>,
     /// 允许的端口列表（空列表 = 默认拒绝所有）
     allow_ports: Vec<rust_frp_config::PortRange>,
+    /// accept 任务的 JoinHandle，用于 stop_proxy 时立即中止
+    accept_handles: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 /// 检查端口是否在允许列表中
@@ -1219,6 +1232,7 @@ impl ServerProxyManager {
             work_conn_manager,
             auth_manager,
             allow_ports,
+            accept_handles: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1250,7 +1264,7 @@ impl ServerProxyManager {
                     let auth_manager = self.auth_manager.clone();
                     let plugin_config = config.plugin.clone();
 
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                             match listener_clone.accept().await {
                                 Ok((visitor_conn, visitor_addr)) => {
@@ -1387,6 +1401,8 @@ impl ServerProxyManager {
 
                     let mut listeners = listeners.write().await;
                     listeners.insert(config.name.clone(), (listener_arc, running));
+                    let mut handles = self.accept_handles.write().await;
+                    handles.insert(config.name.clone(), handle);
                 }
             }
             "http" => {
@@ -1507,7 +1523,7 @@ impl ServerProxyManager {
                     let work_conn_manager = self.work_conn_manager.clone();
                     let auth_manager = self.auth_manager.clone();
 
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                             match listener_clone.accept().await {
                                 Ok((visitor_conn, visitor_addr)) => {
@@ -1600,6 +1616,8 @@ impl ServerProxyManager {
 
                     let mut listeners = listeners.write().await;
                     listeners.insert(config.name.clone(), (listener_arc, running));
+                    let mut handles = self.accept_handles.write().await;
+                    handles.insert(config.name.clone(), handle);
                 }
             }
             _ => {
@@ -1615,11 +1633,17 @@ impl ServerProxyManager {
         // 从 HTTP 虚拟主机路由器中注销
         self.http_vhost_router.unregister_proxy(name).await;
         
-        // 停止 TCP 监听器
+        // 中止 accept 任务，立即释放端口
+        let mut accept_handles = self.accept_handles.write().await;
+        if let Some(handle) = accept_handles.remove(name) {
+            handle.abort();
+            log::info!("aborted accept task for proxy: {}", name);
+        }
+        
+        // 停止 TCP 监听器（清理残留状态）
         let mut listeners = self.listeners.write().await;
         if let Some((_, running)) = listeners.remove(name) {
             running.store(false, std::sync::atomic::Ordering::Relaxed);
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             log::info!("stopped TCP proxy: {}", name);
         }
 
