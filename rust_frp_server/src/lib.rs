@@ -44,16 +44,19 @@
 //!
 //! ### 2. TCP 代理请求流程
 //! ```text
-//! 访问者        服务器                        客户端
-//!   │              │                            │
-//!   │--- TCP 请求 ->│                            │
-//!   │              │ ReqWorkConnMsg ------------>│
-//!   │              │                            │
-//!   │              │              新建工作连接 ---│
-//!   │              │<-------- NewWorkConn ------│
-//!   │              │                            │
-//!   │<--- 桥接 ---- │-------------------------->│
-//!   │              │                            │
+//! 访问者        服务器                             客户端                 本地
+//!   │              │                                 │                   │
+//!   │--- TCP 请求 ->│                                 │                   │
+//!   │              │ get_work_conn():                 │                   │
+//!   │              │   try_recv from pool             │                   │
+//!   │              │   pool empty → ReqWorkConnMsg -->│                   │
+//!   │              │                                 │ 新建工作连接 ─────│
+//!   │              │<------------- NewWorkConn ------│                   │
+//!   │              │   pool.send(conn)                │                   │
+//!   │              │   StartWorkConn(visitor_addr) -->│                   │
+//!   │              │                                 │ connect local ───>│
+//!   │              │                                 │ 可选: PROXY header>│
+//!   │<--- 桥接 ---- │<---- bridge_streams --------->│<---- bridge ----->│
 //! ```
 //!
 //! ### 3. HTTP 代理请求流程
@@ -256,6 +259,7 @@ impl ServerWorkConnManager {
         proxy_name: &str,
         msg_tx: &tokio::sync::mpsc::Sender<Message>,
         timeout: Duration,
+        visitor_addr: std::net::SocketAddr,
     ) -> Result<tokio::net::TcpStream, String> {
         // 获取代理的池（克隆 Arc，避免生命周期问题）
         let pool: Arc<WorkConnPool> = {
@@ -296,9 +300,13 @@ impl ServerWorkConnManager {
                 }
             };
 
-            // 2. 发送 StartWorkConn 唤醒客户端
+            // 2. 发送 StartWorkConn 唤醒客户端（携带访问者地址，用于 PROXY protocol）
             let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
                 error: "".to_string(),
+                src_addr: visitor_addr.ip().to_string(),
+                src_port: visitor_addr.port(),
+                dst_addr: "127.0.0.1".to_string(),
+                dst_port: 0,
             });
             match rust_frp_core::write_message(&mut conn, &resp).await {
                 Ok(_) => {
@@ -1357,6 +1365,7 @@ impl ServerProxyManager {
                                             &proxy_name_clone,
                                             &msg_tx,
                                             Duration::from_secs(30),
+                                            visitor_addr,
                                         ).await {
                                             Ok(work_conn) => {
                                                 log::info!("Got work conn for proxy {}, bridging with visitor", proxy_name_clone);
@@ -1551,6 +1560,7 @@ impl ServerProxyManager {
                                             &proxy_name_clone,
                                             &msg_tx,
                                             Duration::from_secs(30),
+                                            visitor_addr,
                                         ).await {
                                             Ok(work_conn) => {
                                                 log::info!("Got work conn for WebSocket proxy {}, bridging", proxy_name_clone);
@@ -2353,6 +2363,10 @@ impl Server {
                     log::error!("Unknown run_id: {}", work_msg.run_id);
                     let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
                         error: "Unknown run_id".to_string(),
+                        src_addr: String::new(),
+                        src_port: 0,
+                        dst_addr: String::new(),
+                        dst_port: 0,
                     });
                     rust_frp_core::write_message(&mut conn, &resp).await?;
                     return Err("Unknown run_id".into());
@@ -2366,6 +2380,10 @@ impl Server {
                                 log::error!("Sign key mismatch for proxy: {}", work_msg.proxy_name);
                                 let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
                                     error: "Sign key verification failed".to_string(),
+                                    src_addr: String::new(),
+                                    src_port: 0,
+                                    dst_addr: String::new(),
+                                    dst_port: 0,
                                 });
                                 rust_frp_core::write_message(&mut conn, &resp).await?;
                                 return Err("Sign key mismatch".into());
@@ -2492,7 +2510,7 @@ impl Server {
                             // 先进行 TLS 握手
                             match tls_config.accept(conn).await {
                                 Ok(tls_conn) => {
-                                    if let Err(e) = Self::handle_https_vhost_connection(tls_conn, router, po, cm, wcm, am).await {
+                                    if let Err(e) = Self::handle_https_vhost_connection(tls_conn, router, po, cm, wcm, am, addr).await {
                                         if e.to_string().to_lowercase().contains("connection reset")
                                             || e.to_string().to_lowercase().contains("connection aborted")
                                             || e.to_string().to_lowercase().contains("broken pipe")
@@ -2596,10 +2614,12 @@ impl Server {
         };
 
         // 从池中获取工作连接
+        let visitor_addr = conn.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
         match work_conn_manager.get_work_conn(
             &proxy_name,
             &msg_tx,
             Duration::from_secs(30),
+            visitor_addr,
         ).await {
             Ok(mut work_conn) => {
                 log::info!("Got work conn for HTTP proxy {}, bridging", proxy_name);
@@ -2632,6 +2652,7 @@ impl Server {
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
         _auth_manager: Arc<AuthManager>,
+        visitor_addr: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2707,6 +2728,7 @@ impl Server {
             &proxy_name,
             &msg_tx,
             Duration::from_secs(30),
+            visitor_addr,
         ).await {
             Ok(work_conn) => {
                 log::info!("Got work conn for HTTPS proxy {}, bridging", proxy_name);

@@ -343,6 +343,18 @@ pub struct NewWorkConnMsg {
 pub struct StartWorkConnMsg {
     /// 错误信息（空表示成功）
     pub error: String,
+    /// 访问者来源 IP（用于 PROXY protocol）
+    #[serde(default)]
+    pub src_addr: String,
+    /// 访问者来源端口
+    #[serde(default)]
+    pub src_port: u16,
+    /// 代理监听 IP
+    #[serde(default)]
+    pub dst_addr: String,
+    /// 代理监听端口
+    #[serde(default)]
+    pub dst_port: u16,
 }
 
 /// 新访问者连接消息 - 用于 TCP 打孔/反向代理访问
@@ -1023,12 +1035,24 @@ mod tests {
 
     #[test]
     fn test_start_work_conn_msg() {
-        let success = StartWorkConnMsg { error: "".to_string() };
+        let success = StartWorkConnMsg {
+            error: "".to_string(),
+            src_addr: String::new(),
+            src_port: 0,
+            dst_addr: String::new(),
+            dst_port: 0,
+        };
         let json = serde_json::to_string(&success).unwrap();
         let deserialized: StartWorkConnMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.error, "");
 
-        let fail = StartWorkConnMsg { error: "connection refused".to_string() };
+        let fail = StartWorkConnMsg {
+            error: "connection refused".to_string(),
+            src_addr: String::new(),
+            src_port: 0,
+            dst_addr: String::new(),
+            dst_port: 0,
+        };
         let json = serde_json::to_string(&fail).unwrap();
         let deserialized: StartWorkConnMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.error, "connection refused");
