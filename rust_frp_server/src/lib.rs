@@ -185,132 +185,147 @@ impl WorkConnManager {
             Err(format!("No pending work conn request for proxy: {}", proxy_name))
         }
     }
-
-    /// 移除等待请求
-    pub async fn remove_pending(&self, proxy_name: &str) {
-        let mut pending = self.pending_conns.write().await;
-        pending.remove(proxy_name);
-    }
 }
 
-/// 等待的工作连接
-pub struct PendingWorkConn {
-    pub proxy_name: String,
-    pub run_id: String,
-    pub created_at: Instant,
-    pub sender: tokio::sync::oneshot::Sender<Result<tokio::net::TcpStream, String>>,
-}
-
-/// 服务器工作连接管理器
+/// 服务器工作连接管理器（池模式）
+/// 参考 frp 原版设计：预建工作连接池，访客到达时从池中取用。
+/// 无 per-request 状态，自然杜绝僵尸条目和内存泄漏。
 pub struct ServerWorkConnManager {
-    /// 等待工作连接的队列 (key -> pending request)
-    pending: RwLock<std::collections::HashMap<String, PendingWorkConn>>,
-    /// 请求计数器，用于生成唯一 key
-    request_counter: std::sync::atomic::AtomicUsize,
+    /// 工作连接池 (proxy_name -> pool)
+    pools: RwLock<std::collections::HashMap<String, Arc<WorkConnPool>>>,
+    /// 每个代理的池大小
+    pool_size: usize,
+}
+
+/// 单个代理的工作连接池
+struct WorkConnPool {
+    tx: mpsc::Sender<tokio::net::TcpStream>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<tokio::net::TcpStream>>,
 }
 
 impl Default for ServerWorkConnManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(10)
     }
 }
 
 impl ServerWorkConnManager {
-    pub fn new() -> Self {
+    pub fn new(pool_size: usize) -> Self {
         Self {
-            pending: RwLock::new(std::collections::HashMap::new()),
-            request_counter: std::sync::atomic::AtomicUsize::new(0),
+            pools: RwLock::new(std::collections::HashMap::new()),
+            pool_size,
         }
     }
 
-    /// 生成唯一的请求 key
-    pub fn generate_key(&self, proxy_name: &str) -> String {
-        let counter = self.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        format!("{}:{}", proxy_name, counter)
+    /// 为代理初始化工作连接池
+    pub async fn init_pool(&self, proxy_name: &str) {
+        let (tx, rx) = mpsc::channel::<tokio::net::TcpStream>(self.pool_size);
+        let pool = Arc::new(WorkConnPool {
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
+        });
+        let mut pools = self.pools.write().await;
+        pools.insert(proxy_name.to_string(), pool);
+        log::info!("Initialized work conn pool for proxy: {}, capacity: {}", proxy_name, self.pool_size);
     }
 
-    /// 注册一个工作连接请求
-    pub async fn register_request(
-        &self,
-        key: String,
-        proxy_name: String,
-        run_id: String,
-        sender: tokio::sync::oneshot::Sender<Result<tokio::net::TcpStream, String>>
-    ) -> Result<(), String> {
-        let pending = PendingWorkConn {
-            proxy_name: proxy_name.clone(),
-            run_id,
-            created_at: Instant::now(),
-            sender,
-        };
-
-        let mut map = self.pending.write().await;
-        map.insert(key.clone(), pending);
-        log::info!("Registered work conn request for proxy: {}, key: {}", proxy_name, key);
-        Ok(())
+    /// 注册工作连接到池中（由 process_work_conn 调用）
+    /// 如果池已满，连接将被丢弃（背压保护）
+    pub async fn register_work_conn(&self, proxy_name: &str, conn: tokio::net::TcpStream) {
+        let pools = self.pools.read().await;
+        if let Some(pool) = pools.get(proxy_name) {
+            match pool.tx.try_send(conn) {
+                Ok(_) => log::debug!("Work conn registered in pool for {}", proxy_name),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!("Work conn pool full for {}, discarding", proxy_name);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    log::debug!("Work conn pool closed for {}", proxy_name);
+                }
+            }
+        } else {
+            log::warn!("No pool initialized for proxy: {}, discarding work conn", proxy_name);
+        }
     }
 
-    /// 完成工作连接（通过 proxy_name 匹配）
-    pub async fn complete_work_conn(
+    /// 获取工作连接（供 TCP/HTTP/HTTPS/WebSocket 处理器调用）
+    /// 与 frp 原版一致：从池中取 → 发 StartWorkConn，失败则重试 pool_size+1 次，
+    /// 成功后立即补充一个请求保持池始终有可用连接。
+    pub async fn get_work_conn(
         &self,
         proxy_name: &str,
-        run_id: &str,
-        work_conn: tokio::net::TcpStream
-    ) -> Result<(), String> {
-        let mut map = self.pending.write().await;
+        msg_tx: &tokio::sync::mpsc::Sender<Message>,
+        timeout: Duration,
+    ) -> Result<tokio::net::TcpStream, String> {
+        // 获取代理的池（克隆 Arc，避免生命周期问题）
+        let pool: Arc<WorkConnPool> = {
+            let pools = self.pools.read().await;
+            pools.get(proxy_name)
+                .ok_or_else(|| format!("Pool not found for proxy: {}", proxy_name))?
+                .clone()
+        };
 
-        // 找到匹配 proxy_name 的 pending 请求
-        let matched_key = map.iter()
-            .find(|(_, pending)| pending.proxy_name == proxy_name)
-            .map(|(key, _)| key.clone());
+        let max_retries = self.pool_size + 1;
+        let mut last_err = String::new();
 
-        if let Some(key) = matched_key {
-            let pending = map.remove(&key).unwrap();
+        for retry in 0..max_retries {
+            // 1. 从池中获取连接（池空则请求+等待）
+            let mut conn = {
+                let mut rx = pool.rx.lock().await;
+                match rx.try_recv() {
+                    Ok(c) => c,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        drop(rx);
+                        log::debug!("Pool empty for {}, requesting new work conn (retry {}/{})", proxy_name, retry + 1, max_retries);
+                        let req = Message::ReqWorkConn(rust_frp_core::ReqWorkConnMsg {
+                            proxy_name: proxy_name.to_string(),
+                        });
+                        msg_tx.send(req).await
+                            .map_err(|e| format!("Failed to send ReqWorkConn: {}", e))?;
 
-            if pending.run_id != run_id {
-                return Err("Run ID mismatch".to_string());
+                        let mut rx = pool.rx.lock().await;
+                        match tokio::time::timeout(timeout, rx.recv()).await {
+                            Ok(Some(c)) => c,
+                            Ok(None) => return Err("Pool channel closed".to_string()),
+                            Err(_) => return Err(format!("Timeout waiting for work conn for {}", proxy_name)),
+                        }
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        return Err("Pool disconnected".to_string());
+                    }
+                }
+            };
+
+            // 2. 发送 StartWorkConn 唤醒客户端
+            let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
+                error: "".to_string(),
+            });
+            match rust_frp_core::write_message(&mut conn, &resp).await {
+                Ok(_) => {
+                    // 成功后立即补充，保持池始终有可用连接（与 frp 原版一致）
+                    let req = Message::ReqWorkConn(rust_frp_core::ReqWorkConnMsg {
+                        proxy_name: proxy_name.to_string(),
+                    });
+                    let _ = msg_tx.try_send(req);
+                    return Ok(conn);
+                }
+                Err(e) => {
+                    last_err = format!("Failed to send StartWorkConn: {}", e);
+                    log::warn!("{} for proxy {} (retry {}/{})", last_err, proxy_name, retry + 1, max_retries);
+                    // 连接已损坏，丢弃，继续重试
+                    drop(conn);
+                }
             }
-
-            // 检查是否超时（超过30秒）
-            if pending.created_at.elapsed() > Duration::from_secs(30) {
-                return Err("Work conn request timeout".to_string());
-            }
-
-            // 发送工作连接给等待者
-            if pending.sender.send(Ok(work_conn)).is_err() {
-                return Err("Failed to send work conn to waiter".to_string());
-            }
-
-            log::info!("Completed work conn for proxy: {}, key: {}", proxy_name, key);
-            Ok(())
-        } else {
-            Err(format!("No pending work conn request for proxy: {}", proxy_name))
         }
+
+        Err(format!("All {} retries exhausted for {}: {}", max_retries, proxy_name, last_err))
     }
-    
-    /// 清理超时的请求
-    pub async fn cleanup_expired(&self, timeout: Duration) {
-        let mut map = self.pending.write().await;
-        let now = Instant::now();
-        
-        let expired_keys: Vec<String> = map.iter()
-            .filter(|(_, pending)| now.duration_since(pending.created_at) > timeout)
-            .map(|(key, _)| key.clone())
-            .collect();
-        
-        for key in expired_keys {
-            if let Some(pending) = map.remove(&key) {
-                log::warn!("Cleaning up expired work conn request for proxy: {}", key);
-                // 发送超时错误
-                let _ = pending.sender.send(Err("Work conn request timeout".to_string()));
-            }
-        }
-    }
-    
-    /// 获取等待中的请求数量
-    pub async fn pending_count(&self) -> usize {
-        let map = self.pending.read().await;
-        map.len()
+
+    /// 移除代理的池（代理停止时调用）
+    pub async fn remove_pool(&self, proxy_name: &str) {
+        let mut pools = self.pools.write().await;
+        pools.remove(proxy_name);
+        log::info!("Removed work conn pool for {}", proxy_name);
     }
 }
 
@@ -587,6 +602,8 @@ pub struct Control {
     /// 工作连接管理器
     #[allow(dead_code)]
     work_conn_manager: Arc<ServerWorkConnManager>,
+    /// 工作连接池大小（来自客户端 LoginMsg）
+    pool_count: u32,
 }
 
 impl Control {
@@ -624,6 +641,7 @@ impl Control {
             msg_tx,
             stcp_bridge_manager,
             work_conn_manager,
+            pool_count: 0, // 将在收到 LoginMsg 后由 run() 设置
         }
     }
 
@@ -678,6 +696,7 @@ impl Control {
                         self.run_id = login_msg.run_id;
                         self.user = login_msg.user;
                         self.client_id = login_msg.client_id;
+                        self.pool_count = login_msg.pool_count;
 
                         // 注册客户端信息到 ControlManager
                         self.control_manager.add_client(
@@ -752,6 +771,8 @@ impl Control {
 
                                                     if error_msg.is_empty() {
                                                         log::info!("proxy registered: {}", proxy_name);
+                                                        // 初始化工作连接池（不做预填充，由 get_work_conn 的取后补充自然填充）
+                                                        self.work_conn_manager.init_pool(&proxy_name).await;
                                                     } else {
                                                         log::error!("failed to register proxy {}: {}", proxy_name, error_msg);
                                                     }
@@ -1331,60 +1352,20 @@ impl ServerProxyManager {
 
                                         log::debug!("找到消息通道: proxy={}, run_id={}", proxy_name_clone, run_id);
 
-                                        // 3. 创建 oneshot 通道用于接收工作连接
-                                        let (tx, rx) = tokio::sync::oneshot::channel::<Result<tokio::net::TcpStream, String>>();
-
-                                        // 4. 注册等待请求
-                                        let key = work_conn_manager.generate_key(&proxy_name_clone);
-                                        if let Err(e) = work_conn_manager.register_request(
-                                            key.clone(),
-                                            proxy_name_clone.clone(),
-                                            run_id.clone(),
-                                            tx,
+                                        // 3. 从池中获取工作连接（池为空时会自动请求）
+                                        match work_conn_manager.get_work_conn(
+                                            &proxy_name_clone,
+                                            &msg_tx,
+                                            Duration::from_secs(30),
                                         ).await {
-                                            log::error!("Failed to register work conn request: {}", e);
-                                            let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
-                                            return;
-                                        }
-
-                                        // 5. 发送 ReqWorkConn 给客户端
-                                        log::debug!("发送 ReqWorkConn 到客户端: proxy={}", proxy_name_clone);
-
-                                        let req_work_conn_msg = rust_frp_core::ReqWorkConnMsg {
-                                            proxy_name: proxy_name_clone.clone(),
-                                        };
-                                        match msg_tx.send(Message::ReqWorkConn(req_work_conn_msg)).await {
-                                            Ok(_) => {
-                                                log::debug!("=== ReqWorkConn 消息发送成功 (via channel) ===");
-                                            }
-                                            Err(e) => {
-                                                log::error!("=== ReqWorkConn 消息发送失败 ===");
-                                                log::error!("Failed to send ReqWorkConn to client: proxy={}, error={:?}", proxy_name_clone, e);
-                                                let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
-                                                return;
-                                            }
-                                        }
-
-                                        // 6. 等待工作连接（30秒超时）
-                                        // 注意：这里等待的是客户端通过工作连接发送的 NewWorkConn 消息
-                                        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-                                            Ok(Ok(Ok(work_conn))) => {
+                                            Ok(work_conn) => {
                                                 log::info!("Got work conn for proxy {}, bridging with visitor", proxy_name_clone);
-                                                // 7. 桥接访问者连接和工作连接
                                                 if let Err(e) = rust_frp_util::bridge_streams(visitor_conn, work_conn).await {
                                                     log::error!("Bridge error for proxy {}: {:?}", proxy_name_clone, e);
                                                 }
                                             }
-                                            Ok(Ok(Err(e))) => {
-                                                log::error!("Work conn error for proxy {}: {}", proxy_name_clone, e);
-                                                let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
-                                            }
-                                            Ok(Err(_)) => {
-                                                log::error!("Work conn channel closed for proxy {}", proxy_name_clone);
-                                                let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
-                                            }
-                                            Err(_) => {
-                                                log::error!("Timeout waiting for work conn for proxy {}", proxy_name_clone);
+                                            Err(e) => {
+                                                log::error!("Failed to get work conn for {}: {}", proxy_name_clone, e);
                                                 let _ = visitor_conn.try_write(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n");
                                             }
                                         }
@@ -1565,42 +1546,21 @@ impl ServerProxyManager {
                                             }
                                         };
 
-                                        let (tx, rx) = tokio::sync::oneshot::channel::<Result<tokio::net::TcpStream, String>>();
-                                        let key = work_conn_manager.generate_key(&proxy_name_clone);
-                                        if let Err(e) = work_conn_manager.register_request(
-                                            key.clone(),
-                                            proxy_name_clone.clone(),
-                                            run_id.clone(),
-                                            tx,
+                                        // 从池中获取工作连接
+                                        match work_conn_manager.get_work_conn(
+                                            &proxy_name_clone,
+                                            &msg_tx,
+                                            Duration::from_secs(30),
                                         ).await {
-                                            log::error!("Failed to register work conn request: {}", e);
-                                            return;
-                                        }
-
-                                        let req_work_conn_msg = rust_frp_core::ReqWorkConnMsg {
-                                            proxy_name: proxy_name_clone.clone(),
-                                        };
-                                        if let Err(e) = msg_tx.send(Message::ReqWorkConn(req_work_conn_msg)).await {
-                                            log::error!("Failed to send ReqWorkConn: {:?}", e);
-                                            return;
-                                        }
-
-                                        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-                                            Ok(Ok(Ok(work_conn))) => {
+                                            Ok(work_conn) => {
                                                 log::info!("Got work conn for WebSocket proxy {}, bridging", proxy_name_clone);
                                                 let ws_conn = WebSocketConn::new(ws_stream, visitor_addr);
                                                 if let Err(e) = rust_frp_util::bridge_streams(ws_conn, work_conn).await {
                                                     log::error!("WebSocket bridge error for proxy {}: {:?}", proxy_name_clone, e);
                                                 }
                                             }
-                                            Ok(Ok(Err(e))) => {
-                                                log::error!("Work conn error for proxy {}: {}", proxy_name_clone, e);
-                                            }
-                                            Ok(Err(_)) => {
-                                                log::error!("Work conn channel closed for proxy {}", proxy_name_clone);
-                                            }
-                                            Err(_) => {
-                                                log::error!("Timeout waiting for work conn for proxy {}", proxy_name_clone);
+                                            Err(e) => {
+                                                log::error!("Failed to get work conn for {}: {}", proxy_name_clone, e);
                                             }
                                         }
                                     });
@@ -2118,7 +2078,7 @@ impl Server {
         let auth_manager = Arc::new(AuthManager::new(&config.auth).map_err(|e| e.to_string())?);
         let control_manager = Arc::new(ControlManager::new());
         let http_vhost_router = Arc::new(HttpVhostRouter::new());
-        let work_conn_manager = Arc::new(ServerWorkConnManager::new());
+        let work_conn_manager = Arc::new(ServerWorkConnManager::new(config.transport.pool_count as usize));
         let proxy_owners = Arc::new(RwLock::new(std::collections::HashMap::new()));
         let proxy_manager = Arc::new(ServerProxyManager::new(
             http_vhost_router,
@@ -2263,14 +2223,6 @@ impl Server {
 
         self.work_conn_listener = Some(work_conn_listener);
 
-        // 启动工作连接超时清理任务
-        let wcm = self.work_conn_manager.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                wcm.cleanup_expired(Duration::from_secs(30)).await;
-            }
-        });
 
         // 开始处理连接
         log::info!("Starting connection handlers...");
@@ -2425,12 +2377,7 @@ impl Server {
                     }
                 }
 
-                // 先发送 StartWorkConn 成功响应
-                let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
-                    error: "".to_string(),
-                });
-                rust_frp_core::write_message(&mut conn, &resp).await?;
-
+                // 不再立即发送 StartWorkConn，连接放入池中等待访客取用
                 // 检查是否是 STCP 桥接工作连接（用 proxy_name 作为 bridge_id）
                 match stcp_bridge_manager.add_conn_and_try_bridge(
                     &work_msg.proxy_name, conn
@@ -2450,16 +2397,8 @@ impl Server {
                         return Ok(());
                     }
                     Err(conn) => {
-                        // 没有 STCP 桥接，继续正常流程
-                        // 将工作连接交付给等待的访问者处理器
-                        if let Err(e) = work_conn_manager.complete_work_conn(
-                            &work_msg.proxy_name,
-                            &work_msg.run_id,
-                            conn,
-                        ).await {
-                            log::error!("Failed to complete work conn: {}", e);
-                            return Err(e.into());
-                        }
+                        // 没有 STCP 桥接，放入工作连接池
+                        work_conn_manager.register_work_conn(&work_msg.proxy_name, conn).await;
                     }
                 }
             }
@@ -2656,47 +2595,13 @@ impl Server {
             }
         };
 
-        // 创建 oneshot 通道
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<tokio::net::TcpStream, String>>();
-
-        // 注册等待请求
-        let key = work_conn_manager.generate_key(&proxy_name);
-        if let Err(e) = work_conn_manager.register_request(
-            key.clone(),
-            proxy_name.clone(),
-            run_id.clone(),
-            tx,
+        // 从池中获取工作连接
+        match work_conn_manager.get_work_conn(
+            &proxy_name,
+            &msg_tx,
+            Duration::from_secs(30),
         ).await {
-            log::error!("Failed to register HTTP work conn request: {}", e);
-            let response = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-            conn.write_all(response.as_bytes()).await?;
-            return Ok(());
-        }
-
-        // 发送 ReqWorkConn 消息，请求客户端建立工作连接
-        {
-            log::debug!("发送 ReqWorkConn 消息到客户端: proxy={}", proxy_name);
-
-            let req_work_conn_msg = rust_frp_core::ReqWorkConnMsg {
-                proxy_name: proxy_name.clone(),
-            };
-            match msg_tx.send(Message::ReqWorkConn(req_work_conn_msg)).await {
-                Ok(_) => {
-                    log::debug!("=== ReqWorkConn 消息发送成功 (via channel) ===");
-                }
-                Err(e) => {
-                    log::error!("=== ReqWorkConn 消息发送失败 ===");
-                    log::error!("Failed to send ReqWorkConn to client: proxy={}, error={:?}", proxy_name, e);
-                    let response = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-                    let _ = conn.write_all(response.as_bytes()).await;
-                    return Ok(());
-                }
-            }
-        }
-
-        // 等待工作连接（30秒超时）
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(Ok(mut work_conn))) => {
+            Ok(mut work_conn) => {
                 log::info!("Got work conn for HTTP proxy {}, bridging", proxy_name);
                 // 先发送已读取的 HTTP 数据到工作连接
                 if n > 0 {
@@ -2710,18 +2615,8 @@ impl Server {
                     log::error!("HTTP bridge error: {:?}", e);
                 }
             }
-            Ok(Ok(Err(e))) => {
-                log::error!("Work conn error for HTTP proxy {}: {}", proxy_name, e);
-                let response = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-                conn.write_all(response.as_bytes()).await?;
-            }
-            Ok(Err(_)) => {
-                log::error!("Work conn channel closed for HTTP proxy {}", proxy_name);
-                let response = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-                conn.write_all(response.as_bytes()).await?;
-            }
-            Err(_) => {
-                log::error!("Timeout waiting for work conn for HTTP proxy {}", proxy_name);
+            Err(e) => {
+                log::error!("Failed to get work conn for HTTP proxy {}: {}", proxy_name, e);
                 let response = "HTTP/1.1 504 Gateway Timeout\r\n\r\n";
                 conn.write_all(response.as_bytes()).await?;
             }
@@ -2807,47 +2702,13 @@ impl Server {
             }
         };
 
-        // 创建 oneshot 通道
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<tokio::net::TcpStream, String>>();
-
-        // 注册等待请求
-        let key = work_conn_manager.generate_key(&proxy_name);
-        if let Err(e) = work_conn_manager.register_request(
-            key.clone(),
-            proxy_name.clone(),
-            run_id.clone(),
-            tx,
+        // 从池中获取工作连接
+        match work_conn_manager.get_work_conn(
+            &proxy_name,
+            &msg_tx,
+            Duration::from_secs(30),
         ).await {
-            log::error!("Failed to register HTTPS work conn request: {}", e);
-            let response = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-            conn.write_all(response.as_bytes()).await?;
-            return Ok(());
-        }
-
-        // 发送 ReqWorkConn 消息，请求客户端建立工作连接
-        {
-            log::debug!("发送 ReqWorkConn 消息到客户端: proxy={}", proxy_name);
-
-            let req_work_conn_msg = rust_frp_core::ReqWorkConnMsg {
-                proxy_name: proxy_name.clone(),
-            };
-            match msg_tx.send(Message::ReqWorkConn(req_work_conn_msg)).await {
-                Ok(_) => {
-                    log::debug!("=== ReqWorkConn 消息发送成功 (via channel) ===");
-                }
-                Err(e) => {
-                    log::error!("=== ReqWorkConn 消息发送失败 ===");
-                    log::error!("Failed to send ReqWorkConn to client: proxy={}, error={:?}", proxy_name, e);
-                    let response = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-                    conn.write_all(response.as_bytes()).await?;
-                    return Ok(());
-                }
-            }
-        }
-
-        // 等待工作连接（30秒超时）
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(Ok(work_conn))) => {
+            Ok(work_conn) => {
                 log::info!("Got work conn for HTTPS proxy {}, bridging", proxy_name);
                 // 先发送已读取的 HTTP 数据到工作连接
                 // 注意：对于 HTTPS，conn 是 TLS 流，work_conn 是普通 TCP
@@ -2865,18 +2726,8 @@ impl Server {
                     log::error!("HTTPS bridge error: {:?}", e);
                 }
             }
-            Ok(Ok(Err(e))) => {
-                log::error!("Work conn error for HTTPS proxy {}: {}", proxy_name, e);
-                let response = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-                conn.write_all(response.as_bytes()).await?;
-            }
-            Ok(Err(_)) => {
-                log::error!("Work conn channel closed for HTTPS proxy {}", proxy_name);
-                let response = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-                conn.write_all(response.as_bytes()).await?;
-            }
-            Err(_) => {
-                log::error!("Timeout waiting for work conn for HTTPS proxy {}", proxy_name);
+            Err(e) => {
+                log::error!("Failed to get work conn for HTTPS proxy {}: {}", proxy_name, e);
                 let response = "HTTP/1.1 504 Gateway Timeout\r\n\r\n";
                 conn.write_all(response.as_bytes()).await?;
             }
