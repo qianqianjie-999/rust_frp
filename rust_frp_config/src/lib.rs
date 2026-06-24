@@ -626,6 +626,25 @@ pub struct ProxyConfig {
     ///
     /// 当使用插件时，local_ip/local_port 被插件替代
     pub plugin: Option<PluginConfig>,
+
+    /// 是否启用 PROXY protocol（可选，默认 false）
+    ///
+    /// 启用后，frpc 在连接本地服务前会写入 PROXY protocol v1 header，
+    /// 让 nginx/haproxy 等本地服务获取真实访问者 IP。
+    ///
+    /// # 示例
+    ///
+    /// ```toml
+    /// proxy_protocol = true
+    /// ```
+    ///
+    /// 本地 nginx 需要配合配置：
+    /// ```nginx
+    /// listen 80 proxy_protocol;
+    /// set_real_ip_from 127.0.0.1;
+    /// real_ip_header proxy_protocol;
+    /// ```
+    pub proxy_protocol: Option<bool>,
 }
 
 /// 访问者配置 - 定义如何访问其他客户端的 STCP/XTCP 服务

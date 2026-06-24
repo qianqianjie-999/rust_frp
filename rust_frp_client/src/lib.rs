@@ -45,17 +45,19 @@
 //!
 //! ### 2. 工作连接流程
 //! ```text
-//! 服务器                          客户端
-//!   │                               │
-//!   │--- ReqWorkConnMsg ----------->│
-//!   │                               │
-//!   │                        establish_work_connection()
-//!   │                               │
-//!   │                        连接工作端口 (server_port + 1000)
-//!   │                               │
-//!   │<---- NewWorkConnMsg ----------│
-//!   │                               │
-//!   │                               │
+//! 服务器                          客户端                          本地服务
+//!   │                               │                              │
+//!   │--- ReqWorkConnMsg ----------->│                              │
+//!   │                               │                              │
+//!   │                        establish_work_connection()            │
+//!   │                               │                              │
+//!   │                        连接工作端口 (server_port + 1000)       │
+//!   │                               │                              │
+//!   │<---- NewWorkConnMsg ----------│                              │
+//!   │--- StartWorkConnMsg --------->│                              │
+//!   │                               │ TcpStream::connect(local) -->│
+//!   │                               │ 可选: PROXY header --------->│
+//!   │<------ bridge_streams ------->│<---- bridge_streams -------->│
 //! ```
 //!
 //! ## 安全性
@@ -64,6 +66,7 @@
 //! - HMAC 签名验证
 //! - Token 认证
 //! - 连接重试机制
+//! - PROXY Protocol 支持（可选，透传真实访问者 IP）
 //!
 //! ## 配置示例
 //!
@@ -811,22 +814,37 @@ async fn establish_work_connection(
 
     // 等待 StartWorkConn 响应
     let resp = rust_frp_core::read_message(&mut work_conn).await?;
-    match resp {
+    let (src_addr, src_port) = match resp {
         Message::StartWorkConn(start_msg) => {
             if !start_msg.error.is_empty() {
                 return Err(format!("Server error: {}", start_msg.error).into());
             }
             log::info!("Work conn established for proxy: {}", proxy_name);
+            (start_msg.src_addr, start_msg.src_port)
         }
         _ => {
             return Err("Unexpected response from server".into());
         }
-    }
+    };
 
     // 连接到本地服务
     let local_addr = format!("{}:{}", proxy_config.local_ip, proxy_config.local_port);
-    let local_conn = tokio::net::TcpStream::connect(&local_addr).await?;
+    let mut local_conn = tokio::net::TcpStream::connect(&local_addr).await?;
     log::info!("Connected to local service: {}", local_addr);
+
+    // 如果启用了 PROXY protocol，先写入 header 再桥接
+    let proxy_protocol_enabled = proxy_config.proxy_protocol.unwrap_or(false);
+    if proxy_protocol_enabled && src_port > 0 {
+        let header = format!(
+            "PROXY TCP4 {} {} {} {}\r\n",
+            src_addr,
+            proxy_config.local_ip,
+            src_port,
+            proxy_config.local_port,
+        );
+        log::info!("Writing PROXY protocol header for {}: {}", proxy_name, header.trim());
+        tokio::io::AsyncWriteExt::write_all(&mut local_conn, header.as_bytes()).await?;
+    }
 
     // 双向桥接工作连接和本地连接
     rust_frp_util::bridge_streams(work_conn, local_conn).await?;

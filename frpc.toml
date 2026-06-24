@@ -89,6 +89,9 @@ type = "tcp"
 local_ip = "127.0.0.1"
 local_port = 22
 remote_port = 9302
+# 可选：启用 PROXY protocol，透传真实访问者 IP 给本地 nginx/haproxy
+# 本地服务需配合配置（如 nginx: listen 80 proxy_protocol;）
+# proxy_protocol = true
 
 # -------------------- UDP 代理 --------------------
 # 用于 UDP 服务（如 DNS、游戏服务器等）

@@ -13,6 +13,8 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **KCP 协议**：基于 UDP 的低延迟可靠传输协议，适合弱网和跨国场景
 - **TLS 加密**：使用 rustls 实现，默认使用内置自签名证书（无需额外配置即可使用），也支持自定义证书；控制连接和数据连接均默认启用加密；客户端支持跳过证书验证模式，方便使用自签名证书
 - **HMAC 签名验证**：工作连接使用 HMAC-SHA256 签名，防止连接伪造
+- **PROXY Protocol**：可选启用，透传真实访问者 IP 给本地 nginx/haproxy，方便日志记录和访问控制
+- **工作连接池模式**：与 frp 原版一致，per-proxy mpsc channel 池管理，取后自动补充 + 失败重试
 - **连接池**：内置连接池管理，支持空闲超时和生命周期控制
 - **重试机制**：客户端连接本地服务时使用指数退避重试
 - **端口白名单**：服务器默认拒绝未明确允许的端口，必须配置才能正常使用
@@ -41,6 +43,8 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
+| PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP |
+| 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
 ---
 
@@ -49,12 +53,13 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 ```
 rust_frp/
 ├── rust_frp_core/          # 核心协议：消息类型、连接封装、Wire 协议
-├── rust_frp_server/        # 服务端：控制连接管理、代理转发、vhost 路由
-├── rust_frp_client/        # 客户端：工作连接建立、本地服务桥接
+├── rust_frp_server/        # 服务端：控制连接管理、池模式工作连接、代理转发、vhost 路由
+├── rust_frp_client/        # 客户端：工作连接建立、PROXY protocol、本地服务桥接
 ├── rust_frp_config/        # 配置：TOML/YAML/JSON 解析、验证、环境变量
 ├── rust_frp_net/           # 网络：TCP/TLS/WebSocket、连接池 (rustls)
 ├── rust_frp_auth/          # 认证：Token 认证、HMAC 签名、OIDC 认证
 ├── rust_frp_util/          # 工具：流桥接、重试、时间戳、随机 ID、令牌桶限速
+├── rust_frp_plugin/        # 插件：HTTP/SOCKS5/TLS/StaticFile/UnixSocket 插件
 ├── frps.toml               # 服务器配置示例
 ├── frpc.toml               # 客户端配置示例
 └── target/                 # 编译产物目录
@@ -527,6 +532,10 @@ type = "tcp"
 local_ip = "127.0.0.1"
 local_port = 22
 remote_port = 9302
+
+# 可选：启用 PROXY protocol 透传真实访问者 IP
+# 本地 nginx 需配合配置：listen 80 proxy_protocol;
+# proxy_protocol = true
 ```
 
 ### UDP 代理
@@ -827,6 +836,62 @@ TokenBucket（令牌桶算法）              ← 控制读写速率
 
 **限速位置**：客户端的服务器→本地（server_to_local）和本地→服务器（local_to_server）两个方向均受限速控制。优先级：代理级 `bandwidth_limit` > 全局 `bandwidth_limit`。
 
+### PROXY Protocol
+
+可选功能，通过 `proxy_protocol = true` 启用。在客户端连接本地服务前，写入 PROXY protocol v1 header，让 nginx/haproxy 获取真实访问者 IP 而非 `127.0.0.1`。
+
+**数据流**：
+
+```text
+访客(1.2.3.4:54321) → frps(公网) → frpc → PROXY TCP4 1.2.3.4 127.0.0.1 54321 8080\r\n → nginx → flask
+                                                                                               ↑
+                                                                                    拿到真实IP 1.2.3.4
+```
+
+**涉及修改**：
+
+- `rust_frp_config` — `proxy_protocol: Option<bool>` 配置字段
+- `rust_frp_core` — `StartWorkConnMsg` 新增 `src_addr/src_port/dst_addr/dst_port`
+- `rust_frp_server` — `get_work_conn` 传递访问者地址填入 StartWorkConn
+- `rust_frp_client` — `establish_work_connection` 检测配置，按需写入 PROXY header
+
+**nginx 配合配置**：
+
+```nginx
+server {
+    listen 80 proxy_protocol;
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+}
+```
+
+**注意**：启用后本地服务必须支持 PROXY protocol（nginx 的 `proxy_protocol`、haproxy 的 `send-proxy`），否则会解析失败。
+
+### 工作连接池模式
+
+与 frp 原版 Go 实现对齐，服务端使用 per-proxy 有界 mpsc channel 管理工作连接。
+
+**核心设计**：
+
+```text
+process_work_conn          get_work_conn (访客到达时)
+      │                              │
+      │ try_send(conn)               │ try_recv() — 池中有 → 直接取用
+      ├── 池满 → 丢弃               │ pool empty → 发 ReqWorkConn → 阻塞等 recv()
+      │                              │
+      ▼                              ▼
+   [pool channel: capacity=pool_count] → 取用后立即补充 ReqWorkConn
+                                         → StartWorkConn 失败 → 重试 pool_size+1 次
+```
+
+**与 Go 原版对齐**：
+- ✅ 有界 channel，满则丢弃
+- ✅ 取后立即补充
+- ✅ StartWorkConn 失败重试 `pool_size+1` 次
+- ✅ StartWorkConn 在取用时发送（非 process 时）
+
+**差异**：Rust 版池粒度为 per-proxy（隔离性更好），Go 版为 per-Control（整客户端共用）。
+
 ---
 
 ## 安全建议
@@ -855,8 +920,8 @@ TokenBucket（令牌桶算法）              ← 控制读写速率
 
 ---
 
-**文档版本**：v2.0
-**更新日期**：2026-05-23
+**文档版本**：v2.1
+**更新日期**：2026-06-24
 
 ---
 
