@@ -46,6 +46,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::{SocketAddr, ToSocketAddrs};
+use tokio::io::AsyncWriteExt;
 
 /// 工具模块错误类型
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +102,9 @@ pub async fn bridge_connections(
         r = s_to_c => { r.map(|_| ())?; }
         r = c_to_s => { r.map(|_| ())?; }
     }
+
+    let _ = w1.shutdown().await;
+    let _ = w2.shutdown().await;
 
     Ok(())
 }
@@ -167,13 +171,19 @@ where
     S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // 使用 tokio::io::copy_bidirectional，它会在两个方向上同时复制数据
-    // 并且不会在一个方向完成时取消另一个方向的复制，防止数据丢失
-    let (n1, n2) = tokio::io::copy_bidirectional(&mut stream1, &mut stream2).await?;
+    let result = tokio::io::copy_bidirectional(&mut stream1, &mut stream2).await;
     
-    log::debug!("Bridge complete: stream1->stream2: {} bytes, stream2->stream1: {} bytes", n1, n2);
-    log::info!("Bridge streams closed");
-    Ok(())
+    let _ = stream1.shutdown().await;
+    let _ = stream2.shutdown().await;
+    
+    match result {
+        Ok((n1, n2)) => {
+            log::debug!("Bridge complete: stream1->stream2: {} bytes, stream2->stream1: {} bytes", n1, n2);
+            log::info!("Bridge streams closed");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 // 导出重试模块
