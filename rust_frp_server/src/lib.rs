@@ -233,21 +233,24 @@ impl ServerWorkConnManager {
     }
 
     /// 注册工作连接到池中（由 process_work_conn 调用）
-    /// 如果池已满，连接将被丢弃（背压保护）
-    pub async fn register_work_conn(&self, proxy_name: &str, conn: tokio::net::TcpStream) {
+    /// 如果池已满，连接将被丢弃并关闭（背压保护）
+    pub async fn register_work_conn(&self, proxy_name: &str, mut conn: tokio::net::TcpStream) {
         let pools = self.pools.read().await;
         if let Some(pool) = pools.get(proxy_name) {
             match pool.tx.try_send(conn) {
                 Ok(_) => log::debug!("Work conn registered in pool for {}", proxy_name),
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    log::warn!("Work conn pool full for {}, discarding", proxy_name);
+                Err(mpsc::error::TrySendError::Full(mut conn)) => {
+                    log::warn!("Work conn pool full for {}, discarding and closing", proxy_name);
+                    let _ = conn.shutdown().await;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    log::debug!("Work conn pool closed for {}", proxy_name);
+                Err(mpsc::error::TrySendError::Closed(mut conn)) => {
+                    log::debug!("Work conn pool closed for {}, closing connection", proxy_name);
+                    let _ = conn.shutdown().await;
                 }
             }
         } else {
-            log::warn!("No pool initialized for proxy: {}, discarding work conn", proxy_name);
+            log::warn!("No pool initialized for proxy: {}, discarding and closing work conn", proxy_name);
+            let _ = conn.shutdown().await;
         }
     }
 
