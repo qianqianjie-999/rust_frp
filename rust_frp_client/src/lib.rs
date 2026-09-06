@@ -536,20 +536,22 @@ impl ClientControl {
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut msg_count = 0u32;
-        let _ping_interval: u32 = 10; // 每 10 个消息周期发送一次 ping
+        // 心跳 10 秒一次（配合 Nginx proxy_read_timeout 300s 绰绰有余；
+        // 断线时最多 20 秒就能发现：10s 没收到 pong → 触发下一次 ping → 发现写失败）
+        let heartbeat_interval_secs: u64 = 10;
         let mut last_ping_time = std::time::Instant::now();
         
         log::debug!("ClientControl::run started, waiting for messages...");
 
         loop {
-            // 定期发送 ping 消息（每 30 秒发送一次）
-            if last_ping_time.elapsed() > std::time::Duration::from_secs(30) {
+            // 定期发送 ping 消息
+            if last_ping_time.elapsed() > std::time::Duration::from_secs(heartbeat_interval_secs) {
                 let ping_msg = rust_frp_core::PingMsg {
                     timestamp: get_timestamp(),
                 };
                 log::debug!("Sending ping message, count: {}", msg_count);
                 if let Err(e) = self.conn.write_message(&Message::Ping(ping_msg)).await {
-                    log::error!("Failed to send ping: {:?}", e);
+                    log::error!("Failed to send ping (connection lost): {:?}", e);
                     break;
                 }
                 last_ping_time = std::time::Instant::now();
@@ -1277,9 +1279,9 @@ impl Client {
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-        // 重连配置
-        let mut reconnect_delay_secs = 1u64;
-        let max_reconnect_delay = 60u64;
+        // 重连配置（指数退避但起步要快，隧道断了尽快恢复）
+        let mut reconnect_delay_secs = 0u64;
+        let max_reconnect_delay = 30u64;
 
         log::info!("Client started, entering main loop with auto-reconnect...");
 
