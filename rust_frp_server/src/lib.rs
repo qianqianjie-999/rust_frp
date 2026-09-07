@@ -125,7 +125,7 @@ use rust_frp_core::{
     XtcpHolePunchMsg, XtcpNatInfoMsg,
 };
 use rust_frp_net::{
-    ConnManager, KcpConn, KcpListener, TcpListener, TlsConfig, UdpListener, WebSocketConn,
+    AnyConn, ConnManager, KcpConn, KcpListener, TcpListener, TlsConfig, UdpListener, WebSocketConn,
 };
 use rust_frp_util::get_timestamp;
 use std::net::SocketAddr;
@@ -220,8 +220,8 @@ pub struct ServerWorkConnManager {
 
 /// 单个代理的工作连接池
 struct WorkConnPool {
-    tx: mpsc::Sender<tokio::net::TcpStream>,
-    rx: tokio::sync::Mutex<mpsc::Receiver<tokio::net::TcpStream>>,
+    tx: mpsc::Sender<AnyConn>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<AnyConn>>,
 }
 
 impl Default for ServerWorkConnManager {
@@ -240,7 +240,7 @@ impl ServerWorkConnManager {
 
     /// 为代理初始化工作连接池
     pub async fn init_pool(&self, proxy_name: &str) {
-        let (tx, rx) = mpsc::channel::<tokio::net::TcpStream>(self.pool_size);
+        let (tx, rx) = mpsc::channel::<AnyConn>(self.pool_size);
         let pool = Arc::new(WorkConnPool {
             tx,
             rx: tokio::sync::Mutex::new(rx),
@@ -256,7 +256,7 @@ impl ServerWorkConnManager {
 
     /// 注册工作连接到池中（由 process_work_conn 调用）
     /// 如果池已满，连接将被丢弃并关闭（背压保护）
-    pub async fn register_work_conn(&self, proxy_name: &str, mut conn: tokio::net::TcpStream) {
+    pub async fn register_work_conn(&self, proxy_name: &str, mut conn: AnyConn) {
         global_metrics().incr_work_conn_total();
         let pools = self.pools.read().await;
         if let Some(pool) = pools.get(proxy_name) {
@@ -295,7 +295,7 @@ impl ServerWorkConnManager {
         msg_tx: &tokio::sync::mpsc::Sender<Message>,
         timeout: Duration,
         visitor_addr: std::net::SocketAddr,
-    ) -> Result<tokio::net::TcpStream, String> {
+    ) -> Result<AnyConn, String> {
         // 获取代理的池（克隆 Arc，避免生命周期问题）
         let pool: Arc<WorkConnPool> = {
             let pools = self.pools.read().await;
@@ -901,6 +901,8 @@ pub struct Control {
     work_conn_manager: Arc<ServerWorkConnManager>,
     /// 工作连接池大小（来自客户端 LoginMsg）
     pool_count: u32,
+    /// 工作连接是否启用 TLS（通过 LoginRespMsg 协商给客户端）
+    work_conn_tls: bool,
 }
 
 impl Control {
@@ -920,6 +922,7 @@ impl Control {
         msg_tx: Option<mpsc::Sender<Message>>,
         stcp_bridge_manager: Arc<StcpBridgeManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
+        work_conn_tls: bool,
     ) -> Self {
         Self {
             conn,
@@ -939,6 +942,7 @@ impl Control {
             stcp_bridge_manager,
             work_conn_manager,
             pool_count: 0, // 将在收到 LoginMsg 后由 run() 设置
+            work_conn_tls,
         }
     }
 
@@ -1022,11 +1026,12 @@ impl Control {
                             )
                             .await;
 
-                        // 发送登录响应
+                        // 发送登录响应（work_conn_tls 协商：服务器启用 TLS 时工作连接同步启用）
                         let resp = rust_frp_core::LoginRespMsg {
                             version: "0.1.0".to_string(),
                             run_id: self.run_id.clone(),
                             error: "".to_string(),
+                            work_conn_tls: self.work_conn_tls,
                         };
                         let write_result = self.write_msg(&Message::LoginResp(resp)).await;
                         if let Err(e) = write_result {
@@ -1444,8 +1449,8 @@ impl ControlManager {
 
 /// STCP 桥接状态，用于等待两个客户端的工连接并桥接
 struct StcpBridgeState {
-    conn1: Option<tokio::net::TcpStream>,
-    conn2: Option<tokio::net::TcpStream>,
+    conn1: Option<AnyConn>,
+    conn2: Option<AnyConn>,
 }
 
 /// STCP 桥接管理器，用于协调两个客户端的工作连接
@@ -1484,8 +1489,8 @@ impl StcpBridgeManager {
     pub async fn add_conn_and_try_bridge(
         &self,
         bridge_id: &str,
-        conn: tokio::net::TcpStream,
-    ) -> Result<Option<(tokio::net::TcpStream, tokio::net::TcpStream)>, tokio::net::TcpStream> {
+        conn: AnyConn,
+    ) -> Result<Option<(AnyConn, AnyConn)>, AnyConn> {
         let mut bridges = self.bridges.write().await;
         if let Some(state) = bridges.get_mut(bridge_id) {
             if state.conn1.is_none() {
@@ -1580,6 +1585,44 @@ fn port_allowed(port: u16, ranges: &[rust_frp_config::PortRange]) -> bool {
         }
     }
     false
+}
+
+/// 工作连接首字节分类结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkConnClass {
+    /// 客户端发起 TLS 握手（首字节 0x16）且服务器已配置 TLS
+    Tls,
+    /// 明文协议（兼容旧客户端）
+    Plain,
+    /// 拒绝连接
+    Reject,
+}
+
+/// 根据首字节判定工作连接处理方式
+///
+/// - `first_byte == 0x16`：TLS ClientHello，服务器配置了 TLS 则走 TLS，
+///   未配置则无法完成握手只能拒绝
+/// - 其他字节：明文协议；tls_only 模式下拒绝（防止降级）
+pub fn classify_work_conn(first_byte: u8, tls_available: bool, tls_only: bool) -> WorkConnClass {
+    match (first_byte == 0x16, tls_available, tls_only) {
+        (true, true, _) => WorkConnClass::Tls,
+        (true, false, _) => WorkConnClass::Reject,
+        (false, _, true) => WorkConnClass::Reject,
+        (false, _, false) => WorkConnClass::Plain,
+    }
+}
+
+/// 工作连接错误日志（对端断开类错误降级为 debug，避免日志噪音）
+fn log_work_conn_error(e: &Box<dyn std::error::Error + Send + Sync>) {
+    let msg = e.to_string().to_lowercase();
+    if msg.contains("connection reset")
+        || msg.contains("connection aborted")
+        || msg.contains("broken pipe")
+    {
+        log::debug!("Work connection closed (peer disconnected): {:?}", e);
+    } else {
+        log::error!("Failed to process work connection: {:?}", e);
+    }
 }
 
 impl ServerProxyManager {
@@ -2155,10 +2198,10 @@ impl ServerProxyManager {
             }
             counts.insert(user.to_string(), current + ports_used);
             drop(counts);
-            self.proxy_user_ports.write().await.insert(
-                config.name.clone(),
-                (user.to_string(), ports_used),
-            );
+            self.proxy_user_ports
+                .write()
+                .await
+                .insert(config.name.clone(), (user.to_string(), ports_used));
         }
 
         // 3. 先写入 map 声明代理名，启动失败则回滚
@@ -2172,7 +2215,11 @@ impl ServerProxyManager {
             if quota_tracked {
                 self.release_user_quota(&config.name).await;
             }
-            log::error!("failed to start proxy [{}], rolled back: {:?}", config.name, e);
+            log::error!(
+                "failed to start proxy [{}], rolled back: {:?}",
+                config.name,
+                e
+            );
             return Err(e);
         }
         Ok(())
@@ -2750,6 +2797,14 @@ impl Server {
         let stcp_bridge_manager = Arc::new(StcpBridgeManager::new());
         let xtcp_visitors = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
+        // tls_only 前置校验：强制 TLS 必须先启用 TLS
+        if config.transport.tls_only && conn_manager.get_tls_config().is_none() {
+            return Err(
+                "tls_only requires transport.tls.enable = true (with cert/key or builtin cert)"
+                    .into(),
+            );
+        }
+
         let mut web_server = None;
         if config.web_server.port > 0 {
             web_server = Some(WebServer::new(&config.web_server)?);
@@ -2857,6 +2912,10 @@ impl Server {
         log::info!("Work connection listener started on {}", work_conn_addr);
 
         // 启动工作连接处理任务
+        // TLS 协商：服务器启用 TLS 时工作连接监听器同步支持 TLS（嗅探 0x16 首字节），
+        // tls_only 时拒绝一切明文工作连接
+        let work_conn_tls_config = self.conn_manager.get_tls_config().cloned();
+        let work_conn_tls_only = self.config.transport.tls_only;
         let control_manager = self.control_manager.clone();
         let work_conn_manager = self.work_conn_manager.clone();
         let auth_manager = self.auth_manager.clone();
@@ -2868,6 +2927,8 @@ impl Server {
                 work_conn_manager,
                 auth_manager,
                 stcp_bridge_manager_work,
+                work_conn_tls_config,
+                work_conn_tls_only,
             )
             .await;
         });
@@ -2878,7 +2939,12 @@ impl Server {
         log::info!("Starting connection handlers...");
 
         // 启动 KCP 连接处理器（如果启用了 KCP）
+        // tls_only 下拒绝启动 KCP：KCP 为明文 UDP，无法满足强制 TLS 要求
         if let Some(ref _udp_listener) = self.udp_listener {
+            if self.config.transport.tls_only {
+                log::error!("tls_only is enabled, refusing to start KCP listener (plaintext UDP)");
+                return Err("tls_only is enabled but KCP is plaintext UDP; disable kcp_bind_port or tls_only".into());
+            }
             log::info!("KCP connection handler enabled");
             let control_manager = self.control_manager.clone();
             let proxy_manager = self.proxy_manager.clone();
@@ -2889,6 +2955,7 @@ impl Server {
             let work_conn_manager = self.work_conn_manager.clone();
             let stcp_bridge_manager = self.stcp_bridge_manager.clone();
             let xtcp_visitors = self.xtcp_visitors.clone();
+            let kcp_work_conn_tls = self.conn_manager.get_tls_config().is_some();
             let kcp_listener = KcpListener::bind(
                 format!(
                     "{}:{}",
@@ -2919,7 +2986,16 @@ impl Server {
 
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_kcp_connection(
-                                    kcp_conn, cm, pm, vm, am, po, xv, wcm, sbm,
+                                    kcp_conn,
+                                    cm,
+                                    pm,
+                                    vm,
+                                    am,
+                                    po,
+                                    xv,
+                                    wcm,
+                                    sbm,
+                                    kcp_work_conn_tls,
                                 )
                                 .await
                                 {
@@ -2942,34 +3018,89 @@ impl Server {
         Ok(())
     }
 
-    /// 处理工作连接
+    /// 处理工作连接（支持 TLS/明文混跑 + tls_only 强制）
     async fn handle_work_connections(
         listener: tokio::net::TcpListener,
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
         auth_manager: Arc<AuthManager>,
         stcp_bridge_manager: Arc<StcpBridgeManager>,
+        tls_config: Option<TlsConfig>,
+        tls_only: bool,
     ) {
-        log::info!("Work connection handler started");
+        log::info!(
+            "Work connection handler started (tls: {}, tls_only: {})",
+            tls_config.is_some(),
+            tls_only
+        );
 
         loop {
             match listener.accept().await {
-                Ok((conn, addr)) => {
-                    log::info!("New work connection from: {:?}", addr);
-
+                Ok((mut conn, addr)) => {
                     let cm = control_manager.clone();
                     let wcm = work_conn_manager.clone();
                     let am = auth_manager.clone();
                     let sbm = stcp_bridge_manager.clone();
+                    let tls_config = tls_config.clone();
+
                     tokio::spawn(async move {
-                        if let Err(e) = Self::process_work_conn(conn, cm, wcm, am, sbm).await {
-                            if e.to_string().to_lowercase().contains("connection reset")
-                                || e.to_string().to_lowercase().contains("connection aborted")
-                                || e.to_string().to_lowercase().contains("broken pipe")
-                            {
-                                log::debug!("Work connection closed (peer disconnected): {:?}", e);
-                            } else {
-                                log::error!("Failed to process work connection: {:?}", e);
+                        // 嗅探首字节：0x16 = TLS ClientHello，其余视为明文协议
+                        let mut first_byte = [0u8; 1];
+                        let n = match conn.peek(&mut first_byte).await {
+                            Ok(n) => n,
+                            Err(e) => {
+                                log::debug!("Work conn peek failed from {:?}: {}", addr, e);
+                                return;
+                            }
+                        };
+                        if n == 0 {
+                            log::debug!("Work conn from {:?} closed before sending data", addr);
+                            return;
+                        }
+
+                        match classify_work_conn(first_byte[0], tls_config.is_some(), tls_only) {
+                            WorkConnClass::Tls => {
+                                let tls_config = match tls_config {
+                                    Some(c) => c,
+                                    None => unreachable!(),
+                                };
+                                log::info!("New TLS work connection from: {:?}", addr);
+                                match tls_config.accept(conn).await {
+                                    Ok(tls_stream) => {
+                                        if let Err(e) = Self::process_work_conn(
+                                            Box::new(tls_stream),
+                                            cm,
+                                            wcm,
+                                            am,
+                                            sbm,
+                                        )
+                                        .await
+                                        {
+                                            log_work_conn_error(&e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        global_metrics().incr_tls_rejects();
+                                        log::warn!("TLS accept failed for work conn: {}", e);
+                                    }
+                                }
+                            }
+                            WorkConnClass::Plain => {
+                                log::info!("New work connection from: {:?}", addr);
+                                if let Err(e) =
+                                    Self::process_work_conn(Box::new(conn), cm, wcm, am, sbm).await
+                                {
+                                    log_work_conn_error(&e);
+                                }
+                            }
+                            WorkConnClass::Reject => {
+                                global_metrics().incr_tls_rejects();
+                                log::warn!(
+                                    "Rejected work connection from {:?} (tls_only = {})",
+                                    addr,
+                                    tls_only
+                                );
+                                let _ = conn.shutdown().await;
                             }
                         }
                     });
@@ -2986,7 +3117,7 @@ impl Server {
 
     /// 处理单个工作连接
     async fn process_work_conn(
-        mut conn: tokio::net::TcpStream,
+        mut conn: AnyConn,
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
         auth_manager: Arc<AuthManager>,
@@ -3601,6 +3732,8 @@ impl Server {
         work_conn_manager: Arc<ServerWorkConnManager>,
         stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 工作连接 TLS 协商标志：与控制连接共用同一 TLS 配置
+        let work_conn_tls = tls_config.is_some();
         let conn = if let Some(tls_config) = tls_config {
             // 处理 TLS 连接
             let tls_stream = match tls_config.accept(conn).await {
@@ -3639,6 +3772,7 @@ impl Server {
             Some(msg_tx),
             stcp_bridge_manager.clone(),
             work_conn_manager.clone(),
+            work_conn_tls,
         );
 
         let cm = control_manager.clone();
@@ -3688,6 +3822,7 @@ impl Server {
         xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
         work_conn_manager: Arc<ServerWorkConnManager>,
         stcp_bridge_manager: Arc<StcpBridgeManager>,
+        work_conn_tls: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = ControlConn::new(Box::new(kcp_conn));
 
@@ -3709,6 +3844,7 @@ impl Server {
             Some(msg_tx),
             stcp_bridge_manager.clone(),
             work_conn_manager.clone(),
+            work_conn_tls,
         );
 
         let cm = control_manager.clone();

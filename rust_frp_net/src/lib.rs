@@ -69,6 +69,12 @@ pub trait FrpConn: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {
     fn remote_addr(&self) -> Option<SocketAddr>;
 }
 
+/// 类型擦除的连接（TCP/TLS/KCP/WebSocket 统一类型）
+///
+/// `Box<dyn FrpConn>` 自动满足 AsyncRead + AsyncWrite + Unpin + Send，
+/// 可直接用于消息读写与 bridge_streams 桥接。
+pub type AnyConn = Box<dyn FrpConn>;
+
 /// 实现 TokioTcpStream 的 FrpConn trait
 impl FrpConn for TokioTcpStream {
     fn remote_addr(&self) -> Option<SocketAddr> {

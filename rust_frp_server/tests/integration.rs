@@ -174,45 +174,73 @@ fn tcp_proxy(name: &str, port: u16) -> rust_frp_config::ProxyConfig {
 #[tokio::test]
 async fn test_max_ports_per_user_quota() {
     let ports: Vec<u16> = (0..4).map(|_| free_port()).collect();
-    let allow: Vec<PortRange> = ports.iter().map(|&p| PortRange { single: Some(p), start: None, end: None }).collect();
+    let allow: Vec<PortRange> = ports
+        .iter()
+        .map(|&p| PortRange {
+            single: Some(p),
+            start: None,
+            end: None,
+        })
+        .collect();
     let mgr = build_manager(Some(2), allow);
 
     use rust_frp_core::ProxyManager as _;
 
     // 前两个 TCP 代理成功
-    mgr.add_proxy_for_user(tcp_proxy("a1", ports[0]), "alice").await.unwrap();
-    mgr.add_proxy_for_user(tcp_proxy("a2", ports[1]), "alice").await.unwrap();
+    mgr.add_proxy_for_user(tcp_proxy("a1", ports[0]), "alice")
+        .await
+        .unwrap();
+    mgr.add_proxy_for_user(tcp_proxy("a2", ports[1]), "alice")
+        .await
+        .unwrap();
 
     // 第三个超出配额被拒绝
-    let err = mgr.add_proxy_for_user(tcp_proxy("a3", ports[2]), "alice").await;
+    let err = mgr
+        .add_proxy_for_user(tcp_proxy("a3", ports[2]), "alice")
+        .await;
     assert!(err.is_err());
     assert!(format!("{:?}", err.unwrap_err()).contains("max_ports_per_user"));
 
     // 配额按用户隔离：bob 不受 alice 占用影响
-    mgr.add_proxy_for_user(tcp_proxy("b1", ports[2]), "bob").await.unwrap();
+    mgr.add_proxy_for_user(tcp_proxy("b1", ports[2]), "bob")
+        .await
+        .unwrap();
 
     // 移除后配额释放，可再次添加
     mgr.remove_proxy("a1").await.unwrap();
-    mgr.add_proxy_for_user(tcp_proxy("a4", ports[3]), "alice").await.unwrap();
+    mgr.add_proxy_for_user(tcp_proxy("a4", ports[3]), "alice")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn test_add_proxy_failure_no_residual() {
     let ok_port = free_port();
     let bad_port = free_port(); // 不在 allow_ports 中
-    let mgr = build_manager(Some(1), vec![PortRange { single: Some(ok_port), start: None, end: None }]);
+    let mgr = build_manager(
+        Some(1),
+        vec![PortRange {
+            single: Some(ok_port),
+            start: None,
+            end: None,
+        }],
+    );
 
     use rust_frp_core::ProxyManager as _;
 
     // 端口不在白名单 → 启动失败
-    let err = mgr.add_proxy_for_user(tcp_proxy("bad", bad_port), "alice").await;
+    let err = mgr
+        .add_proxy_for_user(tcp_proxy("bad", bad_port), "alice")
+        .await;
     assert!(err.is_err());
 
     // 修复点：失败后 proxies map 不应残留
     assert!(mgr.get_proxy_status("bad").await.unwrap().is_none());
 
     // 修复点：配额预占同时回滚，limit=1 下仍可注册一个代理
-    mgr.add_proxy_for_user(tcp_proxy("good", ok_port), "alice").await.unwrap();
+    mgr.add_proxy_for_user(tcp_proxy("good", ok_port), "alice")
+        .await
+        .unwrap();
     assert_eq!(
         mgr.get_proxy_status("good").await.unwrap().as_deref(),
         Some("running")
@@ -222,7 +250,14 @@ async fn test_add_proxy_failure_no_residual() {
 #[tokio::test]
 async fn test_add_proxy_duplicate_name_rejected() {
     let port = free_port();
-    let mgr = build_manager(None, vec![PortRange { single: Some(port), start: None, end: None }]);
+    let mgr = build_manager(
+        None,
+        vec![PortRange {
+            single: Some(port),
+            start: None,
+            end: None,
+        }],
+    );
 
     use rust_frp_core::ProxyManager as _;
 
@@ -236,12 +271,21 @@ async fn test_add_proxy_duplicate_name_rejected() {
 #[tokio::test]
 async fn test_http_proxy_not_counted_in_quota() {
     let port = free_port();
-    let mgr = build_manager(Some(1), vec![PortRange { single: Some(port), start: None, end: None }]);
+    let mgr = build_manager(
+        Some(1),
+        vec![PortRange {
+            single: Some(port),
+            start: None,
+            end: None,
+        }],
+    );
 
     use rust_frp_core::ProxyManager as _;
 
     // TCP 占 1 个配额
-    mgr.add_proxy_for_user(tcp_proxy("t1", port), "alice").await.unwrap();
+    mgr.add_proxy_for_user(tcp_proxy("t1", port), "alice")
+        .await
+        .unwrap();
 
     // HTTP 不占用端口配额，limit=1 下仍可注册
     let http = rust_frp_config::ProxyConfig {
@@ -253,4 +297,86 @@ async fn test_http_proxy_not_counted_in_quota() {
         ..Default::default()
     };
     mgr.add_proxy_for_user(http, "alice").await.unwrap();
+}
+
+// ============ P0-3 tls_only / 工作连接 TLS 协商 ============
+
+use rust_frp_server::{classify_work_conn, WorkConnClass};
+
+#[test]
+fn test_classify_work_conn_matrix() {
+    use WorkConnClass::*;
+
+    // TLS ClientHello（0x16）：服务器有 TLS 证书 → TLS 握手
+    assert_eq!(classify_work_conn(0x16, true, false), Tls);
+    assert_eq!(classify_work_conn(0x16, true, true), Tls);
+
+    // TLS ClientHello 但服务器未配置 TLS → 无法握手，拒绝
+    assert_eq!(classify_work_conn(0x16, false, false), Reject);
+    assert_eq!(classify_work_conn(0x16, false, true), Reject);
+
+    // 明文协议：tls_only 下拒绝（防降级），否则放行（兼容旧客户端）
+    assert_eq!(classify_work_conn(0x00, false, true), Reject);
+    assert_eq!(classify_work_conn(0x00, true, true), Reject);
+    assert_eq!(classify_work_conn(0x00, false, false), Plain);
+    assert_eq!(classify_work_conn(0x00, true, false), Plain);
+}
+
+#[test]
+fn test_login_resp_work_conn_tls_backward_compat() {
+    // 新版服务端：协商 work_conn_tls = true
+    let resp = rust_frp_core::LoginRespMsg {
+        version: "0.1.0".to_string(),
+        run_id: "rid".to_string(),
+        error: String::new(),
+        work_conn_tls: true,
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    assert!(json.contains("\"work_conn_tls\":true"));
+
+    // 旧版服务端 JSON 无 work_conn_tls 字段 → serde default = false（保持旧行为）
+    let legacy = r#"{"version":"0.1.0","run_id":"rid","error":""}"#;
+    let parsed: rust_frp_core::LoginRespMsg = serde_json::from_str(legacy).unwrap();
+    assert!(!parsed.work_conn_tls);
+}
+
+#[tokio::test]
+async fn test_tls_only_requires_tls_config_validation() {
+    // 默认配置 + token 认证补全（默认 token method 必须提供 token 才能通过 AuthManager）
+    fn base_cfg() -> rust_frp_config::ServerConfig {
+        let mut cfg = rust_frp_config::ServerConfig::default();
+        cfg.auth.token = Some("test-token".to_string());
+        cfg
+    }
+
+    // tls_only = true 但 tls 配置缺失 → Server::new 启动报错
+    let mut cfg = base_cfg();
+    cfg.transport.tls_only = true;
+    cfg.transport.tls = None;
+    let err = rust_frp_server::Server::new(cfg, None).await.err();
+    let msg = err.map(|e| e.to_string()).unwrap_or_default();
+    assert!(msg.contains("tls_only"), "unexpected error: {}", msg);
+
+    // tls_only = true 且 tls.enable = false → 同样报错
+    let mut cfg = base_cfg();
+    cfg.transport.tls_only = true;
+    cfg.transport.tls = Some(rust_frp_config::TlsConfig {
+        enable: false,
+        ..Default::default()
+    });
+    assert!(rust_frp_server::Server::new(cfg, None).await.is_err());
+
+    // tls_only = true 且 tls.enable = true → 使用内置证书，启动成功
+    let mut cfg = base_cfg();
+    cfg.transport.tls_only = true;
+    cfg.transport.tls = Some(rust_frp_config::TlsConfig {
+        enable: true,
+        ..Default::default()
+    });
+    assert!(rust_frp_server::Server::new(cfg, None).await.is_ok());
+
+    // tls_only = false 且无 TLS → 宽松模式，正常启动（兼容旧行为）
+    let mut cfg = base_cfg();
+    cfg.transport.tls = None;
+    assert!(rust_frp_server::Server::new(cfg, None).await.is_ok());
 }
