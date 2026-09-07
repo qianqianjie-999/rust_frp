@@ -1279,9 +1279,9 @@ impl Client {
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-        // 重连配置（指数退避但起步要快，隧道断了尽快恢复）
-        let mut reconnect_delay_secs = 0u64;
-        let max_reconnect_delay = 30u64;
+        // 重连配置：首次断线立即重连（0ms），失败后 1s 起步指数退避，封顶 30s
+        let mut reconnect_delay_ms: u64 = 0;
+        let max_reconnect_delay_ms: u64 = 30_000;
 
         log::info!("Client started, entering main loop with auto-reconnect...");
 
@@ -1294,6 +1294,9 @@ impl Client {
                         log::error!("Login failed: {}", e);
                         return;
                     }
+
+                    // 登录成功：重置退避，下次断线仍然立即重连
+                    reconnect_delay_ms = 0;
 
                     // 克隆代理配置到临时向量
                     let proxies = self.config.proxies.clone();
@@ -1375,12 +1378,25 @@ impl Client {
                 break;
             }
 
-            // 重连逻辑：指数退避
-            log::warn!("Connection lost, attempting to reconnect in {} seconds...", reconnect_delay_secs);
-            tokio::time::sleep(tokio::time::Duration::from_secs(reconnect_delay_secs)).await;
-            
-            // 增加延迟，但不超过最大值
-            reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay);
+            // 重连逻辑：首次立即重连，之后指数退避 + jitter
+            // jitter 与 frp 原版一致：在退避延迟上叠加 0~10% 随机量，
+            // 防止服务端恢复时所有客户端同时涌入（惊群）
+            let sleep_ms = if reconnect_delay_ms == 0 {
+                0
+            } else {
+                let jitter = (reconnect_delay_ms as f64 * rand::random::<f64>() * 0.1) as u64;
+                reconnect_delay_ms + jitter
+            };
+            log::warn!("Connection lost, attempting to reconnect in {} ms...", sleep_ms);
+            tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
+
+            // 下次延迟：首次(0)后从 1s 起步翻倍，封顶 30s
+            // （修复原实现 0*2=0 导致退避永不生效的问题）
+            reconnect_delay_ms = if reconnect_delay_ms == 0 {
+                1_000
+            } else {
+                (reconnect_delay_ms * 2).min(max_reconnect_delay_ms)
+            };
             
             // 重置代理管理器状态
             self.proxy_manager.clear().await;

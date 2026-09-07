@@ -970,6 +970,7 @@ dependencies = [
  "hostname",
  "log",
  "notify",
+ "rand",
  "ring 0.16.20",
  "rust_frp_auth",
  "rust_frp_config",
