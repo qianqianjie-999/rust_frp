@@ -44,8 +44,8 @@
 //! - 随机 ID 使用安全的随机数生成器
 //! - 连接桥接保证数据完整性
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
 /// 工具模块错误类型
@@ -69,19 +69,18 @@ pub fn get_timestamp() -> i64 {
 
 /// 解析地址字符串为 SocketAddr
 pub fn parse_addr(addr: &str) -> Result<SocketAddr, std::io::Error> {
-    addr.to_socket_addrs()?.next().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid address",
-        )
-    })
+    addr.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid address"))
 }
 
 /// 生成随机 ID
 pub fn rand_id(len: usize) -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
-    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".chars().collect();
+    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        .chars()
+        .collect();
     (0..len)
         .map(|_| chars[rng.gen_range(0..chars.len())])
         .collect()
@@ -160,7 +159,6 @@ mod tests {
     }
 }
 
-
 /// 桥接任意两个双向流，实现双向数据转发
 /// 支持 TcpStream、TLS stream 等任何实现 AsyncRead + AsyncWrite 的类型
 pub async fn bridge_streams<S1, S2>(
@@ -172,13 +170,17 @@ where
     S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let result = tokio::io::copy_bidirectional(&mut stream1, &mut stream2).await;
-    
+
     let _ = stream1.shutdown().await;
     let _ = stream2.shutdown().await;
-    
+
     match result {
         Ok((n1, n2)) => {
-            log::debug!("Bridge complete: stream1->stream2: {} bytes, stream2->stream1: {} bytes", n1, n2);
+            log::debug!(
+                "Bridge complete: stream1->stream2: {} bytes, stream2->stream1: {} bytes",
+                n1,
+                n2
+            );
             log::info!("Bridge streams closed");
             Ok(())
         }
@@ -195,5 +197,7 @@ pub mod retry;
 pub mod rate_limiter;
 
 // 重新导出常用类型
-pub use retry::{RetryConfig, RetryResult, retry, retry_with_default, ConnectionError, RetryableError};
-pub use rate_limiter::{TokenBucket, RateLimitedReader, RateLimitedWriter, parse_bandwidth_limit};
+pub use rate_limiter::{parse_bandwidth_limit, RateLimitedReader, RateLimitedWriter, TokenBucket};
+pub use retry::{
+    retry, retry_with_default, ConnectionError, RetryConfig, RetryResult, RetryableError,
+};

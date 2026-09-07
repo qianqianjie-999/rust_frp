@@ -26,9 +26,9 @@
 //! ### 访问者消息
 //! - `NewVisitorConn` / `NewVisitorConnResp` - 访问者连接（TCP 打孔）
 
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use rust_frp_net::FrpConn;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -1060,7 +1060,9 @@ mod tests {
 
     #[test]
     fn test_proxy_status_msg() {
-        let msg = ProxyStatusMsg { name: "web".to_string() };
+        let msg = ProxyStatusMsg {
+            name: "web".to_string(),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: ProxyStatusMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "web");

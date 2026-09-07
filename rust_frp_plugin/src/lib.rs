@@ -65,12 +65,11 @@
 //! ```
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use rust_frp_config::PluginConfig;
 use std::fs::File;
 use std::path::Path;
-
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UnixStream;
 
 /// Combined trait for AsyncRead + AsyncWrite
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
@@ -79,12 +78,18 @@ impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
 /// 插件接口
 #[async_trait]
 pub trait Plugin: Send + Sync {
-    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn handle(
+        &mut self,
+        conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// 插件工厂
 pub trait PluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>>;
+    fn create(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Unix 域套接字插件
@@ -109,7 +114,10 @@ impl UnixDomainSocketPlugin {
 
 #[async_trait]
 impl Plugin for UnixDomainSocketPlugin {
-    async fn handle(&mut self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle(
+        &mut self,
+        mut conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 连接到 Unix 域套接字
         let mut unix_conn = UnixStream::connect(&self.unix_path).await?;
 
@@ -146,7 +154,10 @@ impl StaticFilePlugin {
     }
 
     /// 处理 HTTP 请求
-    async fn handle_http_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle_http_request(
+        &self,
+        mut conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取 HTTP 请求
         let mut buf = [0; 1024];
         let n = conn.read(&mut buf).await?;
@@ -213,30 +224,37 @@ impl StaticFilePlugin {
     }
 
     /// 提供文件
-    async fn serve_file(&self, file_path: &str, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn serve_file(
+        &self,
+        file_path: &str,
+        mut conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let path = Path::new(file_path);
-        
+
         // 检查路径是否在允许目录内，防止路径遍历攻击
         let canonical_path = match path.canonicalize() {
             Ok(p) => p,
             Err(_) => {
-                let response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nFile not found";
+                let response =
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nFile not found";
                 conn.write_all(response.as_bytes()).await?;
                 return Ok(());
             }
         };
-        
+
         let base_path = Path::new(&self.local_path).canonicalize()?;
         if !canonical_path.starts_with(base_path) {
             // 检测到路径遍历攻击
-            let response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nAccess forbidden";
+            let response =
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\nAccess forbidden";
             conn.write_all(response.as_bytes()).await?;
             return Ok(());
         }
 
         // 检查文件是否存在
         if !canonical_path.exists() {
-            let response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nFile not found";
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nFile not found";
             conn.write_all(response.as_bytes()).await?;
             return Ok(());
         }
@@ -267,7 +285,10 @@ impl StaticFilePlugin {
 
 #[async_trait]
 impl Plugin for StaticFilePlugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle(
+        &mut self,
+        conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.handle_http_request(conn).await
     }
 }
@@ -288,7 +309,10 @@ impl HttpProxyPlugin {
     }
 
     /// 处理 HTTP 代理请求
-    async fn handle_http_proxy_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle_http_proxy_request(
+        &self,
+        mut conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取 HTTP 请求
         let mut buf = [0; 1024];
         let n = conn.read(&mut buf).await?;
@@ -331,7 +355,10 @@ impl HttpProxyPlugin {
 
 #[async_trait]
 impl Plugin for HttpProxyPlugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle(
+        &mut self,
+        conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.handle_http_proxy_request(conn).await
     }
 }
@@ -352,7 +379,10 @@ impl Socks5Plugin {
     }
 
     /// 处理 SOCKS5 代理请求
-    async fn handle_socks5_request(&self, mut conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle_socks5_request(
+        &self,
+        mut conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取 SOCKS5 握手请求
         let mut buf = [0; 256];
         let n = conn.read(&mut buf).await?;
@@ -380,7 +410,8 @@ impl Socks5Plugin {
 
         // 解析 SOCKS5 请求
         let cmd = buf[1];
-        if cmd != 0x01 { // CONNECT
+        if cmd != 0x01 {
+            // CONNECT
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "unsupported SOCKS5 command",
@@ -395,7 +426,8 @@ impl Socks5Plugin {
         let mut target_port = 0;
 
         match addr_type {
-            0x01 => { // IPv4
+            0x01 => {
+                // IPv4
                 if n < 10 {
                     return Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -405,7 +437,8 @@ impl Socks5Plugin {
                 target_addr = format!("{}.{}.{}.{}", buf[4], buf[5], buf[6], buf[7]);
                 target_port = ((buf[8] as u16) << 8) | (buf[9] as u16);
             }
-            0x03 => { // 域名
+            0x03 => {
+                // 域名
                 let len = buf[4] as usize;
                 if n < 5 + len + 2 {
                     return Err(Box::new(std::io::Error::new(
@@ -413,10 +446,11 @@ impl Socks5Plugin {
                         "invalid SOCKS5 domain address",
                     )));
                 }
-                target_addr = String::from_utf8_lossy(&buf[5..5+len]).to_string();
-                target_port = ((buf[5+len] as u16) << 8) | (buf[5+len+1] as u16);
+                target_addr = String::from_utf8_lossy(&buf[5..5 + len]).to_string();
+                target_port = ((buf[5 + len] as u16) << 8) | (buf[5 + len + 1] as u16);
             }
-            0x04 => { // IPv6
+            0x04 => {
+                // IPv6
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "IPv6 not supported",
@@ -454,7 +488,10 @@ impl Socks5Plugin {
 
 #[async_trait]
 impl Plugin for Socks5Plugin {
-    async fn handle(&mut self, conn: Box<dyn AsyncStream>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle(
+        &mut self,
+        conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.handle_socks5_request(conn).await
     }
 }
@@ -466,20 +503,31 @@ pub struct PluginManager {
 
 impl PluginManager {
     pub fn new() -> Self {
-        let mut factories: std::collections::HashMap<String, Box<dyn PluginFactory + Send + Sync>> = std::collections::HashMap::new();
+        let mut factories: std::collections::HashMap<String, Box<dyn PluginFactory + Send + Sync>> =
+            std::collections::HashMap::new();
 
         // 注册内置插件
-        factories.insert("unix_domain_socket".to_string(), Box::new(UnixDomainSocketPluginFactory {}));
-        factories.insert("static_file".to_string(), Box::new(StaticFilePluginFactory {}));
-        factories.insert("http_proxy".to_string(), Box::new(HttpProxyPluginFactory {}));
+        factories.insert(
+            "unix_domain_socket".to_string(),
+            Box::new(UnixDomainSocketPluginFactory {}),
+        );
+        factories.insert(
+            "static_file".to_string(),
+            Box::new(StaticFilePluginFactory {}),
+        );
+        factories.insert(
+            "http_proxy".to_string(),
+            Box::new(HttpProxyPluginFactory {}),
+        );
         factories.insert("socks5".to_string(), Box::new(Socks5PluginFactory {}));
 
-        Self {
-            factories,
-        }
+        Self { factories }
     }
 
-    pub fn create_plugin(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn create_plugin(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(factory) = self.factories.get(&config.r#type) {
             factory.create(config)
         } else {
@@ -509,7 +557,10 @@ impl Default for PluginManager {
 struct UnixDomainSocketPluginFactory {}
 
 impl PluginFactory for UnixDomainSocketPluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+    fn create(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(UnixDomainSocketPlugin::new(config)?))
     }
 }
@@ -518,7 +569,10 @@ impl PluginFactory for UnixDomainSocketPluginFactory {
 struct StaticFilePluginFactory {}
 
 impl PluginFactory for StaticFilePluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+    fn create(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(StaticFilePlugin::new(config)?))
     }
 }
@@ -527,7 +581,10 @@ impl PluginFactory for StaticFilePluginFactory {
 struct HttpProxyPluginFactory {}
 
 impl PluginFactory for HttpProxyPluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+    fn create(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(HttpProxyPlugin::new(config)?))
     }
 }
@@ -536,8 +593,10 @@ impl PluginFactory for HttpProxyPluginFactory {
 struct Socks5PluginFactory {}
 
 impl PluginFactory for Socks5PluginFactory {
-    fn create(&self, config: &PluginConfig) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+    fn create(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(Socks5Plugin::new(config)?))
     }
 }
-

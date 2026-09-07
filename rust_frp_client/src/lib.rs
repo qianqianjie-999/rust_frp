@@ -82,16 +82,19 @@
 //! remote_port = 6000
 //! ```
 
+use axum::{extract::State, routing::get, Json, Router};
+use rust_frp_auth::AuthManager;
+use rust_frp_config::ClientConfig;
+use rust_frp_core::{ControlConn, Message, NewWorkConnMsg, ProxyManager, VisitorManager};
+use rust_frp_net::{ConnManager, TlsConfig};
+use rust_frp_util::{
+    get_timestamp, rand_id,
+    retry::{retry, ConnectionError, RetryConfig},
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::io::AsyncWriteExt;
-use axum::{Router, routing::get, Json, extract::State};
-use rust_frp_config::ClientConfig;
-use rust_frp_core::{ControlConn, Message, ProxyManager, VisitorManager, NewWorkConnMsg};
-use rust_frp_net::{ConnManager, TlsConfig};
-use rust_frp_auth::AuthManager;
-use rust_frp_util::{get_timestamp, rand_id, retry::{RetryConfig, retry, ConnectionError}};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -105,7 +108,8 @@ pub enum ClientError {
     Other(String),
 }
 
-type WorkConnSenderMap = RwLock<std::collections::HashMap<String, mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>>;
+type WorkConnSenderMap =
+    RwLock<std::collections::HashMap<String, mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>>;
 
 /// 工作连接管理器
 pub struct WorkConnManager {
@@ -126,17 +130,29 @@ impl WorkConnManager {
         }
     }
 
-    pub async fn register_work_conn_handler(&self, proxy_name: String, sender: mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>) {
+    pub async fn register_work_conn_handler(
+        &self,
+        proxy_name: String,
+        sender: mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>,
+    ) {
         let mut senders = self.work_conn_senders.write().await;
         senders.insert(proxy_name, sender);
     }
 
-    pub async fn get_work_conn_sender(&self, proxy_name: &str) -> Option<mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>> {
+    pub async fn get_work_conn_sender(
+        &self,
+        proxy_name: &str,
+    ) -> Option<mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>> {
         let senders = self.work_conn_senders.read().await;
         senders.get(proxy_name).cloned()
     }
 
-    pub async fn handle_work_conn(&self, proxy_name: &str, server_conn: tokio::net::TcpStream, initial_data: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn handle_work_conn(
+        &self,
+        proxy_name: &str,
+        server_conn: tokio::net::TcpStream,
+        initial_data: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(sender) = self.get_work_conn_sender(proxy_name).await {
             sender.send((server_conn, initial_data)).await?;
             Ok(())
@@ -191,7 +207,10 @@ impl ClientProxyManager {
             .and_then(rust_frp_util::parse_bandwidth_limit);
 
         let handle = tokio::spawn(async move {
-            log::info!("Starting work connection handler for proxy: {}", proxy_name_clone);
+            log::info!(
+                "Starting work connection handler for proxy: {}",
+                proxy_name_clone
+            );
 
             while let Some((mut server_conn, initial_data)) = receiver.recv().await {
                 log::info!("Received work connection for proxy: {}", proxy_name_clone);
@@ -201,12 +220,15 @@ impl ClientProxyManager {
                     &retry_config,
                     &format!("connect to local service for proxy {}", proxy_name_clone),
                     || async {
-                        tokio::net::TcpStream::connect(&local_addr).await.map_err(|e| {
-                            log::warn!("Connection attempt failed: {:?}", e);
-                            ConnectionError::from(e)
-                        })
-                    }
-                ).await;
+                        tokio::net::TcpStream::connect(&local_addr)
+                            .await
+                            .map_err(|e| {
+                                log::warn!("Connection attempt failed: {:?}", e);
+                                ConnectionError::from(e)
+                            })
+                    },
+                )
+                .await;
 
                 match connect_result {
                     Ok(retry_result) => {
@@ -218,7 +240,7 @@ impl ClientProxyManager {
                             retry_result.attempts,
                             retry_result.total_delay
                         );
-                        
+
                         // 首先发送已读取的初始数据
                         if !initial_data.is_empty() {
                             if let Err(e) = local_conn.write_all(&initial_data).await {
@@ -226,7 +248,7 @@ impl ClientProxyManager {
                                 continue;
                             }
                         }
-                        
+
                         // 双向转发数据
                         if let Some(rate) = rate_bytes_per_sec {
                             let (server_read, server_write) = server_conn.split();
@@ -238,15 +260,33 @@ impl ClientProxyManager {
                                 rust_frp_util::RateLimitedWriter::new(server_write, rate);
 
                             let server_to_local = async {
-                                match tokio::io::copy(&mut rate_limited_server_read, &mut local_write).await {
-                                    Ok(n) => log::info!("Server to local: {} bytes transferred (rate: {}B/s)", n, rate),
+                                match tokio::io::copy(
+                                    &mut rate_limited_server_read,
+                                    &mut local_write,
+                                )
+                                .await
+                                {
+                                    Ok(n) => log::info!(
+                                        "Server to local: {} bytes transferred (rate: {}B/s)",
+                                        n,
+                                        rate
+                                    ),
                                     Err(e) => log::error!("Server to local error: {:?}", e),
                                 }
                             };
 
                             let local_to_server = async {
-                                match tokio::io::copy(&mut local_read, &mut rate_limited_server_write).await {
-                                    Ok(n) => log::info!("Local to server: {} bytes transferred (rate: {}B/s)", n, rate),
+                                match tokio::io::copy(
+                                    &mut local_read,
+                                    &mut rate_limited_server_write,
+                                )
+                                .await
+                                {
+                                    Ok(n) => log::info!(
+                                        "Local to server: {} bytes transferred (rate: {}B/s)",
+                                        n,
+                                        rate
+                                    ),
                                     Err(e) => log::error!("Local to server error: {:?}", e),
                                 }
                             };
@@ -254,15 +294,26 @@ impl ClientProxyManager {
                             futures_util::future::join(server_to_local, local_to_server).await;
                         } else {
                             match rust_frp_util::bridge_streams(server_conn, local_conn).await {
-                                Ok(_) => log::info!("Bidirectional bridge completed for proxy: {}", proxy_name_clone),
-                                Err(e) => log::error!("Bridge error for proxy {}: {:?}", proxy_name_clone, e),
+                                Ok(_) => log::info!(
+                                    "Bidirectional bridge completed for proxy: {}",
+                                    proxy_name_clone
+                                ),
+                                Err(e) => log::error!(
+                                    "Bridge error for proxy {}: {:?}",
+                                    proxy_name_clone,
+                                    e
+                                ),
                             }
                         }
-                        
+
                         log::info!("Work connection closed for proxy: {}", proxy_name_clone);
                     }
                     Err(e) => {
-                        log::error!("Failed to connect to local service at {:?} after retries: {:?}", local_addr, e);
+                        log::error!(
+                            "Failed to connect to local service at {:?} after retries: {:?}",
+                            local_addr,
+                            e
+                        );
                         // 发送 HTTP 错误响应
                         let error_response = format!(
                             "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\nFailed to connect to local service after retries: {}",
@@ -273,21 +324,32 @@ impl ClientProxyManager {
                     }
                 }
             }
-            
-            log::info!("Work connection handler stopped for proxy: {}", proxy_name_clone);
+
+            log::info!(
+                "Work connection handler stopped for proxy: {}",
+                proxy_name_clone
+            );
         });
-        
+
         let mut handlers = self.work_conn_handlers.write().await;
         handlers.insert(proxy_name, handle);
     }
 
-    pub async fn start_proxy(&self, config: &rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn start_proxy(
+        &self,
+        config: &rust_frp_config::ProxyConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match config.r#type.as_str() {
             "tcp" | "http" | "https" | "websocket" => {
-                let local_addr = format!("{}:{}", config.local_ip, config.local_port)
-                    .parse::<SocketAddr>()?;
-                log::info!("starting {} proxy: {} -> {}", config.r#type, config.name, local_addr);
-                
+                let local_addr =
+                    format!("{}:{}", config.local_ip, config.local_port).parse::<SocketAddr>()?;
+                log::info!(
+                    "starting {} proxy: {} -> {}",
+                    config.r#type,
+                    config.name,
+                    local_addr
+                );
+
                 // 为 TCP 代理创建工作连接通道
                 // 当服务器收到外部连接时，会通过这个通道通知客户端
                 let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
@@ -296,16 +358,19 @@ impl ClientProxyManager {
                     local_addr,
                     rx,
                     config.bandwidth_limit.clone(),
-                ).await;
-                
+                )
+                .await;
+
                 // 注册工作连接发送器到 WorkConnManager
                 if let Some(work_conn_manager) = &self.work_conn_manager {
-                    work_conn_manager.register_work_conn_handler(config.name.clone(), tx).await;
+                    work_conn_manager
+                        .register_work_conn_handler(config.name.clone(), tx)
+                        .await;
                 } else {
                     log::error!("WorkConnManager not set for proxy: {}", config.name);
                     return Err("WorkConnManager not set".into());
                 }
-                
+
                 Ok(())
             }
             _ => {
@@ -315,26 +380,32 @@ impl ClientProxyManager {
         }
     }
 
-    pub async fn stop_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn stop_proxy(
+        &self,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut listeners = self.listeners.write().await;
         if let Some(listener) = listeners.remove(name) {
             // TcpListener doesn't have a shutdown method, we'll just drop it
             drop(listener);
         }
-        
+
         // 停止工作连接处理器
         let mut handlers = self.work_conn_handlers.write().await;
         if let Some(handle) = handlers.remove(name) {
             handle.abort();
         }
-        
+
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl ProxyManager for ClientProxyManager {
-    async fn add_proxy(&self, config: rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn add_proxy(
+        &self,
+        config: rust_frp_config::ProxyConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut proxies = self.proxies.write().await;
         proxies.insert(config.name.clone(), config.clone());
         drop(proxies);
@@ -342,14 +413,20 @@ impl ProxyManager for ClientProxyManager {
         Ok(())
     }
 
-    async fn remove_proxy(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn remove_proxy(
+        &self,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.stop_proxy(name).await?;
         let mut proxies = self.proxies.write().await;
         proxies.remove(name);
         Ok(())
     }
 
-    async fn get_proxy_status(&self, name: &str) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_proxy_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
         let proxies = self.proxies.read().await;
         if proxies.contains_key(name) {
             Ok(Some("running".to_string()))
@@ -382,7 +459,7 @@ impl ProxyManager for ClientProxyManager {
         listeners.clear();
         let mut work_conn_handlers = self.work_conn_handlers.write().await;
         work_conn_handlers.clear();
-        
+
         log::info!("Proxy manager cleared");
     }
 }
@@ -408,13 +485,19 @@ impl ClientVisitorManager {
 
 #[async_trait::async_trait]
 impl VisitorManager for ClientVisitorManager {
-    async fn add_visitor(&self, config: rust_frp_config::VisitorConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn add_visitor(
+        &self,
+        config: rust_frp_config::VisitorConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut visitors = self.visitors.write().await;
         visitors.insert(config.name.clone(), config);
         Ok(())
     }
 
-    async fn remove_visitor(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn remove_visitor(
+        &self,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut visitors = self.visitors.write().await;
         visitors.remove(name);
         Ok(())
@@ -460,25 +543,39 @@ impl Connector {
         })
     }
 
-    pub async fn connect(&mut self) -> Result<rust_frp_net::PooledConn, Box<dyn std::error::Error>> {
+    pub async fn connect(
+        &mut self,
+    ) -> Result<rust_frp_net::PooledConn, Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
             .parse::<SocketAddr>()?;
         Ok(self.conn_manager.connect_tcp(&addr).await?)
     }
 
-    pub async fn connect_tls(&mut self, domain: &str) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, Box<dyn std::error::Error>> {
+    pub async fn connect_tls(
+        &mut self,
+        domain: &str,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, Box<dyn std::error::Error>>
+    {
         let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
             .parse::<SocketAddr>()?;
         Ok(self.conn_manager.connect_tls(domain, &addr).await?)
     }
 
-    pub async fn connect_kcp(&mut self) -> Result<rust_frp_net::KcpConn, Box<dyn std::error::Error>> {
+    pub async fn connect_kcp(
+        &mut self,
+    ) -> Result<rust_frp_net::KcpConn, Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
             .parse::<SocketAddr>()?;
         Ok(self.conn_manager.connect_kcp(&addr).await?)
     }
 
-    pub async fn connect_websocket(&mut self, url: &str) -> Result<rust_frp_net::WebSocketConn<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Box<dyn std::error::Error>> {
+    pub async fn connect_websocket(
+        &mut self,
+        url: &str,
+    ) -> Result<
+        rust_frp_net::WebSocketConn<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        Box<dyn std::error::Error>,
+    > {
         Ok(self.conn_manager.connect_websocket(url).await?)
     }
 }
@@ -540,7 +637,7 @@ impl ClientControl {
         // 断线时最多 20 秒就能发现：10s 没收到 pong → 触发下一次 ping → 发现写失败）
         let heartbeat_interval_secs: u64 = 10;
         let mut last_ping_time = std::time::Instant::now();
-        
+
         log::debug!("ClientControl::run started, waiting for messages...");
 
         loop {
@@ -613,26 +710,36 @@ impl ClientControl {
             }
             Message::ReqWorkConn(req_work_conn_msg) => {
                 // 服务器请求建立工作连接
-                log::debug!("收到 ReqWorkConn 消息: proxy={}", req_work_conn_msg.proxy_name);
-                log::info!("Received ReqWorkConn for proxy: {}", req_work_conn_msg.proxy_name);
+                log::debug!(
+                    "收到 ReqWorkConn 消息: proxy={}",
+                    req_work_conn_msg.proxy_name
+                );
+                log::info!(
+                    "Received ReqWorkConn for proxy: {}",
+                    req_work_conn_msg.proxy_name
+                );
                 let proxy_name = req_work_conn_msg.proxy_name.clone();
                 let run_id = self.run_id.clone();
                 let config = self.config.clone();
 
                 tokio::spawn(async move {
                     log::debug!("开始建立工作连接: proxy={}", proxy_name);
-                    if let Err(e) = establish_work_connection(
-                        &proxy_name,
-                        &run_id,
-                        &config,
-                    ).await {
+                    if let Err(e) = establish_work_connection(&proxy_name, &run_id, &config).await {
                         if e.to_string().to_lowercase().contains("connection reset")
                             || e.to_string().to_lowercase().contains("connection aborted")
                             || e.to_string().to_lowercase().contains("broken pipe")
                         {
-                            log::debug!("Work connection for {} closed (peer disconnected): {:?}", proxy_name, e);
+                            log::debug!(
+                                "Work connection for {} closed (peer disconnected): {:?}",
+                                proxy_name,
+                                e
+                            );
                         } else {
-                            log::error!("Failed to establish work connection for {}: {:?}", proxy_name, e);
+                            log::error!(
+                                "Failed to establish work connection for {}: {:?}",
+                                proxy_name,
+                                e
+                            );
                         }
                     } else {
                         log::debug!("工作连接建立成功: proxy={}", proxy_name);
@@ -644,7 +751,10 @@ impl ClientControl {
                 let data = udp_msg.data;
                 let client_addr = udp_msg.client_addr.clone();
 
-                let proxy_config = self.config.proxies.iter()
+                let proxy_config = self
+                    .config
+                    .proxies
+                    .iter()
                     .find(|p| p.name == proxy_name)
                     .cloned();
 
@@ -663,7 +773,11 @@ impl ClientControl {
                                     s
                                 }
                                 Err(e) => {
-                                    log::error!("Failed to bind UDP socket for proxy {}: {:?}", proxy_name, e);
+                                    log::error!(
+                                        "Failed to bind UDP socket for proxy {}: {:?}",
+                                        proxy_name,
+                                        e
+                                    );
                                     return;
                                 }
                             }
@@ -671,7 +785,12 @@ impl ClientControl {
                     };
 
                     if let Err(e) = socket.send_to(&data, &local_addr).await {
-                        log::error!("Failed to send UDP data to {} for proxy {}: {:?}", local_addr, proxy_name, e);
+                        log::error!(
+                            "Failed to send UDP data to {} for proxy {}: {:?}",
+                            local_addr,
+                            proxy_name,
+                            e
+                        );
                         return;
                     }
 
@@ -684,7 +803,9 @@ impl ClientControl {
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(5),
                             socket_clone.recv_from(&mut buf),
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(Ok((n, _))) => {
                                 let resp_data = buf[..n].to_vec();
                                 let resp_msg = Message::UdpPacket(rust_frp_core::UdpPacketMsg {
@@ -697,7 +818,11 @@ impl ClientControl {
                                 }
                             }
                             Ok(Err(e)) => {
-                                log::error!("UDP recv error for proxy {}: {:?}", proxy_name_clone, e);
+                                log::error!(
+                                    "UDP recv error for proxy {}: {:?}",
+                                    proxy_name_clone,
+                                    e
+                                );
                             }
                             Err(_) => {
                                 log::debug!("UDP response timeout for proxy {}", proxy_name_clone);
@@ -709,7 +834,11 @@ impl ClientControl {
                 }
             }
             Message::XtcpNatInfo(xtcp_msg) => {
-                log::info!("Received XTCP NAT info from {} for proxy {}", xtcp_msg.run_id, xtcp_msg.proxy_name);
+                log::info!(
+                    "Received XTCP NAT info from {} for proxy {}",
+                    xtcp_msg.run_id,
+                    xtcp_msg.proxy_name
+                );
                 let proxy_name = xtcp_msg.proxy_name.clone();
                 let peer_local_addr = xtcp_msg.local_addr.clone();
                 let peer_public_addr = xtcp_msg.public_addr.clone();
@@ -724,7 +853,11 @@ impl ClientControl {
                         local_addr,
                         public_addr: String::new(),
                     };
-                    if let Err(e) = self.conn.write_message(&Message::XtcpNatInfo(nat_info)).await {
+                    if let Err(e) = self
+                        .conn
+                        .write_message(&Message::XtcpNatInfo(nat_info))
+                        .await
+                    {
                         log::error!("Failed to send XTCP NAT info response: {:?}", e);
                     }
                 }
@@ -735,7 +868,11 @@ impl ClientControl {
                 });
             }
             Message::XtcpHolePunch(hp_msg) => {
-                log::info!("Received XTCP hole punch from {} for proxy {}", hp_msg.from_run_id, hp_msg.proxy_name);
+                log::info!(
+                    "Received XTCP hole punch from {} for proxy {}",
+                    hp_msg.from_run_id,
+                    hp_msg.proxy_name
+                );
                 let peer_local = hp_msg.peer_local_addr.clone();
                 let peer_public = hp_msg.peer_public_addr.clone();
 
@@ -767,7 +904,7 @@ impl ClientControl {
 
 /// 生成工作连接签名密钥（与服务端 AuthManager::generate_work_conn_sign_key 一致）
 fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
-    use ring::{hmac, digest};
+    use ring::{digest, hmac};
     // encryption_key = SHA-256(token)
     let mut hasher = digest::Context::new(&digest::SHA256);
     hasher.update(token.as_bytes());
@@ -787,7 +924,9 @@ async fn establish_work_connection(
     config: &ClientConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 查找代理配置
-    let proxy_config = config.proxies.iter()
+    let proxy_config = config
+        .proxies
+        .iter()
         .find(|p| p.name == proxy_name)
         .ok_or_else(|| format!("Proxy config not found: {}", proxy_name))?;
 
@@ -799,7 +938,10 @@ async fn establish_work_connection(
     log::info!("Connected to server work conn port: {}", work_addr);
 
     // 生成 sign_key
-    let sign_key = config.auth.token.as_ref()
+    let sign_key = config
+        .auth
+        .token
+        .as_ref()
         .map(|token| generate_work_conn_sign_key(token, run_id))
         .unwrap_or_default();
 
@@ -839,12 +981,13 @@ async fn establish_work_connection(
     if proxy_protocol_enabled && src_port > 0 {
         let header = format!(
             "PROXY TCP4 {} {} {} {}\r\n",
-            src_addr,
-            proxy_config.local_ip,
-            src_port,
-            proxy_config.local_port,
+            src_addr, proxy_config.local_ip, src_port, proxy_config.local_port,
         );
-        log::info!("Writing PROXY protocol header for {}: {}", proxy_name, header.trim());
+        log::info!(
+            "Writing PROXY protocol header for {}: {}",
+            proxy_name,
+            header.trim()
+        );
         tokio::io::AsyncWriteExt::write_all(&mut local_conn, header.as_bytes()).await?;
     }
 
@@ -861,7 +1004,10 @@ async fn try_xtcp_hole_punch(proxy_name: &str, peer_public_addr: &str, peer_loca
         .collect();
 
     if addrs.is_empty() {
-        log::error!("XTCP hole punch: no valid peer addresses for {}", proxy_name);
+        log::error!(
+            "XTCP hole punch: no valid peer addresses for {}",
+            proxy_name
+        );
         return;
     }
 
@@ -870,11 +1016,17 @@ async fn try_xtcp_hole_punch(proxy_name: &str, peer_public_addr: &str, peer_loca
         let addr = addr.to_string();
         let name = proxy_name.to_string();
         handles.push(tokio::spawn(async move {
-            log::info!("XTCP hole punch: trying to connect to {} for {}", addr, name);
+            log::info!(
+                "XTCP hole punch: trying to connect to {} for {}",
+                addr,
+                name
+            );
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 tokio::net::TcpStream::connect(&addr),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(_conn)) => {
                     log::info!("XTCP hole punch succeeded to {} for {}", addr, name);
                     Some(addr)
@@ -907,7 +1059,12 @@ async fn start_stcp_visitor(
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
         Err(e) => {
-            log::error!("Failed to bind STCP visitor {} on {}: {:?}", proxy_name, bind_addr, e);
+            log::error!(
+                "Failed to bind STCP visitor {} on {}: {:?}",
+                proxy_name,
+                bind_addr,
+                e
+            );
             return;
         }
     };
@@ -916,7 +1073,11 @@ async fn start_stcp_visitor(
     loop {
         match listener.accept().await {
             Ok((local_conn, addr)) => {
-                log::info!("STCP visitor accepted connection from {} for {}", addr, proxy_name);
+                log::info!(
+                    "STCP visitor accepted connection from {} for {}",
+                    addr,
+                    proxy_name
+                );
                 let pn = proxy_name.clone();
                 let tx = stcp_tx.clone();
                 let rid = run_id.clone();
@@ -944,7 +1105,10 @@ async fn handle_stcp_visitor_conn(
     run_id: String,
     config: ClientConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let is_xtcp = config.visitors.iter().any(|v| v.server_name == proxy_name && v.r#type == "xtcp");
+    let is_xtcp = config
+        .visitors
+        .iter()
+        .any(|v| v.server_name == proxy_name && v.r#type == "xtcp");
     // 也可检查 proxies 中是否有 xtcp 类型
 
     if is_xtcp {
@@ -961,12 +1125,18 @@ async fn handle_stcp_visitor_conn(
             log::error!("Failed to send XTCP NAT info: {:?}", e);
         }
 
-        log::info!("XTCP visitor: waiting for hole punch (2s) before STCP fallback for {}", proxy_name);
+        log::info!(
+            "XTCP visitor: waiting for hole punch (2s) before STCP fallback for {}",
+            proxy_name
+        );
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 
     let timestamp = get_timestamp();
-    let sign_key = config.auth.token.as_ref()
+    let sign_key = config
+        .auth
+        .token
+        .as_ref()
         .map(|_| timestamp.to_string())
         .unwrap_or_default();
 
@@ -986,7 +1156,10 @@ async fn handle_stcp_visitor_conn(
     let mut work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
     log::info!("STCP visitor work conn to: {}", work_addr);
 
-    let work_sign_key = config.auth.token.as_ref()
+    let work_sign_key = config
+        .auth
+        .token
+        .as_ref()
         .map(|token| generate_work_conn_sign_key(token, &run_id))
         .unwrap_or_default();
 
@@ -1031,12 +1204,11 @@ struct WebServerState {
 }
 
 impl WebServer {
-    pub fn new(config: &rust_frp_config::WebServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        config: &rust_frp_config::WebServerConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", config.addr, config.port).parse::<SocketAddr>()?;
-        Ok(Self {
-            addr,
-            server: None,
-        })
+        Ok(Self { addr, server: None })
     }
 
     pub async fn start(&mut self, client: &Client) -> Result<(), Box<dyn std::error::Error>> {
@@ -1117,14 +1289,18 @@ impl HealthChecker {
 
                 match check_type.as_str() {
                     "tcp" => {
-                        let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&target_addr))
-                            .await;
+                        let result = tokio::time::timeout(
+                            timeout,
+                            tokio::net::TcpStream::connect(&target_addr),
+                        )
+                        .await;
                         match result {
                             Ok(Ok(_)) => {
                                 if failed_count > 0 {
                                     log::warn!(
                                         "Health check for proxy '{}' recovered (TCP: {})",
-                                        self.config.name, target_addr
+                                        self.config.name,
+                                        target_addr
                                     );
                                 }
                                 failed_count = 0;
@@ -1133,7 +1309,10 @@ impl HealthChecker {
                                 failed_count += 1;
                                 log::warn!(
                                     "Health check for proxy '{}' failed ({}/{}): TCP connect to {}",
-                                    self.config.name, failed_count, max_failed, target_addr
+                                    self.config.name,
+                                    failed_count,
+                                    max_failed,
+                                    target_addr
                                 );
                                 if failed_count >= max_failed {
                                     log::error!(
@@ -1173,7 +1352,8 @@ impl HealthChecker {
                                     if failed_count > 0 {
                                         log::warn!(
                                             "Health check for proxy '{}' recovered (HTTP: {})",
-                                            self.config.name, target_addr
+                                            self.config.name,
+                                            target_addr
                                         );
                                     }
                                     failed_count = 0;
@@ -1211,7 +1391,8 @@ impl HealthChecker {
                     _ => {
                         log::warn!(
                             "Unsupported health check type '{}' for proxy '{}'",
-                            check_type, self.config.name
+                            check_type,
+                            self.config.name
                         );
                         break;
                     }
@@ -1236,15 +1417,18 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(config: ClientConfig, config_path: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        config: ClientConfig,
+        config_path: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let auth_manager = Arc::new(AuthManager::new(&config.auth).map_err(|e| e.to_string())?);
-        
+
         // 先创建可变的 proxy_manager，设置 work_conn_manager，再包装成 Arc
         let mut proxy_manager_instance = ClientProxyManager::new();
         let work_conn_manager = Arc::new(WorkConnManager::new());
         proxy_manager_instance.set_work_conn_manager(work_conn_manager.clone());
         let proxy_manager = Arc::new(proxy_manager_instance);
-        
+
         let visitor_manager = Arc::new(ClientVisitorManager::new());
         let connector = Connector::new(config.clone())?;
 
@@ -1277,7 +1461,8 @@ impl Client {
 
         // 设置信号处理
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
         // 重连配置：首次断线立即重连（0ms），失败后 1s 起步指数退避，封顶 30s
         let mut reconnect_delay_ms: u64 = 0;
@@ -1300,7 +1485,7 @@ impl Client {
 
                     // 克隆代理配置到临时向量
                     let proxies = self.config.proxies.clone();
-                    
+
                     log::info!("Number of proxies: {}", proxies.len());
 
                     // 注册所有代理
@@ -1387,7 +1572,10 @@ impl Client {
                 let jitter = (reconnect_delay_ms as f64 * rand::random::<f64>() * 0.1) as u64;
                 reconnect_delay_ms + jitter
             };
-            log::warn!("Connection lost, attempting to reconnect in {} ms...", sleep_ms);
+            log::warn!(
+                "Connection lost, attempting to reconnect in {} ms...",
+                sleep_ms
+            );
             tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
 
             // 下次延迟：首次(0)后从 1s 起步翻倍，封顶 30s
@@ -1397,7 +1585,7 @@ impl Client {
             } else {
                 (reconnect_delay_ms * 2).min(max_reconnect_delay_ms)
             };
-            
+
             // 重置代理管理器状态
             self.proxy_manager.clear().await;
             self.visitor_manager.clear().await;
@@ -1409,13 +1597,17 @@ impl Client {
 
     async fn graceful_shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         log::info!("Sending disconnect message to server...");
-        
+
         if let Some(control) = &self.control {
             let mut control = control.lock().await;
             let disconnect_msg = rust_frp_core::DisconnectMsg {
                 reason: "client_shutdown".to_string(),
             };
-            if let Err(e) = control.conn.write_message(&Message::Disconnect(disconnect_msg)).await {
+            if let Err(e) = control
+                .conn
+                .write_message(&Message::Disconnect(disconnect_msg))
+                .await
+            {
                 log::warn!("Failed to send disconnect message: {:?}", e);
             } else {
                 log::info!("Disconnect message sent successfully");
@@ -1426,23 +1618,30 @@ impl Client {
         Ok(())
     }
 
-    async fn register_proxy(&mut self, proxy: &rust_frp_config::ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn register_proxy(
+        &mut self,
+        proxy: &rust_frp_config::ProxyConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(control) = &self.control {
             let mut control = control.lock().await;
             // 发送代理注册消息
             let register_proxy_msg = rust_frp_core::RegisterProxyMsg {
                 proxy: proxy.clone(),
             };
-            control.conn.write_message(&Message::RegisterProxy(register_proxy_msg)).await?;
+            control
+                .conn
+                .write_message(&Message::RegisterProxy(register_proxy_msg))
+                .await?;
 
             // 读取注册响应
             let msg = control.conn.read_message().await?;
             match msg {
                 Message::RegisterProxyResp(resp) => {
                     if !resp.error.is_empty() {
-                        return Err(Box::new(std::io::Error::other(
-                            format!("Failed to register proxy {}: {}", proxy.name, resp.error),
-                        )));
+                        return Err(Box::new(std::io::Error::other(format!(
+                            "Failed to register proxy {}: {}",
+                            proxy.name, resp.error
+                        ))));
                     }
                     log::info!("Proxy registered successfully: {}", proxy.name);
                 }
@@ -1460,11 +1659,20 @@ impl Client {
     async fn login(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 根据传输协议选择连接方式
         let protocol = self.config.transport.protocol.as_str();
-        let use_tls = self.config.transport.tls.as_ref().map(|t| t.enable).unwrap_or(true);
-        
+        let use_tls = self
+            .config
+            .transport
+            .tls
+            .as_ref()
+            .map(|t| t.enable)
+            .unwrap_or(true);
+
         let mut conn = match protocol {
             "kcp" => {
-                let kcp_conn = self.connector.connect_kcp().await
+                let kcp_conn = self
+                    .connector
+                    .connect_kcp()
+                    .await
                     .map_err(|e| format!("KCP connection failed: {}", e))?;
                 ControlConn::new(Box::new(kcp_conn))
             }
@@ -1472,18 +1680,27 @@ impl Client {
                 let scheme = if use_tls { "wss" } else { "ws" };
                 let port = self.config.server_port;
                 let url = format!("{}://{}:{}/ws", scheme, self.config.server_addr, port);
-                let ws_conn = self.connector.connect_websocket(&url).await
+                let ws_conn = self
+                    .connector
+                    .connect_websocket(&url)
+                    .await
                     .map_err(|e| format!("WebSocket connection failed: {}", e))?;
                 ControlConn::new(Box::new(ws_conn))
             }
             _ => {
                 // 默认使用 TCP (可能带 TLS)
                 if use_tls {
-                    let tls_conn = self.connector.connect_tls(&self.config.server_addr).await
+                    let tls_conn = self
+                        .connector
+                        .connect_tls(&self.config.server_addr)
+                        .await
                         .map_err(|e| format!("TLS connection failed: {}", e))?;
                     ControlConn::new(Box::new(tls_conn))
                 } else {
-                    let tcp_conn = self.connector.connect().await
+                    let tcp_conn = self
+                        .connector
+                        .connect()
+                        .await
                         .map_err(|e| format!("TCP connection failed: {}", e))?;
                     ControlConn::new(Box::new(tcp_conn))
                 }
@@ -1495,7 +1712,7 @@ impl Client {
 
         // 获取主机名
         let hostname = hostname::get()?.to_string_lossy().to_string();
-        
+
         // 创建登录消息
         let login_msg = rust_frp_core::LoginMsg {
             arch: std::env::consts::ARCH.to_string(),
@@ -1581,13 +1798,19 @@ impl Client {
             // 重新启动所有代理
             let proxies = self.config.proxies.clone();
             for proxy in &proxies {
-                self.proxy_manager.add_proxy(proxy.clone()).await.map_err(|e| e.to_string())?;
+                self.proxy_manager
+                    .add_proxy(proxy.clone())
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
 
             // 重新启动所有访问者
             let visitors = self.config.visitors.clone();
             for visitor in &visitors {
-                self.visitor_manager.add_visitor(visitor.clone()).await.map_err(|e| e.to_string())?;
+                self.visitor_manager
+                    .add_visitor(visitor.clone())
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
 
             // 重新启动健康检查
