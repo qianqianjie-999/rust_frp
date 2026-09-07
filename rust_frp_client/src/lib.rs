@@ -86,7 +86,7 @@ use axum::{extract::State, routing::get, Json, Router};
 use rust_frp_auth::AuthManager;
 use rust_frp_config::ClientConfig;
 use rust_frp_core::{ControlConn, Message, NewWorkConnMsg, ProxyManager, VisitorManager};
-use rust_frp_net::{ConnManager, TlsConfig};
+use rust_frp_net::{ConnManager, MuxSession, TlsConfig, TCP_MUX_MAGIC};
 use rust_frp_util::{
     get_timestamp, rand_id,
     retry::{retry, ConnectionError, RetryConfig},
@@ -611,6 +611,11 @@ pub struct ClientControl {
     last_pong_time: std::time::Instant,
     /// 工作连接是否使用 TLS（来自服务器 LoginRespMsg.work_conn_tls 协商）
     work_conn_tls: bool,
+    /// yamux 多路复用会话（tcp_mux 开启时存在）
+    ///
+    /// 工作连接不再新建 TCP，而是从会话打开新流；
+    /// TLS 在会话层（底层 TCP 已含），流上无需重复加密。
+    mux_session: Option<Arc<MuxSession>>,
 }
 
 impl ClientControl {
@@ -623,6 +628,7 @@ impl ClientControl {
         work_conn_manager: Arc<WorkConnManager>,
         config: ClientConfig,
         work_conn_tls: bool,
+        mux_session: Option<Arc<MuxSession>>,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(256);
         let (stcp_tx, stcp_rx) = tokio::sync::mpsc::channel::<Message>(100);
@@ -641,6 +647,7 @@ impl ClientControl {
             stcp_visitor_rx: stcp_rx,
             last_pong_time: std::time::Instant::now(),
             work_conn_tls,
+            mux_session,
         }
     }
 
@@ -744,12 +751,18 @@ impl ClientControl {
                 let run_id = self.run_id.clone();
                 let config = self.config.clone();
                 let work_conn_tls = self.work_conn_tls;
+                let mux_session = self.mux_session.clone();
 
                 tokio::spawn(async move {
                     log::debug!("开始建立工作连接: proxy={}", proxy_name);
-                    if let Err(e) =
-                        establish_work_connection(&proxy_name, &run_id, &config, work_conn_tls)
-                            .await
+                    if let Err(e) = establish_work_connection(
+                        &proxy_name,
+                        &run_id,
+                        &config,
+                        work_conn_tls,
+                        mux_session.as_ref(),
+                    )
+                    .await
                     {
                         if e.to_string().to_lowercase().contains("connection reset")
                             || e.to_string().to_lowercase().contains("connection aborted")
@@ -945,6 +958,7 @@ fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
 
 /// 建立工作连接（独立函数，供 ClientControl::run 调用）
 ///
+/// - 多路复用：tcp_mux 会话存在时直接打开会话流（无需新建 TCP，TLS 在会话层）
 /// - 端口：优先使用客户端配置的 work_conn_port，默认 server_port + 1000
 /// - TLS：服务器通过 LoginRespMsg.work_conn_tls 协商后按需 TLS 加密
 async fn establish_work_connection(
@@ -952,6 +966,7 @@ async fn establish_work_connection(
     run_id: &str,
     config: &ClientConfig,
     work_conn_tls: bool,
+    mux_session: Option<&Arc<MuxSession>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 查找代理配置
     let proxy_config = config
@@ -960,26 +975,37 @@ async fn establish_work_connection(
         .find(|p| p.name == proxy_name)
         .ok_or_else(|| format!("Proxy config not found: {}", proxy_name))?;
 
-    // 连接到服务器的工作连接端口
-    let work_port = work_conn_port_of(config);
-    let work_addr = format!("{}:{}", config.server_addr, work_port);
-
-    let work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
-    log::info!("Connected to server work conn port: {}", work_addr);
-
-    // 服务器协商要求 TLS 时，工作连接套 TLS（复用控制连接的客户端 TLS 配置）
-    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if work_conn_tls {
-        let tls_config = build_client_tls_config(config)
-            .map_err(|e| format!("failed to build client TLS config: {}", e))?
-            .ok_or("server requires TLS work conn but client tls is disabled")?;
-        let tls_stream = tls_config
-            .connect(&config.server_addr, work_conn)
+    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if let Some(session) = mux_session {
+        // tcp_mux：工作连接 = 会话流（服务端分发循环经 process_work_conn 处理，
+        // 协议与直连工作端口完全一致）
+        let stream = session
+            .open_stream()
             .await
-            .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
-        log::info!("Work conn TLS established for proxy: {}", proxy_name);
-        Box::new(tls_stream)
+            .map_err(|e| format!("mux open work stream failed: {}", e))?;
+        log::info!("Mux work stream established for proxy: {}", proxy_name);
+        stream
     } else {
-        Box::new(work_conn)
+        // 直连工作端口路径
+        let work_port = work_conn_port_of(config);
+        let work_addr = format!("{}:{}", config.server_addr, work_port);
+
+        let work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
+        log::info!("Connected to server work conn port: {}", work_addr);
+
+        // 服务器协商要求 TLS 时，工作连接套 TLS（复用控制连接的客户端 TLS 配置）
+        if work_conn_tls {
+            let tls_config = build_client_tls_config(config)
+                .map_err(|e| format!("failed to build client TLS config: {}", e))?
+                .ok_or("server requires TLS work conn but client tls is disabled")?;
+            let tls_stream = tls_config
+                .connect(&config.server_addr, work_conn)
+                .await
+                .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
+            log::info!("Work conn TLS established for proxy: {}", proxy_name);
+            Box::new(tls_stream)
+        } else {
+            Box::new(work_conn)
+        }
     };
 
     // 生成 sign_key
@@ -1731,14 +1757,17 @@ impl Client {
             .map(|t| t.enable)
             .unwrap_or(true);
 
-        let mut conn = match protocol {
+        let (mut conn, mux_session): (
+            ControlConn,
+            Option<Arc<MuxSession>>,
+        ) = match protocol {
             "kcp" => {
                 let kcp_conn = self
                     .connector
                     .connect_kcp()
                     .await
                     .map_err(|e| format!("KCP connection failed: {}", e))?;
-                ControlConn::new(Box::new(kcp_conn))
+                (ControlConn::new(Box::new(kcp_conn)), None)
             }
             "websocket" => {
                 let scheme = if use_tls { "wss" } else { "ws" };
@@ -1749,7 +1778,39 @@ impl Client {
                     .connect_websocket(&url)
                     .await
                     .map_err(|e| format!("WebSocket connection failed: {}", e))?;
-                ControlConn::new(Box::new(ws_conn))
+                (ControlConn::new(Box::new(ws_conn)), None)
+            }
+            _ if self.config.transport.tcp_mux => {
+                // tcp_mux：TCP → magic 字节 → (TLS) → yamux 会话 → 首条流为控制流
+                //（仅 TCP 协议生效，与 frp 原版语义一致）
+                let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
+                    .parse::<SocketAddr>()?;
+                let mut tcp = tokio::net::TcpStream::connect(addr).await
+                    .map_err(|e| format!("TCP connection failed: {}", e))?;
+                // 先写 magic 字节，服务端嗅探后走多路复用路径（须在 TLS 握手前）
+                tcp.write_all(&[TCP_MUX_MAGIC]).await?;
+                log::info!("tcp_mux enabled, sent magic byte to server");
+
+                let io: rust_frp_net::AnyConn = if use_tls {
+                    let tls_config = build_client_tls_config(&self.config)
+                        .map_err(|e| format!("failed to build client TLS config: {}", e))?
+                        .ok_or("tcp_mux requires TLS but client tls is disabled")?;
+                    let tls_stream = tls_config
+                        .connect(&self.config.server_addr, tcp)
+                        .await
+                        .map_err(|e| format!("TLS connection failed: {}", e))?;
+                    Box::new(tls_stream)
+                } else {
+                    Box::new(tcp)
+                };
+
+                let session = MuxSession::new_client(io);
+                // 首条流 = 控制流（服务端 accept 后作为控制连接处理）
+                let control_stream = session
+                    .open_stream()
+                    .await
+                    .map_err(|e| format!("mux open control stream failed: {}", e))?;
+                (ControlConn::new(control_stream), Some(session))
             }
             _ => {
                 // 默认使用 TCP (可能带 TLS)
@@ -1759,14 +1820,14 @@ impl Client {
                         .connect_tls(&self.config.server_addr)
                         .await
                         .map_err(|e| format!("TLS connection failed: {}", e))?;
-                    ControlConn::new(Box::new(tls_conn))
+                    (ControlConn::new(Box::new(tls_conn)), None)
                 } else {
                     let tcp_conn = self
                         .connector
                         .connect()
                         .await
                         .map_err(|e| format!("TCP connection failed: {}", e))?;
-                    ControlConn::new(Box::new(tcp_conn))
+                    (ControlConn::new(Box::new(tcp_conn)), None)
                 }
             }
         };
@@ -1822,6 +1883,7 @@ impl Client {
                     self.work_conn_manager.clone(),
                     self.config.clone(),
                     work_conn_tls,
+                    mux_session,
                 );
                 self.control = Some(Mutex::new(control));
 
