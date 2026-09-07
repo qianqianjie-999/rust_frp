@@ -812,6 +812,9 @@ pub struct PluginConfig {
     /// - `static_file`: 静态文件服务
     /// - `http_proxy`: HTTP 代理
     /// - `socks5`: SOCKS5 代理
+    /// - `https2http`: TLS 卸载（访客 HTTPS → 明文 HTTP 本地服务）
+    /// - `tls2raw`: TLS 卸载（访客 TLS → 明文 TCP 本地服务，与 https2http 同实现）
+    /// - `https2https`: 双层 TLS 桥接（访客 HTTPS → TLS 本地服务）
     pub r#type: String,
 
     /// Unix 域套接字路径（unix_domain_socket 插件用）
@@ -829,7 +832,7 @@ pub struct PluginConfig {
     /// HTTP 密码（http_proxy 插件用）
     pub http_password: Option<String>,
 
-    /// 本地地址（http_proxy/socks5 插件用）
+    /// 本地地址（http_proxy/socks5 及 TLS 系插件 https2http/tls2raw/https2https 用）
     pub local_addr: Option<String>,
 
     /// 证书文件路径（HTTPS 相关插件用）
