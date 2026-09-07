@@ -586,6 +586,54 @@ impl TlsConfig {
             ))
         }
     }
+
+    /// 接受 TLS 连接（泛型底层流）
+    ///
+    /// 与 [`TlsConfig::accept`] 相同，但底层流不限于 `TcpStream`，
+    /// 供插件（任意访客连接）与多路复用（yamux 流上的 TLS）使用。
+    pub async fn accept_stream<S>(&self, stream: S) -> Result<server::TlsStream<S>, std::io::Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        if let Some(config) = &self.server_config {
+            let acceptor = TlsAcceptor::from(config.clone());
+            acceptor.accept(stream).await.map_err(std::io::Error::other)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a server config",
+            ))
+        }
+    }
+
+    /// 建立 TLS 连接（泛型底层流）
+    ///
+    /// 与 [`TlsConfig::connect`] 相同，但底层流不限于 `TcpStream`，
+    /// 供插件与多路复用（yamux 流上的 TLS）使用。
+    pub async fn connect_stream<S>(
+        &self,
+        domain: &str,
+        stream: S,
+    ) -> Result<client::TlsStream<S>, std::io::Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        if let Some(config) = &self.client_config {
+            let server_name = ServerName::try_from(domain.to_string()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid server name")
+            })?;
+            let connector = TlsConnector::from(config.clone());
+            connector
+                .connect(server_name, stream)
+                .await
+                .map_err(std::io::Error::other)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a client config",
+            ))
+        }
+    }
 }
 
 /// 网络连接管理器
