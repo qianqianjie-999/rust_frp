@@ -21,6 +21,14 @@
 //!    - 实现 SOCKS5 协议
 //!    - 支持域名和 IPv4 地址
 //!
+//! 5. **TlsOffloadPlugin (TLS 卸载,https2http / tls2raw)**
+//!    - 访客 TLS 接入 → 终止 TLS → 明文桥接到 local_addr
+//!    - 证书:显式 crt_path/key_path 或内置自签名证书
+//!
+//! 6. **TlsBridgePlugin (https2https)**
+//!    - 访客 TLS 接入 → 终止 TLS → 重新 TLS 连接 local_addr(双层 TLS)
+//!    - 本地侧跳过证书验证(自签场景)
+//!
 //! ## 架构图
 //!
 //! ```text
@@ -496,6 +504,121 @@ impl Plugin for Socks5Plugin {
     }
 }
 
+/// TLS 卸载插件（https2http / tls2raw 同一实现）
+///
+/// 访客以 TLS 接入，插件终止 TLS（用 crt_path/key_path 或内置证书），
+/// 解密后的明文流量桥接到 local_addr 的明文服务。
+///
+/// - `https2http`：HTTPS 访客 → 明文 HTTP 本地服务（frp 语义）
+/// - `tls2raw`：TLS 访客 → 任意明文 TCP 本地服务
+pub struct TlsOffloadPlugin {
+    tls_config: rust_frp_net::TlsConfig,
+    local_addr: String,
+}
+
+impl TlsOffloadPlugin {
+    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let local_addr = config
+            .local_addr
+            .clone()
+            .ok_or_else(|| invalid_input("local_addr is required for https2http/tls2raw plugin"))?;
+
+        // 证书：显式配置 crt_path/key_path 优先，否则内置自签名证书
+        let tls_config = match (&config.crt_path, &config.key_path) {
+            (Some(crt), Some(key)) => rust_frp_net::TlsConfig::new_server(crt, key)?,
+            (None, None) => rust_frp_net::TlsConfig::new_server_with_builtin_cert()?,
+            _ => {
+                return Err(invalid_input(
+                    "crt_path and key_path must be configured together",
+                ))
+            }
+        };
+
+        Ok(Self {
+            tls_config,
+            local_addr,
+        })
+    }
+}
+
+#[async_trait]
+impl Plugin for TlsOffloadPlugin {
+    async fn handle(
+        &mut self,
+        conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 终止访客侧 TLS
+        let tls_conn = self.tls_config.accept_stream(conn).await?;
+        // 明文桥接到本地服务
+        let local = tokio::net::TcpStream::connect(&self.local_addr).await?;
+        rust_frp_util::bridge_streams(tls_conn, local).await
+    }
+}
+
+/// TLS 桥接插件（https2https）
+///
+/// 访客以 TLS 接入，插件终止 TLS 后重新以 TLS 连接 local_addr，
+/// 双层 TLS 桥接（本地服务通常是自签证书，跳过验证）。
+pub struct TlsBridgePlugin {
+    server_tls: rust_frp_net::TlsConfig,
+    client_tls: rust_frp_net::TlsConfig,
+    local_addr: String,
+}
+
+impl TlsBridgePlugin {
+    pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let local_addr = config
+            .local_addr
+            .clone()
+            .ok_or_else(|| invalid_input("local_addr is required for https2https plugin"))?;
+
+        let server_tls = match (&config.crt_path, &config.key_path) {
+            (Some(crt), Some(key)) => rust_frp_net::TlsConfig::new_server(crt, key)?,
+            (None, None) => rust_frp_net::TlsConfig::new_server_with_builtin_cert()?,
+            _ => {
+                return Err(invalid_input(
+                    "crt_path and key_path must be configured together",
+                ))
+            }
+        };
+
+        // 本地服务常为自签证书，跳过证书验证（仅加密不验证）
+        let client_tls = rust_frp_net::TlsConfig::new_client_insecure()?;
+
+        Ok(Self {
+            server_tls,
+            client_tls,
+            local_addr,
+        })
+    }
+}
+
+#[async_trait]
+impl Plugin for TlsBridgePlugin {
+    async fn handle(
+        &mut self,
+        conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 终止访客侧 TLS
+        let tls_conn = self.server_tls.accept_stream(conn).await?;
+        // 重新以 TLS 连接本地服务
+        let local_tcp = tokio::net::TcpStream::connect(&self.local_addr).await?;
+        let local_tls = self
+            .client_tls
+            .connect_stream("localhost", local_tcp)
+            .await?;
+        rust_frp_util::bridge_streams(tls_conn, local_tls).await
+    }
+}
+
+/// 构造 InvalidInput 错误的快捷方式
+fn invalid_input(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        msg.to_string(),
+    ))
+}
+
 /// 插件管理器
 pub struct PluginManager {
     factories: std::collections::HashMap<String, Box<dyn PluginFactory + Send + Sync>>,
@@ -520,6 +643,16 @@ impl PluginManager {
             Box::new(HttpProxyPluginFactory {}),
         );
         factories.insert("socks5".to_string(), Box::new(Socks5PluginFactory {}));
+        // TLS 系插件（https2http/tls2raw 同一实现，https2https 双层 TLS）
+        factories.insert(
+            "https2http".to_string(),
+            Box::new(TlsOffloadPluginFactory {}),
+        );
+        factories.insert("tls2raw".to_string(), Box::new(TlsOffloadPluginFactory {}));
+        factories.insert(
+            "https2https".to_string(),
+            Box::new(TlsBridgePluginFactory {}),
+        );
 
         Self { factories }
     }
@@ -598,5 +731,29 @@ impl PluginFactory for Socks5PluginFactory {
         config: &PluginConfig,
     ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(Socks5Plugin::new(config)?))
+    }
+}
+
+/// TLS 卸载插件工厂（https2http / tls2raw）
+struct TlsOffloadPluginFactory {}
+
+impl PluginFactory for TlsOffloadPluginFactory {
+    fn create(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Box::new(TlsOffloadPlugin::new(config)?))
+    }
+}
+
+/// TLS 桥接插件工厂（https2https）
+struct TlsBridgePluginFactory {}
+
+impl PluginFactory for TlsBridgePluginFactory {
+    fn create(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Box::new(TlsBridgePlugin::new(config)?))
     }
 }

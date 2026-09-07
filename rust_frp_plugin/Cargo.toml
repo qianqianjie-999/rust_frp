@@ -11,3 +11,4 @@ serde_json = { workspace = true }
 log = { workspace = true }
 rust_frp_util = { path = "../rust_frp_util" }
 rust_frp_config = { path = "../rust_frp_config" }
+rust_frp_net = { path = "../rust_frp_net" }
