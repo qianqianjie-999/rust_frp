@@ -686,6 +686,28 @@ pub struct ProxyConfig {
     /// real_ip_header proxy_protocol;
     /// ```
     pub proxy_protocol: Option<bool>,
+
+    /// 负载均衡分组名（可选，仅 TCP 代理）
+    ///
+    /// 同 group + 同 remote_port 的多个代理组成负载均衡组，
+    /// 服务器对新连接按 round-robin 分发到组成员。
+    ///
+    /// # 示例
+    ///
+    /// ```toml
+    /// [[proxies]]
+    /// name = "web-1"
+    /// type = "tcp"
+    /// group = "web"
+    /// group_key = "shared-secret"
+    /// remote_port = 8080
+    /// ```
+    pub group: Option<String>,
+
+    /// 负载均衡分组密钥（可选，与 group 配合）
+    ///
+    /// 加入组时校验，与已有成员不匹配则拒绝注册（防止误入他人分组）。
+    pub group_key: Option<String>,
 }
 
 /// 访问者配置 - 定义如何访问其他客户端的 STCP/XTCP 服务

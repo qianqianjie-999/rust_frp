@@ -380,3 +380,114 @@ async fn test_tls_only_requires_tls_config_validation() {
     cfg.transport.tls = None;
     assert!(rust_frp_server::Server::new(cfg, None).await.is_ok());
 }
+
+// ============ P1-2 group 负载均衡 ============
+
+#[tokio::test]
+async fn test_group_registry_join_pick_round_robin() {
+    let reg = rust_frp_server::GroupRegistry::default();
+
+    // 首成员 → true（需要绑定监听端口）
+    assert!(reg.join("web", "key1", 9000, "web-1").await.unwrap());
+    // 后续成员 → false（共享已有监听器）
+    assert!(!reg.join("web", "key1", 9000, "web-2").await.unwrap());
+
+    // round-robin：两成员交替命中
+    let a = reg.pick(9000).await.unwrap();
+    let b = reg.pick(9000).await.unwrap();
+    let c = reg.pick(9000).await.unwrap();
+    assert_ne!(a, b, "consecutive picks should hit different members");
+    assert_eq!(a, c, "round-robin should cycle back to first member");
+    let members = ["web-1", "web-2"];
+    assert!(members.contains(&a.as_str()) && members.contains(&b.as_str()));
+}
+
+#[tokio::test]
+async fn test_group_registry_key_mismatch_rejected() {
+    let reg = rust_frp_server::GroupRegistry::default();
+    reg.join("web", "secret", 9000, "web-1").await.unwrap();
+    let err = reg.join("web", "wrong", 9000, "web-2").await.unwrap_err();
+    assert!(err.contains("group_key"), "unexpected error: {}", err);
+}
+
+#[tokio::test]
+async fn test_group_registry_group_port_unique() {
+    let reg = rust_frp_server::GroupRegistry::default();
+    reg.join("web", "k", 9000, "web-1").await.unwrap();
+
+    // 同组名绑定不同端口 → 拒绝（对齐 frp ErrGroupDifferentPort）
+    let err = reg.join("web", "k", 9001, "web-2").await.unwrap_err();
+    assert!(err.contains("bound to port"), "unexpected error: {}", err);
+
+    // 同端口被其他组占用 → 拒绝
+    let err = reg.join("api", "k", 9000, "api-1").await.unwrap_err();
+    assert!(err.contains("already bound by group"), "unexpected error: {}", err);
+}
+
+#[tokio::test]
+async fn test_group_registry_leave_and_cleanup() {
+    let reg = rust_frp_server::GroupRegistry::default();
+    reg.join("web", "k", 9000, "web-1").await.unwrap();
+    reg.join("web", "k", 9000, "web-2").await.unwrap();
+
+    // web-1 退出：组未空，返回 false
+    assert!(!reg.leave(9000, "web-1").await);
+    // 流量全部由 web-2 承接
+    for _ in 0..4 {
+        assert_eq!(reg.pick(9000).await.unwrap(), "web-2");
+    }
+
+    // web-2 退出：组空，返回 true；pick 无成员
+    assert!(reg.leave(9000, "web-2").await);
+    assert_eq!(reg.member_count(9000).await, 0);
+    assert!(reg.pick(9000).await.is_none());
+
+    // 组已清理：同组名可绑定新端口
+    assert!(reg.join("web", "k", 9001, "web-3").await.unwrap());
+}
+
+#[tokio::test]
+async fn test_group_proxy_validation_and_shared_lifecycle() {
+    let port = free_port();
+    let allow = vec![PortRange {
+        single: Some(port),
+        start: None,
+        end: None,
+    }];
+    let mgr = build_manager(None, allow);
+    use rust_frp_core::ProxyManager as _;
+
+    let grouped = |name: &str, group: &str, key: &str| rust_frp_config::ProxyConfig {
+        group: Some(group.to_string()),
+        group_key: Some(key.to_string()),
+        ..tcp_proxy(name, port)
+    };
+
+    // 两个成员注册同一端口：首成员绑定，次成员共享（若重复绑定会 AddrInUse 失败）
+    mgr.add_proxy(grouped("web-1", "web", "secret")).await.unwrap();
+    mgr.add_proxy(grouped("web-2", "web", "secret")).await.unwrap();
+
+    // group_key 不匹配 → 拒绝
+    let err = mgr.add_proxy(grouped("web-3", "web", "wrong")).await;
+    assert!(err.is_err());
+    assert!(format!("{:?}", err.unwrap_err()).contains("group_key"));
+
+    // group + plugin 互斥
+    let mut p = grouped("web-4", "web2", "k");
+    p.plugin = Some(rust_frp_config::PluginConfig::default());
+    let err = mgr.add_proxy(p).await;
+    assert!(err.is_err());
+    assert!(format!("{:?}", err.unwrap_err()).contains("plugin cannot be used together"));
+
+    // 非 TCP 类型不支持 group
+    let mut p = grouped("http-1", "web3", "k");
+    p.r#type = "http".to_string();
+    let err = mgr.add_proxy(p).await;
+    assert!(err.is_err());
+    assert!(format!("{:?}", err.unwrap_err()).contains("only supported for tcp"));
+
+    // 成员逐个退出：组空后共享监听器释放，端口可被新代理重新绑定
+    mgr.remove_proxy("web-1").await.unwrap();
+    mgr.remove_proxy("web-2").await.unwrap();
+    mgr.add_proxy(grouped("web-new", "web", "secret")).await.unwrap();
+}
