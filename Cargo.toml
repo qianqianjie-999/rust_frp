@@ -37,5 +37,7 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 kcp = "0.6"
+yamux = "0.13"
+tokio-util = { version = "0.7", features = ["compat"] }
 notify = { version = "6.0", default-features = false, features = ["macos_kqueue"] }
 

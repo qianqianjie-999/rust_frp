@@ -19,3 +19,5 @@ rustls-pemfile = { workspace = true }
 webpki-roots = "0.26"
 kcp = { workspace = true }
 rand = { workspace = true }
+yamux = { workspace = true }
+tokio-util = { workspace = true }

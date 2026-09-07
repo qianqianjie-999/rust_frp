@@ -125,7 +125,8 @@ use rust_frp_core::{
     XtcpHolePunchMsg, XtcpNatInfoMsg,
 };
 use rust_frp_net::{
-    AnyConn, ConnManager, KcpConn, KcpListener, TcpListener, TlsConfig, UdpListener, WebSocketConn,
+    AnyConn, ConnManager, KcpConn, KcpListener, MuxSession, TcpListener, TlsConfig, TCP_MUX_MAGIC,
+    UdpListener, WebSocketConn,
 };
 use rust_frp_util::get_timestamp;
 use std::net::SocketAddr;
@@ -3721,7 +3722,7 @@ impl Server {
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
-        conn: tokio::net::TcpStream,
+        mut conn: tokio::net::TcpStream,
         control_manager: Arc<ControlManager>,
         proxy_manager: Arc<ServerProxyManager>,
         visitor_manager: Arc<ServerVisitorManager>,
@@ -3732,6 +3733,28 @@ impl Server {
         work_conn_manager: Arc<ServerWorkConnManager>,
         stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 首字节嗅探：TCP_MUX_MAGIC = tcp_mux 客户端（多路复用路径）
+        let mut first = [0u8; 1];
+        if conn.peek(&mut first).await.is_ok_and(|n| n == 1) && first[0] == TCP_MUX_MAGIC {
+            // 消费 magic 字节（peek 不消费；不读掉会污染后续 TLS 握手）
+            let mut b = [0u8; 1];
+            conn.read_exact(&mut b).await?;
+            log::info!("tcp_mux connection detected");
+            return Self::handle_mux_connection(
+                conn,
+                control_manager,
+                proxy_manager,
+                visitor_manager,
+                auth_manager,
+                proxy_owners,
+                xtcp_visitors,
+                tls_config,
+                work_conn_manager,
+                stcp_bridge_manager,
+            )
+            .await;
+        }
+
         // 工作连接 TLS 协商标志：与控制连接共用同一 TLS 配置
         let work_conn_tls = tls_config.is_some();
         let conn = if let Some(tls_config) = tls_config {
@@ -3750,6 +3773,38 @@ impl Server {
             ControlConn::new(Box::new(conn))
         };
 
+        Self::spawn_control(
+            conn,
+            control_manager,
+            proxy_manager,
+            visitor_manager,
+            auth_manager,
+            proxy_owners,
+            xtcp_visitors,
+            stcp_bridge_manager,
+            work_conn_manager,
+            work_conn_tls,
+        );
+
+        Ok(())
+    }
+
+    /// 启动控制连接处理任务（登录注册 + 控制循环 + 退出清理）
+    ///
+    /// 返回任务句柄：多路复用路径在控制流退出后据此关闭会话。
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_control(
+        conn: ControlConn,
+        control_manager: Arc<ControlManager>,
+        proxy_manager: Arc<ServerProxyManager>,
+        visitor_manager: Arc<ServerVisitorManager>,
+        auth_manager: Arc<AuthManager>,
+        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        stcp_bridge_manager: Arc<StcpBridgeManager>,
+        work_conn_manager: Arc<ServerWorkConnManager>,
+        work_conn_tls: bool,
+    ) -> tokio::task::JoinHandle<()> {
         // 创建登录通知通道
         let (login_tx, mut login_rx) = mpsc::channel::<String>(1);
 
@@ -3770,8 +3825,8 @@ impl Server {
             xtcp_visitors,
             Some(login_tx),
             Some(msg_tx),
-            stcp_bridge_manager.clone(),
-            work_conn_manager.clone(),
+            stcp_bridge_manager,
+            work_conn_manager,
             work_conn_tls,
         );
 
@@ -3806,6 +3861,99 @@ impl Server {
                 // 登录失败或通道关闭
                 let _ = run_handle.await;
             }
+        })
+    }
+
+    /// 处理多路复用控制连接（tcp_mux 客户端）
+    ///
+    /// 连接结构：TLS（如启用）→ yamux 会话；首条流为控制流，
+    /// 后续流为工作连接（与 work listener 共用 process_work_conn，协议零变更）。
+    /// 控制流退出 → 关闭整个会话（分发循环随之结束）。
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_mux_connection(
+        conn: tokio::net::TcpStream,
+        control_manager: Arc<ControlManager>,
+        proxy_manager: Arc<ServerProxyManager>,
+        visitor_manager: Arc<ServerVisitorManager>,
+        auth_manager: Arc<AuthManager>,
+        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        tls_config: Option<TlsConfig>,
+        work_conn_manager: Arc<ServerWorkConnManager>,
+        stcp_bridge_manager: Arc<StcpBridgeManager>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 工作连接 TLS 协商标志（mux 下工作连接为会话流，TLS 在会话层；
+        // 保持与 LoginResp 协商一致性）
+        let work_conn_tls = tls_config.is_some();
+
+        let io: AnyConn = if let Some(tls_config) = tls_config {
+            let tls_stream = match tls_config.accept(conn).await {
+                Ok(s) => s,
+                Err(e) => {
+                    global_metrics().incr_tls_rejects();
+                    log::warn!("TLS accept failed (mux): {}", e);
+                    return Err(format!("TLS accept failed: {}", e).into());
+                }
+            };
+            Box::new(tls_stream)
+        } else {
+            Box::new(conn)
+        };
+
+        let session = MuxSession::new_server(io);
+
+        // 首条流 = 控制流
+        let control_stream = session.accept_stream().await?;
+        // 分发循环所需的克隆（spawn_control 会移走原值）
+        let am = auth_manager.clone();
+        let sbm = stcp_bridge_manager.clone();
+        let control_handle = Self::spawn_control(
+            ControlConn::new(control_stream),
+            control_manager.clone(),
+            proxy_manager,
+            visitor_manager,
+            auth_manager,
+            proxy_owners,
+            xtcp_visitors,
+            stcp_bridge_manager,
+            work_conn_manager.clone(),
+            work_conn_tls,
+        );
+
+        // 后续流 = 工作连接，逐条分发
+        let dispatch_session = session.clone();
+        let cm = control_manager.clone();
+        let wcm = work_conn_manager.clone();
+        let dispatch = tokio::spawn(async move {
+            loop {
+                match dispatch_session.accept_stream().await {
+                    Ok(stream) => {
+                        log::info!("New mux work stream");
+                        let cm = cm.clone();
+                        let wcm = wcm.clone();
+                        let am = am.clone();
+                        let sbm = sbm.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                Server::process_work_conn(stream, cm, wcm, am, sbm).await
+                            {
+                                log_work_conn_error(&e);
+                            }
+                        });
+                    }
+                    Err(_) => break, // 会话关闭
+                }
+            }
+            log::info!("Mux dispatch loop stopped");
+        });
+
+        // 控制流退出 → 关闭会话 → 分发循环退出
+        let close_session = session.clone();
+        tokio::spawn(async move {
+            let _ = control_handle.await;
+            log::info!("Mux control stream ended, closing session");
+            close_session.close().await;
+            let _ = dispatch.await;
         });
 
         Ok(())
