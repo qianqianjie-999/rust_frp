@@ -28,11 +28,11 @@
 //!
 //! 所有配置项都有合理的默认值，可参考各结构的 `Default` 实现。
 
+use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use glob::glob;
 
 /// 配置模块错误类型
 #[derive(Debug, thiserror::Error)]
@@ -957,7 +957,9 @@ impl ConfigLoader {
     /// 处理客户端配置文件包含
     ///
     /// 与 `process_includes` 类似，但针对客户端配置
-    fn process_includes_client(config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn process_includes_client(
+        config: &mut ClientConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let includes = config.includes.clone();
         if let Some(includes) = includes {
             for pattern in includes {
@@ -1060,7 +1062,9 @@ impl ConfigLoader {
     }
 
     /// 替换服务器配置中的环境变量
-    fn replace_environment_variables(config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_environment_variables(
+        config: &mut ServerConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         config.bind_addr = Self::replace_env_vars(&config.bind_addr);
         if let Some(ref mut includes) = config.includes {
             for item in includes.iter_mut() {
@@ -1074,7 +1078,9 @@ impl ConfigLoader {
     }
 
     /// 替换客户端配置中的环境变量
-    fn replace_environment_variables_client(config: &mut ClientConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn replace_environment_variables_client(
+        config: &mut ClientConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         config.server_addr = Self::replace_env_vars(&config.server_addr);
         if let Some(ref mut includes) = config.includes {
             for item in includes.iter_mut() {
@@ -1183,28 +1189,40 @@ single = 8080
 
     #[test]
     fn test_validate_server_config_missing_port() {
-        let config = ServerConfig { bind_port: 0, ..Default::default() };
+        let config = ServerConfig {
+            bind_port: 0,
+            ..Default::default()
+        };
         let result = ConfigLoader::validate_server_config(&config);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_server_config_success() {
-        let config = ServerConfig { bind_port: 9300, ..Default::default() };
+        let config = ServerConfig {
+            bind_port: 9300,
+            ..Default::default()
+        };
         let result = ConfigLoader::validate_server_config(&config);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_client_config_missing_addr() {
-        let config = ClientConfig { server_addr: "".to_string(), ..Default::default() };
+        let config = ClientConfig {
+            server_addr: "".to_string(),
+            ..Default::default()
+        };
         let result = ConfigLoader::validate_client_config(&config);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_client_config_missing_port() {
-        let config = ClientConfig { server_port: 0, ..Default::default() };
+        let config = ClientConfig {
+            server_port: 0,
+            ..Default::default()
+        };
         let result = ConfigLoader::validate_client_config(&config);
         assert!(result.is_err());
     }
@@ -1288,7 +1306,13 @@ custom_domains = ["example.com", "www.example.com"]
         let proxy: ProxyConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(proxy.name, "web");
         assert_eq!(proxy.r#type, "http");
-        assert_eq!(proxy.custom_domains, Some(vec!["example.com".to_string(), "www.example.com".to_string()]));
+        assert_eq!(
+            proxy.custom_domains,
+            Some(vec![
+                "example.com".to_string(),
+                "www.example.com".to_string()
+            ])
+        );
     }
 
     #[test]

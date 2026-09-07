@@ -1,7 +1,7 @@
-use std::env;
-use tracing::{info, error, warn};
-use rust_frp_config::ConfigLoader;
 use rust_frp_client::Client;
+use rust_frp_config::ConfigLoader;
+use std::env;
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -18,12 +18,20 @@ async fn main() {
 
     let config = match ConfigLoader::load_client_config(&config_path) {
         Ok(config) => {
-            info!("Loaded config: server_addr={}, server_port={}, proxies_len={}", config.server_addr, config.server_port, config.proxies.len());
+            info!(
+                "Loaded config: server_addr={}, server_port={}, proxies_len={}",
+                config.server_addr,
+                config.server_port,
+                config.proxies.len()
+            );
             for (i, proxy) in config.proxies.iter().enumerate() {
-                info!("Proxy {}: name={}, type={}, local_port={}, remote_port={:?}", i, proxy.name, proxy.r#type, proxy.local_port, proxy.remote_port);
+                info!(
+                    "Proxy {}: name={}, type={}, local_port={}, remote_port={:?}",
+                    i, proxy.name, proxy.r#type, proxy.local_port, proxy.remote_port
+                );
             }
             config
-        },
+        }
         Err(e) => {
             error!("Failed to load config: {:?}", e);
             return;
@@ -64,21 +72,25 @@ async fn main() {
     tokio::spawn(async move {
         use notify::{Event, EventKind, RecursiveMode, Watcher};
         let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1);
-        let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                if matches!(event.kind, EventKind::Modify(_)) {
-                    let _ = watch_tx.blocking_send(());
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if matches!(event.kind, EventKind::Modify(_)) {
+                        let _ = watch_tx.blocking_send(());
+                    }
                 }
-            }
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("Failed to create file watcher: {}", e);
-                return;
-            }
-        };
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!("Failed to create file watcher: {}", e);
+                    return;
+                }
+            };
 
-        if let Err(e) = watcher.watch(std::path::Path::new(&watch_path), RecursiveMode::NonRecursive) {
+        if let Err(e) = watcher.watch(
+            std::path::Path::new(&watch_path),
+            RecursiveMode::NonRecursive,
+        ) {
             warn!("Failed to watch config file {}: {}", watch_path, e);
             return;
         }
@@ -97,7 +109,9 @@ async fn main() {
     });
 
     // 启动 Ctrl+C 信号处理
-    if let Ok(mut sigint) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+    if let Ok(mut sigint) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    {
         tokio::spawn(async move {
             sigint.recv().await;
             info!("Received SIGINT, shutting down...");
