@@ -234,6 +234,14 @@ pub struct LoginRespMsg {
     pub run_id: String,
     /// 错误信息（空表示成功）
     pub error: String,
+    /// 工作连接是否需要 TLS（服务器 TLS 协商字段）
+    ///
+    /// # 兼容性
+    ///
+    /// `#[serde(default)]`：旧版服务端不发送此字段时默认 false，
+    /// 客户端按明文建立工作连接（保持旧行为）。
+    #[serde(default)]
+    pub work_conn_tls: bool,
 }
 
 /// 代理注册消息 - 客户端请求注册一个代理
@@ -958,11 +966,21 @@ mod tests {
             version: "1.0.0".to_string(),
             run_id: "server-run-001".to_string(),
             error: "".to_string(),
+            work_conn_tls: true,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: LoginRespMsg = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.version, "1.0.0");
         assert_eq!(deserialized.error, "");
+        assert!(deserialized.work_conn_tls);
+    }
+
+    #[test]
+    fn test_login_resp_msg_backward_compatible() {
+        // 旧版服务端不发送 work_conn_tls 字段 → 反序列化为 false（明文工作连接）
+        let json = r#"{"version":"1.0.0","run_id":"run-1","error":""}"#;
+        let deserialized: LoginRespMsg = serde_json::from_str(json).unwrap();
+        assert!(!deserialized.work_conn_tls);
     }
 
     #[test]

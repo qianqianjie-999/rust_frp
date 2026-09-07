@@ -510,6 +510,34 @@ impl VisitorManager for ClientVisitorManager {
     }
 }
 
+/// 构建客户端 TLS 配置（供控制连接与工作连接复用）
+///
+/// 与原版 frp 保持一致：
+/// - 配置了 trusted_ca_file → 使用 CA 证书验证
+/// - 未配置 trusted_ca_file → 跳过证书验证（默认行为）
+fn build_client_tls_config(
+    config: &rust_frp_config::ClientConfig,
+) -> Result<Option<TlsConfig>, Box<dyn std::error::Error>> {
+    Ok(if let Some(tls) = &config.transport.tls {
+        if tls.enable {
+            if let Some(ref ca_file) = tls.trusted_ca_file {
+                Some(TlsConfig::new_client_with_ca_file(ca_file)?)
+            } else {
+                Some(TlsConfig::new_client_insecure()?)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    })
+}
+
+/// 计算服务器工作连接端口（frps.toml 的 work_conn_port，默认 server_port + 1000）
+fn work_conn_port_of(config: &rust_frp_config::ClientConfig) -> u16 {
+    config.work_conn_port.unwrap_or(config.server_port + 1000)
+}
+
 /// 客户端连接器
 pub struct Connector {
     config: rust_frp_config::ClientConfig,
@@ -518,22 +546,7 @@ pub struct Connector {
 
 impl Connector {
     pub fn new(config: rust_frp_config::ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let tls_config = if let Some(tls) = &config.transport.tls {
-            if tls.enable {
-                // 与原版 frp 保持一致：
-                // - 配置了 trusted_ca_file → 使用 CA 证书验证
-                // - 未配置 trusted_ca_file → 跳过证书验证（默认行为）
-                if let Some(ref ca_file) = tls.trusted_ca_file {
-                    Some(TlsConfig::new_client_with_ca_file(ca_file)?)
-                } else {
-                    Some(TlsConfig::new_client_insecure()?)
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let tls_config = build_client_tls_config(&config)?;
 
         let conn_manager = ConnManager::new(tls_config, config.transport.pool_count as usize);
 
@@ -596,6 +609,8 @@ pub struct ClientControl {
     stcp_visitor_tx: tokio::sync::mpsc::Sender<Message>,
     stcp_visitor_rx: tokio::sync::mpsc::Receiver<Message>,
     last_pong_time: std::time::Instant,
+    /// 工作连接是否使用 TLS（来自服务器 LoginRespMsg.work_conn_tls 协商）
+    work_conn_tls: bool,
 }
 
 impl ClientControl {
@@ -607,6 +622,7 @@ impl ClientControl {
         auth_manager: Arc<AuthManager>,
         work_conn_manager: Arc<WorkConnManager>,
         config: ClientConfig,
+        work_conn_tls: bool,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(256);
         let (stcp_tx, stcp_rx) = tokio::sync::mpsc::channel::<Message>(100);
@@ -624,11 +640,17 @@ impl ClientControl {
             stcp_visitor_tx: stcp_tx,
             stcp_visitor_rx: stcp_rx,
             last_pong_time: std::time::Instant::now(),
+            work_conn_tls,
         }
     }
 
     pub fn stcp_visitor_sender(&self) -> tokio::sync::mpsc::Sender<Message> {
         self.stcp_visitor_tx.clone()
+    }
+
+    /// 工作连接是否需要 TLS（服务器 LoginRespMsg.work_conn_tls 协商结果）
+    pub fn work_conn_tls(&self) -> bool {
+        self.work_conn_tls
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -721,10 +743,14 @@ impl ClientControl {
                 let proxy_name = req_work_conn_msg.proxy_name.clone();
                 let run_id = self.run_id.clone();
                 let config = self.config.clone();
+                let work_conn_tls = self.work_conn_tls;
 
                 tokio::spawn(async move {
                     log::debug!("开始建立工作连接: proxy={}", proxy_name);
-                    if let Err(e) = establish_work_connection(&proxy_name, &run_id, &config).await {
+                    if let Err(e) =
+                        establish_work_connection(&proxy_name, &run_id, &config, work_conn_tls)
+                            .await
+                    {
                         if e.to_string().to_lowercase().contains("connection reset")
                             || e.to_string().to_lowercase().contains("connection aborted")
                             || e.to_string().to_lowercase().contains("broken pipe")
@@ -918,10 +944,14 @@ fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
 }
 
 /// 建立工作连接（独立函数，供 ClientControl::run 调用）
+///
+/// - 端口：优先使用客户端配置的 work_conn_port，默认 server_port + 1000
+/// - TLS：服务器通过 LoginRespMsg.work_conn_tls 协商后按需 TLS 加密
 async fn establish_work_connection(
     proxy_name: &str,
     run_id: &str,
     config: &ClientConfig,
+    work_conn_tls: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 查找代理配置
     let proxy_config = config
@@ -930,12 +960,27 @@ async fn establish_work_connection(
         .find(|p| p.name == proxy_name)
         .ok_or_else(|| format!("Proxy config not found: {}", proxy_name))?;
 
-    // 连接到服务器的工作连接端口 (server_port + 1000)
-    let work_port = config.server_port + 1000;
+    // 连接到服务器的工作连接端口
+    let work_port = work_conn_port_of(config);
     let work_addr = format!("{}:{}", config.server_addr, work_port);
 
-    let mut work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
+    let work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
     log::info!("Connected to server work conn port: {}", work_addr);
+
+    // 服务器协商要求 TLS 时，工作连接套 TLS（复用控制连接的客户端 TLS 配置）
+    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if work_conn_tls {
+        let tls_config = build_client_tls_config(config)
+            .map_err(|e| format!("failed to build client TLS config: {}", e))?
+            .ok_or("server requires TLS work conn but client tls is disabled")?;
+        let tls_stream = tls_config
+            .connect(&config.server_addr, work_conn)
+            .await
+            .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
+        log::info!("Work conn TLS established for proxy: {}", proxy_name);
+        Box::new(tls_stream)
+    } else {
+        Box::new(work_conn)
+    };
 
     // 生成 sign_key
     let sign_key = config
@@ -1055,6 +1100,7 @@ async fn start_stcp_visitor(
     stcp_tx: tokio::sync::mpsc::Sender<Message>,
     run_id: String,
     config: ClientConfig,
+    work_conn_tls: bool,
 ) {
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -1082,8 +1128,11 @@ async fn start_stcp_visitor(
                 let tx = stcp_tx.clone();
                 let rid = run_id.clone();
                 let cfg = config.clone();
+                let wct = work_conn_tls;
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stcp_visitor_conn(local_conn, pn, tx, rid, cfg).await {
+                    if let Err(e) =
+                        handle_stcp_visitor_conn(local_conn, pn, tx, rid, cfg, wct).await
+                    {
                         log::error!("STCP visitor connection error: {:?}", e);
                     }
                 });
@@ -1104,6 +1153,7 @@ async fn handle_stcp_visitor_conn(
     stcp_tx: tokio::sync::mpsc::Sender<Message>,
     run_id: String,
     config: ClientConfig,
+    work_conn_tls: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_xtcp = config
         .visitors
@@ -1151,10 +1201,23 @@ async fn handle_stcp_visitor_conn(
         return Err(format!("Failed to send StcpVisitor: {}", e).into());
     }
 
-    let work_port = config.server_port + 1000;
+    // 工作连接端口与 TLS 协商（与 establish_work_connection 保持一致）
+    let work_port = work_conn_port_of(&config);
     let work_addr = format!("{}:{}", config.server_addr, work_port);
-    let mut work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
+    let tcp_conn = tokio::net::TcpStream::connect(&work_addr).await?;
     log::info!("STCP visitor work conn to: {}", work_addr);
+    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if work_conn_tls {
+        let tls_config = build_client_tls_config(&config)
+            .map_err(|e| format!("failed to build client TLS config: {}", e))?
+            .ok_or("server requires TLS work conn but client tls is disabled")?;
+        let tls_stream = tls_config
+            .connect(&config.server_addr, tcp_conn)
+            .await
+            .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
+        Box::new(tls_stream)
+    } else {
+        Box::new(tcp_conn)
+    };
 
     let work_sign_key = config
         .auth
@@ -1516,6 +1579,7 @@ impl Client {
                         let control = control.lock().await;
                         let stcp_tx = control.stcp_visitor_sender();
                         let run_id = control.run_id.clone();
+                        let work_conn_tls = control.work_conn_tls();
                         drop(control);
                         for visitor in &self.config.visitors {
                             if visitor.r#type == "stcp" || visitor.r#type == "xtcp" {
@@ -1525,7 +1589,7 @@ impl Client {
                                 let cfg = self.config.clone();
                                 let rid = run_id.clone();
                                 tokio::spawn(async move {
-                                    start_stcp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg).await;
+                                    start_stcp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg, work_conn_tls).await;
                                 });
                             }
                         }
@@ -1743,8 +1807,12 @@ impl Client {
                     )));
                 }
 
-                // 创建客户端控制
+                // 创建客户端控制（work_conn_tls 来自服务器协商）
                 let run_id = login_resp_msg.run_id.clone();
+                let work_conn_tls = login_resp_msg.work_conn_tls;
+                if work_conn_tls {
+                    log::info!("Server negotiated TLS for work connections");
+                }
                 let control = ClientControl::new(
                     conn,
                     login_resp_msg.run_id,
@@ -1753,6 +1821,7 @@ impl Client {
                     self.auth_manager.clone(),
                     self.work_conn_manager.clone(),
                     self.config.clone(),
+                    work_conn_tls,
                 );
                 self.control = Some(Mutex::new(control));
 

@@ -14,6 +14,11 @@
 server_addr = "127.0.0.1"
 server_port = 9300
 
+# 可选：服务器工作连接端口
+# 未设置时默认使用 server_port + 1000
+# 需与服务端 frps.toml 的 work_conn_port 一致
+# work_conn_port = 10300
+
 # 可选：多用户场景的用户名
 # user = "user1"
 
