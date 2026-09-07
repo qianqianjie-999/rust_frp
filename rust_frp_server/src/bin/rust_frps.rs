@@ -1,7 +1,7 @@
-use std::env;
-use tracing::{info, error, warn};
 use rust_frp_config::ConfigLoader;
 use rust_frp_server::Server;
+use std::env;
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -62,21 +62,25 @@ async fn main() {
     tokio::spawn(async move {
         use notify::{Event, EventKind, RecursiveMode, Watcher};
         let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1);
-        let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res {
-                if matches!(event.kind, EventKind::Modify(_)) {
-                    let _ = watch_tx.blocking_send(());
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                if let Ok(event) = res {
+                    if matches!(event.kind, EventKind::Modify(_)) {
+                        let _ = watch_tx.blocking_send(());
+                    }
                 }
-            }
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("Failed to create file watcher: {}", e);
-                return;
-            }
-        };
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!("Failed to create file watcher: {}", e);
+                    return;
+                }
+            };
 
-        if let Err(e) = watcher.watch(std::path::Path::new(&watch_path), RecursiveMode::NonRecursive) {
+        if let Err(e) = watcher.watch(
+            std::path::Path::new(&watch_path),
+            RecursiveMode::NonRecursive,
+        ) {
             warn!("Failed to watch config file {}: {}", watch_path, e);
             return;
         }
@@ -96,7 +100,9 @@ async fn main() {
     });
 
     // 启动 Ctrl+C 信号处理
-    if let Ok(mut sigint) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+    if let Ok(mut sigint) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    {
         tokio::spawn(async move {
             sigint.recv().await;
             info!("Received SIGINT, shutting down...");
