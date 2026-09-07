@@ -152,6 +152,20 @@ pub struct ServerConfig {
     /// ```
     pub allow_ports: Vec<PortRange>,
 
+    /// 单用户最大端口数限制（可选）
+    ///
+    /// # 说明
+    ///
+    /// - 限制单个用户注册的 TCP/UDP 代理数量（HTTP/HTTPS/STCP 等不占用端口配额）
+    /// - 未设置或设置为 0 表示不限制
+    ///
+    /// # 配置示例
+    ///
+    /// ```toml
+    /// max_ports_per_user = 5
+    /// ```
+    pub max_ports_per_user: Option<usize>,
+
     /// 自定义 404 页面路径（可选）
     pub custom_404_page: Option<String>,
 
@@ -183,6 +197,7 @@ impl Default for ServerConfig {
             auth: AuthConfig::default(),
             transport: TransportConfig::default(),
             allow_ports: Vec::new(),
+            max_ports_per_user: None,
             custom_404_page: None,
             includes: None,
             proxies: Vec::new(),

@@ -837,6 +837,26 @@ pub trait ProxyManager {
         config: rust_frp_config::ProxyConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+    /// 添加代理（带用户信息，用于服务端 max_ports_per_user 配额控制）
+    ///
+    /// # 参数
+    ///
+    /// - `config`: 代理配置
+    /// - `user`: 注册该代理的用户名
+    ///
+    /// # 默认实现
+    ///
+    /// 忽略用户信息，直接委托给 [`ProxyManager::add_proxy`]，
+    /// 客户端实现无需感知配额逻辑。
+    async fn add_proxy_for_user(
+        &self,
+        config: rust_frp_config::ProxyConfig,
+        user: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _ = user;
+        self.add_proxy(config).await
+    }
+
     /// 移除代理
     ///
     /// # 参数

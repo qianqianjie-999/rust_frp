@@ -1066,7 +1066,10 @@ impl Control {
                                                     let proxy_name = proxy.name.clone();
                                                     let proxy_type = proxy.r#type.clone();
                                                     let proxy_remote_port = proxy.remote_port;
-                                                    let result = self.proxy_manager.add_proxy(proxy).await;
+                                                    let result = self
+                                                        .proxy_manager
+                                                        .add_proxy_for_user(proxy, &self.user)
+                                                        .await;
 
                                                     let error_msg = match result {
                                                         Ok(_) => {
@@ -1545,6 +1548,12 @@ pub struct ServerProxyManager {
     auth_manager: Arc<AuthManager>,
     /// 允许的端口列表（空列表 = 默认拒绝所有）
     allow_ports: Vec<rust_frp_config::PortRange>,
+    /// 单用户最大端口配额（None = 不限制，对应 max_ports_per_user 配置）
+    max_ports_per_user: Option<usize>,
+    /// 用户已占用端口计数 (user -> ports_used)
+    user_port_counts: RwLock<std::collections::HashMap<String, usize>>,
+    /// 代理归属与端口占用记录 (proxy_name -> (user, ports_used))，用于移除时释放配额
+    proxy_user_ports: RwLock<std::collections::HashMap<String, (String, usize)>>,
     /// accept 任务的 JoinHandle，用于 stop_proxy 时立即中止
     accept_handles: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
 }
@@ -1561,11 +1570,13 @@ fn port_allowed(port: u16, ranges: &[rust_frp_config::PortRange]) -> bool {
                 return true;
             }
         }
-        // 范围匹配
-        let start = range.start.unwrap_or(0);
-        let end = range.end.unwrap_or(65535);
-        if port >= start && port <= end {
-            return true;
+        // 范围匹配：start/end 均显式配置时才按范围判定。
+        // 修复：此前 start/end 缺省 0/65535，导致 { single = x } 条目
+        // 实际放行全部端口，白名单形同虚设。
+        if let (Some(start), Some(end)) = (range.start, range.end) {
+            if port >= start && port <= end {
+                return true;
+            }
         }
     }
     false
@@ -1579,6 +1590,7 @@ impl ServerProxyManager {
         work_conn_manager: Arc<ServerWorkConnManager>,
         auth_manager: Arc<AuthManager>,
         allow_ports: Vec<rust_frp_config::PortRange>,
+        max_ports_per_user: Option<usize>,
     ) -> Self {
         if allow_ports.is_empty() {
             log::warn!(
@@ -1596,6 +1608,9 @@ impl ServerProxyManager {
             work_conn_manager,
             auth_manager,
             allow_ports,
+            max_ports_per_user,
+            user_port_counts: RwLock::new(std::collections::HashMap::new()),
+            proxy_user_ports: RwLock::new(std::collections::HashMap::new()),
             accept_handles: RwLock::new(std::collections::HashMap::new()),
         }
     }
@@ -2089,6 +2104,80 @@ impl ServerProxyManager {
         Ok(())
     }
 
+    /// 释放代理占用的用户端口配额（幂等，未记录时为空操作）
+    async fn release_user_quota(&self, proxy_name: &str) {
+        let entry = self.proxy_user_ports.write().await.remove(proxy_name);
+        if let Some((user, ports_used)) = entry {
+            let mut counts = self.user_port_counts.write().await;
+            if let Some(current) = counts.get_mut(&user) {
+                *current = current.saturating_sub(ports_used);
+                if *current == 0 {
+                    counts.remove(&user);
+                }
+            }
+        }
+    }
+
+    /// 添加代理的统一入口
+    ///
+    /// - `user: Some(user)` 时执行 max_ports_per_user 配额检查与记账
+    /// - 启动失败时回滚 proxies map 与配额预占，修复失败后残留条目的问题
+    async fn add_proxy_inner(
+        &self,
+        config: &rust_frp_config::ProxyConfig,
+        user: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 1. 同名代理冲突检查（与 frp 行为一致，防止覆盖导致旧监听器泄漏）
+        {
+            let proxies = self.proxies.read().await;
+            if proxies.contains_key(&config.name) {
+                return Err(format!("proxy [{}] already exists", config.name).into());
+            }
+        }
+
+        // 2. 用户端口配额检查与预占（TCP/UDP 各占 1 个端口，其他类型不占用，与 frp 一致）
+        let ports_used: usize = match config.r#type.as_str() {
+            "tcp" | "udp" => 1,
+            _ => 0,
+        };
+        let quota_tracked = user.is_some() && ports_used > 0 && self.max_ports_per_user.is_some();
+        if quota_tracked {
+            let user = user.unwrap();
+            let limit = self.max_ports_per_user.unwrap();
+            let mut counts = self.user_port_counts.write().await;
+            let current = counts.get(user).copied().unwrap_or(0);
+            if current + ports_used > limit {
+                return Err(format!(
+                    "proxy [{}] rejected: user [{}] exceeds max_ports_per_user limit {}",
+                    config.name, user, limit
+                )
+                .into());
+            }
+            counts.insert(user.to_string(), current + ports_used);
+            drop(counts);
+            self.proxy_user_ports.write().await.insert(
+                config.name.clone(),
+                (user.to_string(), ports_used),
+            );
+        }
+
+        // 3. 先写入 map 声明代理名，启动失败则回滚
+        {
+            let mut proxies = self.proxies.write().await;
+            proxies.insert(config.name.clone(), config.clone());
+        }
+        if let Err(e) = self.start_proxy(config).await {
+            let mut proxies = self.proxies.write().await;
+            proxies.remove(&config.name);
+            if quota_tracked {
+                self.release_user_quota(&config.name).await;
+            }
+            log::error!("failed to start proxy [{}], rolled back: {:?}", config.name, e);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// 发送 UDP 数据包到指定访问者
     pub async fn send_udp_packet(
         &self,
@@ -2117,10 +2206,15 @@ impl ProxyManager for ServerProxyManager {
         &self,
         config: rust_frp_config::ProxyConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut proxies = self.proxies.write().await;
-        proxies.insert(config.name.clone(), config.clone());
-        drop(proxies);
-        self.start_proxy(&config).await
+        self.add_proxy_inner(&config, None).await
+    }
+
+    async fn add_proxy_for_user(
+        &self,
+        config: rust_frp_config::ProxyConfig,
+        user: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.add_proxy_inner(&config, Some(user)).await
     }
 
     async fn remove_proxy(
@@ -2130,6 +2224,8 @@ impl ProxyManager for ServerProxyManager {
         self.stop_proxy(name).await?;
         let mut proxies = self.proxies.write().await;
         proxies.remove(name);
+        // 释放该代理占用的用户端口配额
+        self.release_user_quota(name).await;
         Ok(())
     }
 
@@ -2148,6 +2244,8 @@ impl ProxyManager for ServerProxyManager {
     async fn clear(&self) {
         let mut proxies = self.proxies.write().await;
         proxies.clear();
+        self.user_port_counts.write().await.clear();
+        self.proxy_user_ports.write().await.clear();
         log::info!("Server proxy manager cleared");
     }
 
@@ -2626,6 +2724,7 @@ impl Server {
             work_conn_manager.clone(),
             auth_manager.clone(),
             config.allow_ports.clone(),
+            config.max_ports_per_user,
         ));
         let visitor_manager = Arc::new(ServerVisitorManager::new());
         let metrics = Arc::new(MonitorMetrics::new());
