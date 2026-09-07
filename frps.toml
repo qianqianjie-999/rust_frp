@@ -169,6 +169,12 @@ tls = { enable = true }
 #     key_file = "/path/to/server.key"
 # }
 
+# 强制 TLS（可选，对齐 frp 的 transport.tls.force）
+# 开启后所有连接（含工作连接）必须使用 TLS，明文连接将被拒绝
+# 前置条件：tls.enable = true，否则启动报错
+# 注意：开启后 KCP（明文 UDP）监听也会被拒绝启动
+# tls_only = false
+
 # 启用 TCP 多路复用
 # 多个业务流共享单个 TCP 连接，减少握手延迟
 # 默认: true

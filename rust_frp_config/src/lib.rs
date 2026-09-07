@@ -246,6 +246,14 @@ pub struct ClientConfig {
     /// 服务器控制连接端口
     pub server_port: u16,
 
+    /// 服务器工作连接端口（可选）
+    ///
+    /// # 说明
+    ///
+    /// - 未设置时默认使用 server_port + 1000
+    /// - 需与服务端 frps.toml 的 work_conn_port 一致
+    pub work_conn_port: Option<u16>,
+
     /// 用户名（可选，用于多用户场景）
     pub user: Option<String>,
 
@@ -280,6 +288,7 @@ impl Default for ClientConfig {
         Self {
             server_addr: "127.0.0.1".to_string(),
             server_port: 7000,
+            work_conn_port: None,
             user: None,
             client_id: None,
             web_server: WebServerConfig::default(),
@@ -402,6 +411,22 @@ pub struct TransportConfig {
     /// 多个业务流共享单个 TCP 连接，减少握手延迟
     pub tcp_mux: bool,
 
+    /// 强制 TLS（仅服务端有效，对齐 frp 的 transport.tls.force）
+    ///
+    /// # 说明
+    ///
+    /// - 开启后所有连接（含工作连接）必须使用 TLS，明文连接将被拒绝
+    /// - 前置条件：`tls.enable = true`，否则启动报错
+    ///
+    /// # 配置示例
+    ///
+    /// ```toml
+    /// [transport.tls]
+    /// enable = true
+    /// # tls_only = true
+    /// ```
+    pub tls_only: bool,
+
     /// 连接池大小
     ///
     /// 客户端预建立的工作连接数量。建议值：5-100
@@ -417,6 +442,7 @@ impl Default for TransportConfig {
             protocol: "tcp".to_string(),
             tls: None,
             tcp_mux: true,
+            tls_only: false,
             pool_count: 10,
             bandwidth_limit: None,
         }
