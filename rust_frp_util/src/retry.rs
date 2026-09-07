@@ -51,9 +51,9 @@
 //! - 合理设置最大延迟
 //! - 区分可重试和不可重试的错误
 
-use std::time::Duration;
+use log::{error, info, warn};
 use std::future::Future;
-use log::{info, warn, error};
+use std::time::Duration;
 
 /// 重试策略配置
 #[derive(Debug, Clone)]
@@ -158,7 +158,11 @@ where
         match operation().await {
             Ok(value) => {
                 if attempt > 0 {
-                    info!("{} succeeded after {} attempts", operation_name, attempt + 1);
+                    info!(
+                        "{} succeeded after {} attempts",
+                        operation_name,
+                        attempt + 1
+                    );
                 }
                 return Ok(RetryResult {
                     value,
@@ -173,7 +177,7 @@ where
                 if attempt < config.max_retries {
                     let delay = config.calculate_delay(attempt + 1);
                     total_delay += delay;
-                    
+
                     warn!(
                         "{} failed (attempt {}/{}): {}. Retrying in {:?}...",
                         operation_name,
@@ -182,7 +186,7 @@ where
                         error_msg,
                         delay
                     );
-                    
+
                     tokio::time::sleep(delay).await;
                 } else {
                     error!(
@@ -296,15 +300,15 @@ mod tests {
     #[test]
     fn test_calculate_delay() {
         let config = RetryConfig::default();
-        
+
         // 第一次重试
         let delay1 = config.calculate_delay(1);
         assert_eq!(delay1, Duration::from_millis(100));
-        
+
         // 第二次重试（指数退避）
         let delay2 = config.calculate_delay(2);
         assert_eq!(delay2, Duration::from_millis(200));
-        
+
         // 第三次重试
         let delay3 = config.calculate_delay(3);
         assert_eq!(delay3, Duration::from_millis(400));
@@ -319,7 +323,7 @@ mod tests {
             backoff_multiplier: 10.0,
             use_exponential_backoff: true,
         };
-        
+
         // 延迟应该被限制在 max_delay
         let delay = config.calculate_delay(5);
         assert_eq!(delay, Duration::from_secs(5));

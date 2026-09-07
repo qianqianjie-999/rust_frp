@@ -1,8 +1,8 @@
-use rust_frp_config::{
-    ServerConfig, ClientConfig, ProxyConfig, AuthConfig, TransportConfig,
-    TlsConfig, PortRange, WebServerConfig, OidcConfig,
-};
 use rust_frp_auth::AuthManager;
+use rust_frp_config::{
+    AuthConfig, ClientConfig, OidcConfig, PortRange, ProxyConfig, ServerConfig, TlsConfig,
+    TransportConfig, WebServerConfig,
+};
 use rust_frp_core::Message;
 use rust_frp_util::{get_timestamp, rand_id};
 
@@ -15,8 +15,16 @@ fn make_server_config(port: u16) -> ServerConfig {
         vhost_http_port: None,
         vhost_https_port: None,
         allow_ports: vec![
-            PortRange { single: Some(port + 1), start: None, end: None },
-            PortRange { start: Some(port + 100), end: Some(port + 200), single: None },
+            PortRange {
+                single: Some(port + 1),
+                start: None,
+                end: None,
+            },
+            PortRange {
+                start: Some(port + 100),
+                end: Some(port + 200),
+                single: None,
+            },
         ],
         auth: AuthConfig {
             method: "token".to_string(),
@@ -24,10 +32,16 @@ fn make_server_config(port: u16) -> ServerConfig {
             ..Default::default()
         },
         transport: TransportConfig {
-            tls: Some(TlsConfig { enable: false, ..Default::default() }),
+            tls: Some(TlsConfig {
+                enable: false,
+                ..Default::default()
+            }),
             ..Default::default()
         },
-        web_server: WebServerConfig { port: 0, ..Default::default() },
+        web_server: WebServerConfig {
+            port: 0,
+            ..Default::default()
+        },
         ..ServerConfig::default()
     }
 }
@@ -42,19 +56,20 @@ fn make_client_config(server_port: u16) -> ClientConfig {
             ..Default::default()
         },
         transport: TransportConfig {
-            tls: Some(TlsConfig { enable: false, ..Default::default() }),
+            tls: Some(TlsConfig {
+                enable: false,
+                ..Default::default()
+            }),
             ..Default::default()
         },
-        proxies: vec![
-            ProxyConfig {
-                name: "test_tcp".to_string(),
-                r#type: "tcp".to_string(),
-                local_ip: "127.0.0.1".to_string(),
-                local_port: 0,
-                remote_port: Some(server_port + 1),
-                ..Default::default()
-            },
-        ],
+        proxies: vec![ProxyConfig {
+            name: "test_tcp".to_string(),
+            r#type: "tcp".to_string(),
+            local_ip: "127.0.0.1".to_string(),
+            local_port: 0,
+            remote_port: Some(server_port + 1),
+            ..Default::default()
+        }],
         ..ClientConfig::default()
     }
 }
@@ -139,10 +154,16 @@ async fn test_hsmac_sign_roundtrip() {
         ..Default::default()
     };
     let manager = AuthManager::new(&config).unwrap();
-    let sign_key = manager.generate_work_conn_sign_key("run_abc").await.unwrap();
+    let sign_key = manager
+        .generate_work_conn_sign_key("run_abc")
+        .await
+        .unwrap();
     assert!(!sign_key.is_empty());
 
-    let sign_key2 = manager.generate_work_conn_sign_key("run_abc").await.unwrap();
+    let sign_key2 = manager
+        .generate_work_conn_sign_key("run_abc")
+        .await
+        .unwrap();
     assert_eq!(sign_key, sign_key2);
 }
 
@@ -663,7 +684,10 @@ fn test_auth_config_oidc_method() {
     };
     assert_eq!(config.method, "oidc");
     assert!(config.oidc.is_some());
-    assert_eq!(config.oidc.as_ref().unwrap().issuer, "https://auth.example.com");
+    assert_eq!(
+        config.oidc.as_ref().unwrap().issuer,
+        "https://auth.example.com"
+    );
 }
 
 #[test]

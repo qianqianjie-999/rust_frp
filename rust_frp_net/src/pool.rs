@@ -41,14 +41,14 @@
 //! - 最大生命周期限制
 //! - 并发访问安全（使用 Mutex/RwLock）
 
+use super::FrpConn;
+use log::{debug, info};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock, Semaphore};
-use log::{debug, info};
-use super::FrpConn;
 
 /// 连接池配置
 #[derive(Debug, Clone)]
@@ -219,13 +219,14 @@ impl ConnPool {
     /// 获取连接
     pub async fn get(&self) -> Result<PooledConn, std::io::Error> {
         // 获取许可
-        let _permit = self.semaphore.acquire().await.map_err(|e| {
-            std::io::Error::other(format!("Failed to acquire semaphore: {}", e))
-        })?;
+        let _permit =
+            self.semaphore.acquire().await.map_err(|e| {
+                std::io::Error::other(format!("Failed to acquire semaphore: {}", e))
+            })?;
 
         // 首先尝试从池中获取空闲连接
         let mut connections = self.connections.lock().await;
-        
+
         while let Some(mut conn) = connections.pop() {
             // 检查连接是否过期
             if conn.is_expired(self.config.max_idle_time, self.config.max_lifetime) {
@@ -249,27 +250,29 @@ impl ConnPool {
                 s.total_reused += 1;
                 s.current_in_use += 1;
                 s.current_idle = connections.len();
-            }).await;
-            
+            })
+            .await;
+
             debug!("Reusing connection from pool");
             return Ok(conn);
         }
 
         // 池中没有可用连接，创建新连接
         drop(connections);
-        
+
         info!("Creating new connection to {}", self.addr);
         let stream = tokio::time::timeout(
             self.config.connection_timeout,
-            TcpStream::connect(&self.addr)
-        ).await.map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timeout")
-        })??;
+            TcpStream::connect(&self.addr),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Connection timeout"))??;
 
         self.update_stats(|s| {
             s.total_created += 1;
             s.current_in_use += 1;
-        }).await;
+        })
+        .await;
 
         Ok(PooledConn::new(stream))
     }
@@ -283,12 +286,13 @@ impl ConnPool {
             self.update_stats(|s| {
                 s.total_closed += 1;
                 s.current_in_use -= 1;
-            }).await;
+            })
+            .await;
             return;
         }
 
         let mut connections = self.connections.lock().await;
-        
+
         // 如果池已满，关闭连接
         if connections.len() >= self.config.max_size {
             debug!("Pool full, closing connection");
@@ -296,7 +300,8 @@ impl ConnPool {
             self.update_stats(|s| {
                 s.total_closed += 1;
                 s.current_in_use -= 1;
-            }).await;
+            })
+            .await;
             return;
         }
 
@@ -305,8 +310,9 @@ impl ConnPool {
         self.update_stats(|s| {
             s.current_in_use -= 1;
             s.current_idle = connections.len();
-        }).await;
-        
+        })
+        .await;
+
         debug!("Connection returned to pool");
     }
 
@@ -336,23 +342,27 @@ impl ConnPool {
     pub async fn cleanup(&self) {
         let mut connections = self.connections.lock().await;
         let before_count = connections.len();
-        
-        let expired_count = connections.iter().filter(|conn| {
-            conn.is_expired(self.config.max_idle_time, self.config.max_lifetime)
-        }).count();
-        
-        connections.retain(|conn| {
-            !conn.is_expired(self.config.max_idle_time, self.config.max_lifetime)
-        });
+
+        let expired_count = connections
+            .iter()
+            .filter(|conn| conn.is_expired(self.config.max_idle_time, self.config.max_lifetime))
+            .count();
+
+        connections
+            .retain(|conn| !conn.is_expired(self.config.max_idle_time, self.config.max_lifetime));
 
         let after_count = connections.len();
         if before_count != after_count {
-            info!("Cleaned up {} expired connections", before_count - after_count);
+            info!(
+                "Cleaned up {} expired connections",
+                before_count - after_count
+            );
             drop(connections);
             self.update_stats(|s| {
                 s.total_closed += expired_count as u64;
                 s.current_idle = after_count;
-            }).await;
+            })
+            .await;
         }
     }
 
@@ -361,12 +371,13 @@ impl ConnPool {
         let mut connections = self.connections.lock().await;
         let count = connections.len();
         connections.clear();
-        
+
         self.update_stats(|s| {
             s.total_closed += count as u64;
             s.current_idle = 0;
-        }).await;
-        
+        })
+        .await;
+
         info!("Closed all {} connections in pool", count);
     }
 }
@@ -407,7 +418,7 @@ impl PoolManager {
         let pool = Arc::new(ConnPool::new(addr, self.default_config.clone()));
         pools.insert(addr, pool.clone());
         info!("Created new connection pool for {}", addr);
-        
+
         pool
     }
 
@@ -461,19 +472,19 @@ mod tests {
         // 创建一个临时 TCP 监听器
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         // 在后台接受连接
         tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        
+
         // 连接到这个端口
         let tokio_conn = TcpStream::connect(addr).await.unwrap();
         let conn = PooledConn::new(tokio_conn);
-        
+
         // 新连接不应该过期
         assert!(!conn.is_expired(Duration::from_secs(60), Duration::from_secs(3600)));
-        
+
         // 测试过期检测 - 使用极短的过期时间
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(conn.is_expired(Duration::from_millis(5), Duration::from_secs(3600)));

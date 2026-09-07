@@ -37,10 +37,10 @@
 //! ```
 
 use async_trait::async_trait;
-use rust_frp_config::{AuthConfig, OidcConfig};
-use ring::hmac;
-use ring::digest;
 use ring::constant_time;
+use ring::digest;
+use ring::hmac;
+use rust_frp_config::{AuthConfig, OidcConfig};
 
 /// 认证模块错误类型
 #[derive(Debug, thiserror::Error)]
@@ -321,13 +321,14 @@ impl OidcAuthVerifier {
                 )
             })?;
 
-        ring::constant_time::verify_slices_are_equal(expected_tag.as_ref(), &signature)
-            .map_err(|_| {
+        ring::constant_time::verify_slices_are_equal(expected_tag.as_ref(), &signature).map_err(
+            |_| {
                 std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "JWT signature verification failed",
                 )
-            })?;
+            },
+        )?;
 
         // 解码 payload 并验证声明
         let payload_json = base64::decode_config(payload_b64, base64::STANDARD_NO_PAD)
@@ -360,7 +361,10 @@ impl OidcAuthVerifier {
             if iss != self.issuer {
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    format!("JWT issuer mismatch: expected '{}', got '{}'", self.issuer, iss),
+                    format!(
+                        "JWT issuer mismatch: expected '{}', got '{}'",
+                        self.issuer, iss
+                    ),
                 )));
             }
         }
@@ -453,9 +457,7 @@ impl AuthManager {
     ///
     /// - 成功: `Ok(AuthManager)`
     /// - 失败: 认证方法不支持或配置缺失
-    pub fn new(
-        auth_config: &AuthConfig,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(auth_config: &AuthConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // 根据认证方法创建验证器
         let verifier: Box<dyn AuthVerifier + Send + Sync> = match auth_config.method.as_str() {
             "token" => {
@@ -487,7 +489,10 @@ impl AuthManager {
         };
 
         // 从 token 派生加密密钥
-        let encryption_key = auth_config.token.as_ref().map(|token| Self::generate_encryption_key(token));
+        let encryption_key = auth_config
+            .token
+            .as_ref()
+            .map(|token| Self::generate_encryption_key(token));
 
         Ok(Self {
             verifier,
@@ -802,10 +807,19 @@ mod tests {
             oidc: None,
         };
         let manager = AuthManager::new(&config).unwrap();
-        let key1 = manager.generate_work_conn_sign_key("run_001").await.unwrap();
-        let key2 = manager.generate_work_conn_sign_key("run_001").await.unwrap();
+        let key1 = manager
+            .generate_work_conn_sign_key("run_001")
+            .await
+            .unwrap();
+        let key2 = manager
+            .generate_work_conn_sign_key("run_001")
+            .await
+            .unwrap();
         assert_eq!(key1, key2);
-        let key3 = manager.generate_work_conn_sign_key("run_002").await.unwrap();
+        let key3 = manager
+            .generate_work_conn_sign_key("run_002")
+            .await
+            .unwrap();
         assert_ne!(key1, key3);
     }
 
@@ -1014,6 +1028,10 @@ mod tests {
         );
 
         let result = verifier.verify_work_conn("test_user", &token).await;
-        assert!(result.is_ok(), "Valid JWT should pass work conn verification: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Valid JWT should pass work conn verification: {:?}",
+            result.err()
+        );
     }
 }

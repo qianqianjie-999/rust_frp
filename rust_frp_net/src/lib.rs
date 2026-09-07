@@ -25,21 +25,25 @@
 //! - 内置自签名证书，方便快速部署
 //! - 支持自定义证书，可用于生产环境
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio_rustls::{server, client, TlsAcceptor, TlsConnector};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
 use futures_util::{Sink, Stream};
 use std::io::BufReader;
-use tokio_rustls::rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{
+    TcpListener as TokioTcpListener, TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket,
+};
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use tokio_rustls::rustls::pki_types::UnixTime;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::DigitallySignedStruct;
 use tokio_rustls::rustls::Error as TlsError;
 use tokio_rustls::rustls::SignatureScheme;
-use tokio_rustls::rustls::pki_types::UnixTime;
+use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
@@ -149,18 +153,12 @@ where
             std::task::Poll::Ready(Some(Err(e))) => {
                 std::task::Poll::Ready(Err(std::io::Error::other(e)))
             }
-            std::task::Poll::Ready(Some(Ok(_))) => {
-                self.poll_read(cx, buf)
-            }
-            std::task::Poll::Ready(None) => {
-                std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "websocket closed",
-                )))
-            }
-            std::task::Poll::Pending => {
-                std::task::Poll::Pending
-            }
+            std::task::Poll::Ready(Some(Ok(_))) => self.poll_read(cx, buf),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "websocket closed",
+            ))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -178,20 +176,12 @@ where
         match std::pin::Pin::new(&mut self.stream).poll_ready(cx) {
             std::task::Poll::Ready(Ok(())) => {
                 match std::pin::Pin::new(&mut self.stream).start_send(msg) {
-                    Ok(_) => {
-                        std::task::Poll::Ready(Ok(buf.len()))
-                    }
-                    Err(e) => {
-                        std::task::Poll::Ready(Err(std::io::Error::other(e)))
-                    }
+                    Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
+                    Err(e) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
                 }
             }
-            std::task::Poll::Ready(Err(e)) => {
-                std::task::Poll::Ready(Err(std::io::Error::other(e)))
-            }
-            std::task::Poll::Pending => {
-                std::task::Poll::Pending
-            }
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
@@ -200,15 +190,9 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match std::pin::Pin::new(&mut self.stream).poll_flush(cx) {
-            std::task::Poll::Ready(Ok(())) => {
-                std::task::Poll::Ready(Ok(()))
-            }
-            std::task::Poll::Ready(Err(e)) => {
-                std::task::Poll::Ready(Err(std::io::Error::other(e)))
-            }
-            std::task::Poll::Pending => {
-                std::task::Poll::Pending
-            }
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
@@ -217,15 +201,9 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match std::pin::Pin::new(&mut self.stream).poll_close(cx) {
-            std::task::Poll::Ready(Ok(())) => {
-                std::task::Poll::Ready(Ok(()))
-            }
-            std::task::Poll::Ready(Err(e)) => {
-                std::task::Poll::Ready(Err(std::io::Error::other(e)))
-            }
-            std::task::Poll::Pending => {
-                std::task::Poll::Pending
-            }
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -370,26 +348,34 @@ impl TlsConfig {
     pub fn new_server(cert_file: &str, key_file: &str) -> Result<Self, NetError> {
         let cert_file = std::fs::File::open(cert_file)?;
         let mut cert_reader = BufReader::new(cert_file);
-        let cert_chain: Result<Vec<CertificateDer<'static>>, _> = rustls_pemfile::certs(&mut cert_reader)
-            .collect();
+        let cert_chain: Result<Vec<CertificateDer<'static>>, _> =
+            rustls_pemfile::certs(&mut cert_reader).collect();
         let cert_chain = cert_chain.map_err(|e| NetError::PemDecode(format!("{}", e)))?;
 
         let key_file_path = key_file.to_string();
         let key_file = std::fs::File::open(&key_file_path)?;
         let mut key_reader = BufReader::new(key_file);
-        let pkcs8_keys: Result<Vec<_>, _> = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+        let pkcs8_keys: Result<Vec<_>, _> =
+            rustls_pemfile::pkcs8_private_keys(&mut key_reader).collect();
+        let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_keys
+            .map_err(|e| NetError::PemDecode(format!("{}", e)))?
+            .into_iter()
+            .map(|k| k.into())
             .collect();
-        let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_keys.map_err(|e| NetError::PemDecode(format!("{}", e)))?.into_iter().map(|k| k.into()).collect();
-        
+
         if keys.is_empty() {
             let key_file = std::fs::File::open(&key_file_path)?;
             let mut key_reader = BufReader::new(key_file);
-            let rsa_keys: Result<Vec<_>, _> = rustls_pemfile::rsa_private_keys(&mut key_reader)
+            let rsa_keys: Result<Vec<_>, _> =
+                rustls_pemfile::rsa_private_keys(&mut key_reader).collect();
+            let rsa_keys: Vec<PrivateKeyDer<'static>> = rsa_keys
+                .map_err(|e| NetError::PemDecode(format!("{}", e)))?
+                .into_iter()
+                .map(|k| k.into())
                 .collect();
-            let rsa_keys: Vec<PrivateKeyDer<'static>> = rsa_keys.map_err(|e| NetError::PemDecode(format!("{}", e)))?.into_iter().map(|k| k.into()).collect();
             keys.extend(rsa_keys);
         }
-        
+
         if keys.is_empty() {
             return Err(NetError::Other("No private key found in file".to_string()));
         }
@@ -409,8 +395,8 @@ impl TlsConfig {
     pub fn new_client_with_ca_file(ca_file: &str) -> Result<Self, NetError> {
         let cert_file = std::fs::File::open(ca_file)?;
         let mut cert_reader = BufReader::new(cert_file);
-        let certs: Result<Vec<CertificateDer<'static>>, _> = rustls_pemfile::certs(&mut cert_reader)
-            .collect();
+        let certs: Result<Vec<CertificateDer<'static>>, _> =
+            rustls_pemfile::certs(&mut cert_reader).collect();
         let certs = certs.map_err(|e| NetError::PemDecode(format!("{}", e)))?;
 
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
@@ -446,10 +432,11 @@ impl TlsConfig {
 
     /// 创建客户端 TLS 配置（使用系统根证书）
     pub fn new_client() -> Result<Self, NetError> {
-        let root_certs: Vec<CertificateDer<'static>> = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            CertificateDer::from(ta.subject_public_key_info.to_vec())
-        }).collect();
-        
+        let root_certs: Vec<CertificateDer<'static>> = webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .map(|ta| CertificateDer::from(ta.subject_public_key_info.to_vec()))
+            .collect();
+
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
         for cert in root_certs {
             root_store.add(cert).map_err(NetError::Tls)?;
@@ -469,11 +456,12 @@ impl TlsConfig {
     /// 将内置证书添加到 trust store 并启用证书验证
     pub fn new_client_trusting_builtin() -> Result<Self, NetError> {
         let cert_pem = include_bytes!("../cert/frp.crt");
-        let certs: Result<Vec<CertificateDer<'static>>, _> = rustls_pemfile::certs(&mut &cert_pem[..])
-            .collect();
+        let certs: Result<Vec<CertificateDer<'static>>, _> =
+            rustls_pemfile::certs(&mut &cert_pem[..]).collect();
         let certs = certs.map_err(|e| NetError::PemDecode(format!("{}", e)))?;
-        
-        let cert_der = certs.into_iter()
+
+        let cert_der = certs
+            .into_iter()
             .next()
             .ok_or_else(|| NetError::Other("No certificate found in builtin cert".to_string()))?;
 
@@ -495,23 +483,33 @@ impl TlsConfig {
         let cert_pem = include_bytes!("../cert/frp.crt");
         let key_pem = include_bytes!("../cert/frp.key");
 
-        let certs: Result<Vec<CertificateDer<'static>>, _> = rustls_pemfile::certs(&mut &cert_pem[..])
-            .collect();
+        let certs: Result<Vec<CertificateDer<'static>>, _> =
+            rustls_pemfile::certs(&mut &cert_pem[..]).collect();
         let cert_chain = certs.map_err(|e| NetError::PemDecode(format!("{}", e)))?;
 
-        let pkcs8_keys: Result<Vec<_>, _> = rustls_pemfile::pkcs8_private_keys(&mut &key_pem[..])
+        let pkcs8_keys: Result<Vec<_>, _> =
+            rustls_pemfile::pkcs8_private_keys(&mut &key_pem[..]).collect();
+        let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_keys
+            .map_err(|e| NetError::PemDecode(format!("{}", e)))?
+            .into_iter()
+            .map(|k| k.into())
             .collect();
-        let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_keys.map_err(|e| NetError::PemDecode(format!("{}", e)))?.into_iter().map(|k| k.into()).collect();
-        
+
         if keys.is_empty() {
-            let rsa_keys: Result<Vec<_>, _> = rustls_pemfile::rsa_private_keys(&mut &key_pem[..])
+            let rsa_keys: Result<Vec<_>, _> =
+                rustls_pemfile::rsa_private_keys(&mut &key_pem[..]).collect();
+            let rsa_keys: Vec<PrivateKeyDer<'static>> = rsa_keys
+                .map_err(|e| NetError::PemDecode(format!("{}", e)))?
+                .into_iter()
+                .map(|k| k.into())
                 .collect();
-            let rsa_keys: Vec<PrivateKeyDer<'static>> = rsa_keys.map_err(|e| NetError::PemDecode(format!("{}", e)))?.into_iter().map(|k| k.into()).collect();
             keys.extend(rsa_keys);
         }
-        
+
         if keys.is_empty() {
-            return Err(NetError::Other("No private key found in builtin cert".to_string()));
+            return Err(NetError::Other(
+                "No private key found in builtin cert".to_string(),
+            ));
         }
         let key = keys.remove(0);
 
@@ -540,7 +538,10 @@ impl TlsConfig {
     /// # 参数
     ///
     /// * `stream` - 底层 TCP 流
-    pub async fn accept(&self, stream: TokioTcpStream) -> Result<server::TlsStream<TokioTcpStream>, std::io::Error> {
+    pub async fn accept(
+        &self,
+        stream: TokioTcpStream,
+    ) -> Result<server::TlsStream<TokioTcpStream>, std::io::Error> {
         if let Some(config) = &self.server_config {
             let acceptor = TlsAcceptor::from(config.clone());
             acceptor.accept(stream).await.map_err(std::io::Error::other)
@@ -558,12 +559,20 @@ impl TlsConfig {
     ///
     /// * `domain` - 服务器域名
     /// * `stream` - 底层 TCP 流
-    pub async fn connect(&self, domain: &str, stream: TokioTcpStream) -> Result<client::TlsStream<TokioTcpStream>, std::io::Error> {
+    pub async fn connect(
+        &self,
+        domain: &str,
+        stream: TokioTcpStream,
+    ) -> Result<client::TlsStream<TokioTcpStream>, std::io::Error> {
         if let Some(config) = &self.client_config {
-            let server_name = ServerName::try_from(domain.to_string())
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid server name"))?;
+            let server_name = ServerName::try_from(domain.to_string()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid server name")
+            })?;
             let connector = TlsConnector::from(config.clone());
-            connector.connect(server_name, stream).await.map_err(std::io::Error::other)
+            connector
+                .connect(server_name, stream)
+                .await
+                .map_err(std::io::Error::other)
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -594,7 +603,7 @@ impl ConnManager {
             max_size: max_pool_size,
             ..Default::default()
         };
-        
+
         Self {
             tls_config,
             pool_manager: PoolManager::new(pool_config),
@@ -617,7 +626,11 @@ impl ConnManager {
     ///
     /// * `domain` - 服务器域名
     /// * `addr` - 目标地址
-    pub async fn connect_tls(&self, domain: &str, addr: &SocketAddr) -> Result<client::TlsStream<TokioTcpStream>, std::io::Error> {
+    pub async fn connect_tls(
+        &self,
+        domain: &str,
+        addr: &SocketAddr,
+    ) -> Result<client::TlsStream<TokioTcpStream>, std::io::Error> {
         let pooled = self.connect_tcp(addr).await?;
         if let Some(tls_config) = &self.tls_config {
             tls_config.connect(domain, pooled.conn).await
@@ -634,10 +647,14 @@ impl ConnManager {
     /// # 参数
     ///
     /// * `url` - WebSocket 服务地址
-    pub async fn connect_websocket(&self, url: &str) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error> {
-        let (stream, _) = connect_async(url).await.map_err(|e| {
-            std::io::Error::other(e)
-        })?;
+    pub async fn connect_websocket(
+        &self,
+        url: &str,
+    ) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error>
+    {
+        let (stream, _) = connect_async(url)
+            .await
+            .map_err(|e| std::io::Error::other(e))?;
         let remote_addr = "127.0.0.1:0".parse().unwrap();
         Ok(WebSocketConn::new(stream, remote_addr))
     }
@@ -648,7 +665,9 @@ impl ConnManager {
     ///
     /// * `addr` - 目标地址
     pub async fn connect_kcp(&self, addr: &SocketAddr) -> Result<KcpConn, NetError> {
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(NetError::Io)?;
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(NetError::Io)?;
         socket.connect(addr).await.map_err(NetError::Io)?;
         let socket = std::sync::Arc::new(socket);
         KcpConn::new(socket, *addr, None).await
@@ -659,11 +678,14 @@ impl ConnManager {
     /// # 参数
     ///
     /// * `stream` - 底层 TCP 流
-    pub async fn accept_websocket(&self, stream: TokioTcpStream) -> Result<WebSocketConn<TokioTcpStream>, std::io::Error> {
+    pub async fn accept_websocket(
+        &self,
+        stream: TokioTcpStream,
+    ) -> Result<WebSocketConn<TokioTcpStream>, std::io::Error> {
         let remote_addr = stream.peer_addr()?;
-        let stream = accept_async(stream).await.map_err(|e| {
-            std::io::Error::other(e)
-        })?;
+        let stream = accept_async(stream)
+            .await
+            .map_err(|e| std::io::Error::other(e))?;
         Ok(WebSocketConn::new(stream, remote_addr))
     }
 
@@ -753,7 +775,12 @@ impl KcpConn {
         remote_addr: SocketAddr,
     ) -> Result<Self, NetError> {
         let conv = if first_packet.len() >= 4 {
-            u32::from_le_bytes([first_packet[0], first_packet[1], first_packet[2], first_packet[3]])
+            u32::from_le_bytes([
+                first_packet[0],
+                first_packet[1],
+                first_packet[2],
+                first_packet[3],
+            ])
         } else {
             rand::random::<u32>()
         };
@@ -867,12 +894,10 @@ impl AsyncRead for KcpConn {
                 }
                 std::task::Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(None) => {
-                std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "KCP connection closed",
-                )))
-            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "KCP connection closed",
+            ))),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
@@ -892,12 +917,9 @@ impl AsyncWrite for KcpConn {
                 // Channel is full, would block
                 std::task::Poll::Pending
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                std::task::Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "KCP send channel closed",
-                )))
-            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => std::task::Poll::Ready(Err(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "KCP send channel closed"),
+            )),
         }
     }
 
@@ -937,17 +959,16 @@ impl KcpListener {
 
     pub async fn accept(&self) -> Result<(KcpConn, SocketAddr), NetError> {
         let mut buf = vec![0u8; 65535];
-        let (n, src_addr) = self.socket.recv_from(&mut buf).await
+        let (n, src_addr) = self
+            .socket
+            .recv_from(&mut buf)
+            .await
             .map_err(NetError::Io)?;
 
         let first_packet = buf[..n].to_vec();
-        let conn = KcpConn::accept(
-            self.socket.clone(),
-            &first_packet,
-            src_addr,
-        ).await?;
+        let conn = KcpConn::accept(self.socket.clone(), &first_packet, src_addr).await?;
 
         Ok((conn, src_addr))
     }
 }
-pub use pool::{ConnPool, PoolManager, PoolConfig, PoolStats, PooledConn};
+pub use pool::{ConnPool, PoolConfig, PoolManager, PoolStats, PooledConn};
