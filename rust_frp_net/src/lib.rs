@@ -45,6 +45,9 @@ use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
 
+pub mod mux;
+pub use mux::{MuxSession, TCP_MUX_MAGIC};
+
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     #[error("I/O error: {0}")]
