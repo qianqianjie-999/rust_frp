@@ -48,6 +48,12 @@ use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
 pub mod mux;
 pub use mux::{MuxSession, TCP_MUX_MAGIC};
 
+pub mod stun;
+pub use stun::{default_stun_socket_addrs, discover_public_endpoint};
+
+pub mod kcp_stream;
+pub use kcp_stream::KcpStream;
+
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     #[error("I/O error: {0}")]
