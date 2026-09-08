@@ -107,12 +107,7 @@ impl MuxSession {
         let (inbound_tx, inbound_rx) = mpsc::channel::<yamux::Stream>(64);
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(64);
         let closed = Arc::new(AtomicBool::new(false));
-        let driver = tokio::spawn(driver_loop(
-            connection,
-            cmd_rx,
-            inbound_tx,
-            closed.clone(),
-        ));
+        let driver = tokio::spawn(driver_loop(connection, cmd_rx, inbound_tx, closed.clone()));
         Arc::new(Self {
             cmd_tx,
             inbound_rx: AsyncMutex::new(inbound_rx),
@@ -254,10 +249,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 内存双工流（tokio IO）
-    async fn duplex_pair() -> (
-        tokio::io::DuplexStream,
-        tokio::io::DuplexStream,
-    ) {
+    async fn duplex_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
         tokio::io::duplex(4096)
     }
 

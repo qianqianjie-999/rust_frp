@@ -421,7 +421,11 @@ async fn test_group_registry_group_port_unique() {
 
     // 同端口被其他组占用 → 拒绝
     let err = reg.join("api", "k", 9000, "api-1").await.unwrap_err();
-    assert!(err.contains("already bound by group"), "unexpected error: {}", err);
+    assert!(
+        err.contains("already bound by group"),
+        "unexpected error: {}",
+        err
+    );
 }
 
 #[tokio::test]
@@ -464,8 +468,12 @@ async fn test_group_proxy_validation_and_shared_lifecycle() {
     };
 
     // 两个成员注册同一端口：首成员绑定，次成员共享（若重复绑定会 AddrInUse 失败）
-    mgr.add_proxy(grouped("web-1", "web", "secret")).await.unwrap();
-    mgr.add_proxy(grouped("web-2", "web", "secret")).await.unwrap();
+    mgr.add_proxy(grouped("web-1", "web", "secret"))
+        .await
+        .unwrap();
+    mgr.add_proxy(grouped("web-2", "web", "secret"))
+        .await
+        .unwrap();
 
     // group_key 不匹配 → 拒绝
     let err = mgr.add_proxy(grouped("web-3", "web", "wrong")).await;
@@ -489,5 +497,7 @@ async fn test_group_proxy_validation_and_shared_lifecycle() {
     // 成员逐个退出：组空后共享监听器释放，端口可被新代理重新绑定
     mgr.remove_proxy("web-1").await.unwrap();
     mgr.remove_proxy("web-2").await.unwrap();
-    mgr.add_proxy(grouped("web-new", "web", "secret")).await.unwrap();
+    mgr.add_proxy(grouped("web-new", "web", "secret"))
+        .await
+        .unwrap();
 }

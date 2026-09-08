@@ -125,8 +125,8 @@ use rust_frp_core::{
     XtcpHolePunchMsg, XtcpNatInfoMsg,
 };
 use rust_frp_net::{
-    AnyConn, ConnManager, KcpConn, KcpListener, MuxSession, TcpListener, TlsConfig, TCP_MUX_MAGIC,
-    UdpListener, WebSocketConn,
+    AnyConn, ConnManager, KcpConn, KcpListener, MuxSession, TcpListener, TlsConfig, UdpListener,
+    WebSocketConn, TCP_MUX_MAGIC,
 };
 use rust_frp_util::get_timestamp;
 use std::net::SocketAddr;
@@ -1401,7 +1401,8 @@ pub struct ControlManager {
     clients: RwLock<std::collections::HashMap<String, ClientInfo>>,
     // 踢连接信号：run_id -> (kick 通知, 清理完成回执接收端)
     // 同一 client_id 重复登录时，用它通知旧 Control 退出并等待其释放 proxy
-    kick_signals: RwLock<std::collections::HashMap<String, (watch::Sender<()>, oneshot::Receiver<()>)>>,
+    kick_signals:
+        RwLock<std::collections::HashMap<String, (watch::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl Default for ControlManager {
@@ -1447,10 +1448,7 @@ impl ControlManager {
     /// Control 连接进入消息循环前注册自己的"被踢"信号。
     /// 返回 (kick 接收端, 清理完成回执发送端)：
     /// 收到 kick 信号 → cleanup_proxies → 通过 done 回执通知等待方
-    pub async fn register_kick(
-        &self,
-        run_id: &str,
-    ) -> (watch::Receiver<()>, oneshot::Sender<()>) {
+    pub async fn register_kick(&self, run_id: &str) -> (watch::Receiver<()>, oneshot::Sender<()>) {
         let (kick_tx, kick_rx) = watch::channel(());
         let (done_tx, done_rx) = oneshot::channel();
         self.kick_signals
@@ -1477,7 +1475,9 @@ impl ControlManager {
         for old_run_id in old_run_ids {
             log::warn!(
                 "client '{}' re-logged in with new run_id {}, kicking old session {}",
-                client_id, new_run_id, old_run_id
+                client_id,
+                new_run_id,
+                old_run_id
             );
 
             // 取出旧连接的 kick 信号并触发
@@ -1488,7 +1488,10 @@ impl ControlManager {
                 // 最多等 5 秒兜底，防止异常情况下新连接登录被无限阻塞
                 let wait_result = tokio::time::timeout(Duration::from_secs(5), done_tx).await;
                 if wait_result.is_err() {
-                    log::warn!("old session {} did not finish cleanup within 5s", old_run_id);
+                    log::warn!(
+                        "old session {} did not finish cleanup within 5s",
+                        old_run_id
+                    );
                 }
             }
 
@@ -1698,10 +1701,7 @@ impl GroupRegistry {
                     ));
                 }
                 if state.group_key != group_key {
-                    return Err(format!(
-                        "group [{}] auth failed: group_key mismatch",
-                        group
-                    ));
+                    return Err(format!("group [{}] auth failed: group_key mismatch", group));
                 }
                 state.members.push(proxy_name.to_string());
                 log::info!(
@@ -1926,7 +1926,9 @@ impl ServerProxyManager {
                             .group_registry
                             .join(group, &group_key, remote_port, &config.name)
                             .await
-                            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                                e.into()
+                            })?;
                         if !first {
                             // 共享已有监听器，本成员无需绑定
                             return Ok(());
@@ -2032,10 +2034,7 @@ impl ServerProxyManager {
                                             return;
                                         }
 
-                                        log::debug!(
-                                            "使用工作连接协议处理: proxy={}",
-                                            target_name
-                                        );
+                                        log::debug!("使用工作连接协议处理: proxy={}", target_name);
 
                                         // 1. 查找代理对应的 run_id
                                         let run_id = {
