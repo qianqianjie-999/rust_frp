@@ -117,7 +117,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, Duration};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch, oneshot};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -672,6 +672,16 @@ impl Control {
                             self.user.clone()
                         ).await;
 
+                        // frpc 断线重连会用新 run_id、同 client_id 再次登录。
+                        // 必须先踢掉旧连接并等它释放 proxy 端口，否则新连接注册同名
+                        // proxy 会因端口占用失败，旧僵尸连接还会持续制造 502。
+                        self.control_manager.kick_same_client(&self.client_id, &self.run_id).await;
+
+                        // 注册自己的"被踢"信号（下一次同客户端登录时，本次连接会被踢）
+                        let (mut kick_rx, kick_done_tx) =
+                            self.control_manager.register_kick(&self.run_id).await;
+                        let mut kick_done_tx = Some(kick_done_tx);
+
                         // 发送登录响应
                         let resp = rust_frp_core::LoginRespMsg {
                             version: "0.1.0".to_string(),
@@ -696,9 +706,15 @@ impl Control {
                         loop {
                             tokio::select! {
                                 // 读取客户端消息
-                                msg_result = self.conn.read_message() => {
+                                // 加 90 秒读超时：客户端心跳间隔新版 10s / 旧版 30s，
+                                // 超过 90s 没收到任何消息说明 TCP 半开（对端已死但无 RST），
+                                // 必须强制清理，否则旧 proxy 端口不释放、frpc 重连注册失败 → 长时间 502
+                                msg_result = tokio::time::timeout(
+                                    Duration::from_secs(90),
+                                    self.conn.read_message()
+                                ) => {
                                     match msg_result {
-                                        Ok(msg) => {
+                                        Ok(Ok(msg)) => {
                                             match msg {
                                                 Message::Ping(ping_msg) => {
                                                     self.last_heartbeat = Instant::now();
@@ -767,12 +783,30 @@ impl Control {
                                                 }
                                             }
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             log::warn!("Client connection closed unexpectedly: {:?}", e);
                                             self.cleanup_proxies().await;
                                             return Ok(());
                                         }
+                                        Err(_elapsed) => {
+                                            // 90 秒没收到任何消息：TCP 半开，强制关闭并清理 proxy
+                                            log::warn!(
+                                                "Client heartbeat timeout (no data for 90s), force closing: client={}",
+                                                self.client_id
+                                            );
+                                            self.cleanup_proxies().await;
+                                            return Err("client heartbeat timeout".into());
+                                        }
                                     }
+                                },
+                                // 被同一客户端的新登录踢下线（frpc 断线重连场景）
+                                _ = kick_rx.changed() => {
+                                    log::warn!("Kicked by new session for client: {}", self.client_id);
+                                    self.cleanup_proxies().await;
+                                    if let Some(tx) = kick_done_tx.take() {
+                                        let _ = tx.send(());
+                                    }
+                                    return Ok(());
                                 },
                                 // 接收要发送的消息（来自 visitor handler）
                                 msg = msg_rx.recv() => {
@@ -825,6 +859,9 @@ pub struct ControlManager {
     msg_channels: RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>,
     // 存储客户端连接信息 (run_id -> ClientInfo)
     clients: RwLock<std::collections::HashMap<String, ClientInfo>>,
+    // 踢连接信号：run_id -> (kick 通知, 清理完成回执接收端)
+    // 同一 client_id 重复登录时，用它通知旧 Control 退出并等待其释放 proxy
+    kick_signals: RwLock<std::collections::HashMap<String, (watch::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl Default for ControlManager {
@@ -838,6 +875,7 @@ impl ControlManager {
         Self {
             msg_channels: RwLock::new(std::collections::HashMap::new()),
             clients: RwLock::new(std::collections::HashMap::new()),
+            kick_signals: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -853,7 +891,64 @@ impl ControlManager {
         
         let mut clients = self.clients.write().await;
         clients.remove(run_id);
+
+        // 顺带清理踢连接信号
+        self.kick_signals.write().await.remove(run_id);
         Ok(())
+    }
+
+    /// Control 连接进入消息循环前注册自己的"被踢"信号。
+    /// 返回 (kick 接收端, 清理完成回执发送端)：
+    /// 收到 kick 信号 → cleanup_proxies → 通过 done 回执通知等待方
+    pub async fn register_kick(
+        &self,
+        run_id: &str,
+    ) -> (watch::Receiver<()>, oneshot::Sender<()>) {
+        let (kick_tx, kick_rx) = watch::channel(());
+        let (done_tx, done_rx) = oneshot::channel();
+        self.kick_signals
+            .write()
+            .await
+            .insert(run_id.to_string(), (kick_tx, done_rx));
+        (kick_rx, done_tx)
+    }
+
+    /// 同一 client_id 的客户端重复登录时（frpc 断线重连），踢掉旧连接，
+    /// 并同步等待旧 Control 清理完 proxy（释放服务端端口），避免新连接
+    /// 注册同名 proxy 时因端口占用而失败导致长时间 502。
+    pub async fn kick_same_client(&self, client_id: &str, new_run_id: &str) {
+        // 先找出同 client_id 的旧 run_id（只读锁内不 await 其他锁，防死锁）
+        let old_run_ids: Vec<String> = {
+            let clients = self.clients.read().await;
+            clients
+                .values()
+                .filter(|c| c.client_id == client_id && c.run_id != new_run_id)
+                .map(|c| c.run_id.clone())
+                .collect()
+        };
+
+        for old_run_id in old_run_ids {
+            log::warn!(
+                "client '{}' re-logged in with new run_id {}, kicking old session {}",
+                client_id, new_run_id, old_run_id
+            );
+
+            // 取出旧连接的 kick 信号并触发
+            let signal = self.kick_signals.write().await.remove(&old_run_id);
+            if let Some((kick_tx, done_tx)) = signal {
+                let _ = kick_tx.send(());
+                // 等待旧 Control 完成 proxy 清理（stop_proxy 内含 ~100ms 等待），
+                // 最多等 5 秒兜底，防止异常情况下新连接登录被无限阻塞
+                let wait_result = tokio::time::timeout(Duration::from_secs(5), done_tx).await;
+                if wait_result.is_err() {
+                    log::warn!("old session {} did not finish cleanup within 5s", old_run_id);
+                }
+            }
+
+            // 兜底：直接清掉旧连接的注册表项（正常情况下旧 Control 退出时也会自清理）
+            self.msg_channels.write().await.remove(&old_run_id);
+            self.clients.write().await.remove(&old_run_id);
+        }
     }
 
     pub async fn get_msg_tx(&self, run_id: &str) -> Option<mpsc::Sender<Message>> {
