@@ -1875,12 +1875,8 @@ impl Client {
                 }
             }
 
-            // 如果是正常关闭（通过信号），不再重连
-            if self.control.is_none() {
-                break;
-            }
-
-            // 重连逻辑：首次立即重连，之后指数退避 + jitter
+            // 重连逻辑：登录失败与连接断开一致，均按退避重试（不退出进程），
+            // 避免服务端暂时不可达时 frpc 直接死亡（信号分支自行 break）
             // jitter 与 frp 原版一致：在退避延迟上叠加 0~10% 随机量，
             // 防止服务端恢复时所有客户端同时涌入（惊群）
             let sleep_ms = if reconnect_delay_ms == 0 {
