@@ -36,8 +36,8 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | TLS 加密 | ✅ | 使用 rustls，无需 OpenSSL |
 | WebSocket | ✅ | 完整实现，支持 HTTP Upgrade |
 | UDP 代理 | ✅ | 完整实现 |
-| STCP (安全 TCP) | ✅ | 完整实现，服务端中转无需端口映射 |
-| XTCP (P2P TCP) | ✅ | 完整实现，支持 NAT 穿透和 STCP 回退 |
+| STCP (安全 TCP) | ⚠️ | 服务端中转可用，但**仅限同一客户端自身访问**；`secret_key` 访问密钥尚未生效，跨客户端访问被拒绝 |
+| XTCP (P2P TCP) | ⚠️ | NAT 穿透打洞 + STCP 回退可用，同样受上述限制 |
 | KCP 协议 | ✅ | 完整实现 |
 | OIDC 认证 | ✅ | 支持 HS256 JWT 验证 |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
@@ -45,6 +45,19 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
 | PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
+
+---
+
+## ⚠️ 安全说明（务必阅读）
+
+| 事项 | 现状 | 建议 |
+|------|------|------|
+| 内置 TLS 证书 | `rust_frp_net/cert/` 下的自签证书**与私钥一起入库**，属公开凭据，只能加密、**不能认证服务端身份** | 生产环境用 `transport.tls.cert_file/key_file` 指定自建证书；客户端配置 `trusted_ca_file` |
+| 客户端证书校验 | 未配置 `trusted_ca_file` 时**默认不校验服务端证书**（启动会打印 WARN） | 显式配置 `trusted_ca_file`，否则无法防范中间人攻击 |
+| Dashboard 凭据 | `web_server.user/password` 必须成对配置且非空，否则服务端拒绝启动；未配置则鉴权关闭并告警 | 用强密码，只监听 `127.0.0.1` 并前置 Nginx 提供 HTTPS |
+| 会话机制 | 随机会话令牌 + 服务端存储 + 8 小时过期 + `HttpOnly; SameSite=Strict` | 反向代理声明 `X-Forwarded-Proto: https` 时会自动附加 `Secure` |
+| 配置文件 | `frpc.toml` / `frps.toml` 已被 `.gitignore` 忽略，仅提供 `*.example.toml` | 不要把含 token/密码的配置提交进版本库 |
+| STCP/XTCP | `secret_key` 尚未实现校验，跨客户端访问被拒绝 | 需要跨客户端安全访问时暂请改用其他方案 |
 
 ---
 
@@ -591,7 +604,16 @@ remote_port = 9304
 
 ### STCP（安全 TCP）
 
-服务端中转的安全 TCP 访问，无需在服务端开放额外端口映射。通过共享密钥控制访问权限。
+服务端中转的安全 TCP 访问，无需在服务端开放额外端口映射。
+
+> ⚠️ **当前实现的限制**
+>
+> - `secret_key`（访问密钥）目前**尚未参与校验**，仅作配置占位；
+> - 服务端要求访客与代理属于**同一个客户端 `run_id`**，跨客户端的访问会被拒绝
+>   （返回 `proxy owned by another client`）。
+>
+> 也就是说，当前 STCP/XTCP 只适用于「同一客户端访问自己注册的代理」场景。
+> 跨客户端的安全访问尚未可用，规划中。
 
 **代理端配置（持有内网服务的一方）**：
 
