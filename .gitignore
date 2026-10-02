@@ -9,6 +9,11 @@
 *.swo
 *~
 
+# AI assistant tooling — local settings and agent scratch data, not project source
+.claude/
+.workbuddy/
+.trae/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -19,6 +24,11 @@ Thumbs.db
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Local deployment configs — may contain auth tokens / dashboard passwords /
+# OIDC client secrets. Use the checked-in *.example.toml templates instead.
+frpc.toml
+frps.toml
 
 # Logs
 logs

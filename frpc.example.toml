@@ -1,0 +1,66 @@
+# =============================================================================
+# frpc 示例配置（frpc.example.toml）
+#
+# 用法：
+#   cp frpc.example.toml frpc.toml
+#   然后按需修改。frpc.toml 已被 .gitignore 忽略，不会进入版本库。
+#
+# 说明：所有 "CHANGE_ME_*" 占位符都必须替换为真实值，切勿直接上线。
+# =============================================================================
+
+# --- 服务器连接 ---
+server_addr = "127.0.0.1"
+server_port = 9300
+
+# --- 认证配置（需与 frps 一致） ---
+[auth]
+method = "token"
+token = "CHANGE_ME_RANDOM_LONG_TOKEN"
+
+# --- 传输配置 ---
+[transport]
+protocol = "tcp"
+tcp_mux = true
+pool_count = 10
+# 全局带宽限制（代理级 bandwidth_limit 优先）
+# bandwidth_limit = "10MB"
+
+# 启用 TLS
+[transport.tls]
+enable = true
+# ⚠️ 强烈建议配置 trusted_ca_file：不配置时客户端**不校验服务端证书**，
+#    TLS 只提供加密、不提供身份认证，无法防范中间人攻击。
+# trusted_ca_file = "/etc/frp/certs/ca.crt"
+
+# --- 代理定义 ---
+
+# HTTP 代理
+[[proxies]]
+name = "http_web"
+type = "http"
+local_ip = "127.0.0.1"
+local_port = 8080
+custom_domains = ["web.example.com"]
+
+# TCP 代理（带代理级带宽限制）
+[[proxies]]
+name = "tcp_ssh"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 22
+remote_port = 9302
+bandwidth_limit = "1MB"
+
+# 带健康检查的 TCP 代理
+[[proxies]]
+name = "tcp_app"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 8080
+remote_port = 9303
+
+[[proxies.health_check]]
+type = "tcp"
+interval_seconds = 10
+timeout_seconds = 3
+max_failed = 3

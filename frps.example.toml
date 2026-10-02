@@ -1,0 +1,69 @@
+# =============================================================================
+# frps 示例配置（frps.example.toml）
+#
+# 用法：
+#   cp frps.example.toml frps.toml
+#   然后按需修改。frps.toml 已被 .gitignore 忽略，不会进入版本库。
+#
+# 说明：所有 "CHANGE_ME_*" 占位符都必须替换为真实值，切勿直接上线。
+# =============================================================================
+
+# --- 基础监听（必须写在任何 [table] 之前） ---
+bind_addr = "0.0.0.0"
+bind_port = 9300
+
+# 工作连接端口（默认 bind_port + 1000）
+# work_conn_port = 10300
+
+# 虚拟主机端口
+vhost_http_port = 9090
+vhost_https_port = 9091
+
+# KCP 协议监听端口
+# kcp_bind_port = 7001
+
+# --- 端口白名单（为空即拒绝所有 TCP 代理端口，显式允许更安全） ---
+allow_ports = [
+    { single = 9302 },
+    { start = 10000, end = 20000 },
+]
+
+# --- Web Dashboard（默认禁用：port = 0） ---
+# user / password 必须成对配置且非空，否则服务端会拒绝启动。
+# 生产环境建议只监听 127.0.0.1，并前置 Nginx 提供 HTTPS。
+# [web_server]
+# addr = "127.0.0.1"
+# port = 7500
+# user = "CHANGE_ME_DASHBOARD_USER"
+# password = "CHANGE_ME_STRONG_DASHBOARD_PASSWORD"
+
+# --- 传输配置 ---
+[transport]
+protocol = "tcp"
+tcp_mux = true
+pool_count = 10
+# 非法的带宽值（空串 / 0 / 负数 / 非数字）会直接报配置错误
+# bandwidth_limit = "10MB"
+
+# 启用 TLS：请务必指定自建证书，否则会回落到仓库内置的不安全演示证书
+# [transport.tls]
+# enable = true
+# cert_file = "/etc/frp/certs/server.crt"
+# key_file = "/etc/frp/certs/server.key"
+# tls_only = true
+
+# --- 认证配置（二选一） ---
+# 方式一：Token（推荐）
+[auth]
+method = "token"
+token = "CHANGE_ME_RANDOM_LONG_TOKEN"
+
+# 方式二：OIDC
+# [auth]
+# method = "oidc"
+# [auth.oidc]
+# issuer = "https://your-oidc-provider.com"
+# audience = "frp-server"
+# client_id = "your-client-id"
+# client_secret = "CHANGE_ME_OIDC_CLIENT_SECRET"
+# token_endpoint_url = "https://your-oidc-provider.com/token"
