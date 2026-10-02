@@ -74,7 +74,6 @@
 
 use async_trait::async_trait;
 use rust_frp_config::PluginConfig;
-use std::fs::File;
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -82,6 +81,37 @@ use tokio::net::UnixStream;
 /// Combined trait for AsyncRead + AsyncWrite
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
+
+/// 常量时间字符串比较，避免 Basic 凭据比对出现时序侧信道
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    ring::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
+}
+
+/// 根据文件扩展名推断 Content-Type
+fn content_type_for(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") | Some("mjs") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("txt") | Some("log") | Some("md") => "text/plain; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("pdf") => "application/pdf",
+        Some("wasm") => "application/wasm",
+        Some("xml") => "application/xml",
+        _ => "application/octet-stream",
+    }
+}
 
 /// 插件接口
 #[async_trait]
@@ -136,7 +166,6 @@ impl Plugin for UnixDomainSocketPlugin {
 }
 
 /// 静态文件插件
-#[allow(dead_code)]
 pub struct StaticFilePlugin {
     local_path: String,
     strip_prefix: Option<String>,
@@ -192,6 +221,23 @@ impl StaticFilePlugin {
         let method = parts[0];
         let path = parts[1];
 
+        // 配置了 http_user 即强制 Basic 认证；此前 http_user/http_password
+        // 只存进结构体从未被读取，静态文件实际是匿名可访问的。
+        if !self.check_basic_auth(&lines) {
+            let body = "Unauthorized";
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\n\
+                 WWW-Authenticate: Basic realm=\"frp static file\"\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            conn.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+
         // 处理 GET 请求
         if method == "GET" {
             // 构建文件路径
@@ -204,6 +250,51 @@ impl StaticFilePlugin {
         }
 
         Ok(())
+    }
+
+    /// 校验 HTTP Basic 认证
+    ///
+    /// 返回 `true` 表示放行：
+    /// - 未配置 `http_user`（未启用认证，匿名可访问）
+    /// - 或请求头里的凭据与配置匹配（常量时间比较）
+    fn check_basic_auth(&self, lines: &[&str]) -> bool {
+        let Some(expected_user) = self.http_user.as_deref() else {
+            return true;
+        };
+        let expected_password = self.http_password.as_deref().unwrap_or("");
+
+        let header = lines.iter().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("authorization") {
+                Some(value.trim())
+            } else {
+                None
+            }
+        });
+
+        let Some(header) = header else {
+            return false;
+        };
+        let Some(encoded) = header
+            .strip_prefix("Basic ")
+            .or_else(|| header.strip_prefix("basic "))
+        else {
+            return false;
+        };
+
+        let Ok(decoded) = base64::decode(encoded.trim()) else {
+            return false;
+        };
+        let Ok(decoded) = String::from_utf8(decoded) else {
+            return false;
+        };
+        let Some((user, password)) = decoded.split_once(':') else {
+            return false;
+        };
+
+        let user_ok = constant_time_eq(user, expected_user);
+        let password_ok = constant_time_eq(password, expected_password);
+        user_ok && password_ok
     }
 
     /// 构建文件路径
@@ -274,18 +365,21 @@ impl StaticFilePlugin {
             return Ok(());
         }
 
-        // 读取文件内容
-        let mut file = File::open(&canonical_path)?;
-        let mut content = Vec::new();
-        std::io::Read::read_to_end(&mut file, &mut content)?;
-
-        // 发送 HTTP 响应
+        // 流式发送文件：不再一次性 read_to_end 到内存，避免大文件顶爆内存
+        let metadata = tokio::fs::metadata(&canonical_path).await?;
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
-            content.len()
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: {}\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            content_type_for(&canonical_path),
+            metadata.len()
         );
         conn.write_all(response.as_bytes()).await?;
-        conn.write_all(&content).await?;
+
+        let mut file = tokio::fs::File::open(&canonical_path).await?;
+        tokio::io::copy(&mut file, &mut conn).await?;
+        conn.flush().await?;
 
         Ok(())
     }

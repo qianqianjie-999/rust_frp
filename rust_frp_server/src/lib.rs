@@ -2721,11 +2721,120 @@ impl VisitorManager for ServerVisitorManager {
     }
 }
 
-fn create_routes(
-    server: std::sync::Arc<Server>,
+/// 管理端会话有效期（默认 8 小时）
+const WEB_SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// 管理端会话 cookie 名称
+const WEB_SESSION_COOKIE: &str = "frp_session";
+
+/// 常量时间字符串比较，避免凭据/签名比对的时序侧信道
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    ring::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
+}
+
+/// 管理端鉴权状态
+///
+/// 取代旧实现里「`base64(user:password)` 直接当 cookie + 全局环境变量传递 +
+/// `OnceLock` 首次读值永久缓存」的做法，修复两类缺陷：
+///
+/// 1. **会话凭证可逆**：旧 cookie 内容就是可逆的 base64 明文凭据，泄露即等于
+///    密码泄露，且永不过期。现在 cookie 是 32 字节随机令牌，只存在于服务端
+///    内存中，并带绝对过期时间。
+/// 2. **默认回退与竞态**：旧实现把凭据写进进程环境变量再由登录线程首次读取，
+///    读不到就回退 `admin/admin` 并永久缓存。现在凭据以 `Arc` 直接注入路由，
+///    没有环境变量、没有缓存、也没有默认值——未配置即拒绝登录。
+struct WebAuth {
     user: Option<String>,
     password: Option<String>,
-) -> axum::Router {
+    /// token -> 过期时间
+    sessions: RwLock<std::collections::HashMap<String, Instant>>,
+}
+
+impl WebAuth {
+    fn new(user: Option<String>, password: Option<String>) -> Self {
+        Self {
+            user,
+            password,
+            sessions: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 是否启用了登录鉴权（用户名与密码都配置了才算启用）
+    fn requires_login(&self) -> bool {
+        self.user.is_some() && self.password.is_some()
+    }
+
+    /// 校验用户名/密码（两端都做常量时间比较）
+    fn verify_credentials(&self, user: &str, password: &str) -> bool {
+        match (&self.user, &self.password) {
+            (Some(expected_user), Some(expected_password)) => {
+                let user_ok = constant_time_eq(user, expected_user);
+                let password_ok = constant_time_eq(password, expected_password);
+                user_ok && password_ok
+            }
+            _ => false,
+        }
+    }
+
+    /// 创建新会话，返回随机令牌
+    ///
+    /// 随机源不可用时返回 `None`（fail-closed，绝不下发可预测的会话）。
+    async fn create_session(&self) -> Option<String> {
+        let token = new_session_token()?;
+        let mut sessions = self.sessions.write().await;
+        purge_expired_sessions(&mut sessions);
+        sessions.insert(token.clone(), Instant::now() + WEB_SESSION_TTL);
+        Some(token)
+    }
+
+    /// 校验会话令牌是否有效且未过期
+    async fn validate_session(&self, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
+        let mut sessions = self.sessions.write().await;
+        purge_expired_sessions(&mut sessions);
+        sessions
+            .get(token)
+            .map(|expires| *expires > Instant::now())
+            .unwrap_or(false)
+    }
+
+    /// 注销会话
+    async fn revoke_session(&self, token: &str) {
+        if !token.is_empty() {
+            self.sessions.write().await.remove(token);
+        }
+    }
+}
+
+/// 清理已过期会话，避免会话表随运行时间无界增长
+fn purge_expired_sessions(sessions: &mut std::collections::HashMap<String, Instant>) {
+    let now = Instant::now();
+    sessions.retain(|_, expires| *expires > now);
+}
+
+/// 生成 32 字节随机会话令牌（base64 编码）
+fn new_session_token() -> Option<String> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut buf = [0u8; 32];
+    SystemRandom::new().fill(&mut buf).ok()?;
+    Some(base64::encode(buf))
+}
+
+/// 从请求头中提取会话令牌
+fn session_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    cookie.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix(WEB_SESSION_COOKIE)
+            .and_then(|rest| rest.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    })
+}
+
+fn create_routes(server: std::sync::Arc<Server>, auth: std::sync::Arc<WebAuth>) -> axum::Router {
     let app = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
         .route("/metrics", axum::routing::get(prometheus_handler))
@@ -2738,66 +2847,41 @@ fn create_routes(
         .route("/login", axum::routing::post(login_post_handler))
         .route("/logout", axum::routing::get(logout_handler))
         .route("/api/reload", axum::routing::post(reload_handler))
-        .with_state(server);
+        .with_state(server)
+        .layer(axum::Extension(auth.clone()));
 
-    if let (Some(ref user_val), Some(ref password_val)) = (&user, &password) {
+    if auth.requires_login() {
         log::info!("Web server authentication enabled");
-        let web_user = user_val.clone();
-        let web_password = password_val.clone();
-
-        std::thread::spawn(move || {
-            std::env::set_var("FRP_WEB_USER", web_user);
-            std::env::set_var("FRP_WEB_PASSWORD", web_password);
-        });
-
-        let auth_user = user_val.clone();
-        let auth_password = password_val.clone();
         app.layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let user = auth_user.clone();
-                let password = auth_password.clone();
+                let auth = auth.clone();
                 async move {
                     let path = request.uri().path();
 
-                    if path == "/login" || path == "/metrics" {
+                    // 登录页、存活探针与指标端点免鉴权：
+                    // /health 必须放行，否则容器探针会一直被 303 打回。
+                    if path == "/login" || path == "/health" || path == "/metrics" {
                         return next.run(request).await;
                     }
 
-                    let cookies = request.headers().get("cookie");
-                    let session_valid = cookies
-                        .and_then(|c| c.to_str().ok())
-                        .and_then(|c| {
-                            c.split(';')
-                                .find(|s| s.trim().starts_with("frp_session="))
-                                .map(|s| s.trim().split('=').nth(1).unwrap_or(""))
-                        })
-                        .and_then(|session| {
-                            let decoded = base64::decode(session).ok()?;
-                            let data = String::from_utf8(decoded).ok()?;
-                            let parts: Vec<&str> = data.split(':').collect();
-                            if parts.len() == 2 && parts[0] == user && parts[1] == password {
-                                Some(true)
-                            } else {
-                                None
-                            }
-                        })
-                        .is_some();
+                    let session_valid = match session_token_from_headers(request.headers()) {
+                        Some(token) => auth.validate_session(&token).await,
+                        None => false,
+                    };
 
                     if session_valid {
                         next.run(request).await
                     } else {
-                        axum::http::Response::builder()
-                            .status(axum::http::StatusCode::SEE_OTHER)
-                            .header("Location", "/login")
-                            .body("Redirecting to login".to_string())
-                            .unwrap()
-                            .into_response()
+                        axum::response::Redirect::to("/login").into_response()
                     }
                 }
             },
         ))
     } else {
-        log::info!("Web server authentication disabled");
+        log::warn!(
+            "Web server authentication is DISABLED: no web_server.user/password configured, \
+             the dashboard is reachable by anyone who can reach the port"
+        );
         app
     }
 }
@@ -2919,7 +3003,11 @@ async fn login_handler() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../login.html"))
 }
 
-async fn login_post_handler(body: String) -> impl axum::response::IntoResponse {
+async fn login_post_handler(
+    axum::extract::Extension(auth): axum::extract::Extension<std::sync::Arc<WebAuth>>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
     let parts: Vec<(String, String)> = body
         .split('&')
         .filter_map(|s| {
@@ -2944,41 +3032,74 @@ async fn login_post_handler(body: String) -> impl axum::response::IntoResponse {
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
 
-    use std::sync::OnceLock;
-    static USER: OnceLock<String> = OnceLock::new();
-    static PASSWORD: OnceLock<String> = OnceLock::new();
-
-    let config_user =
-        USER.get_or_init(|| std::env::var("FRP_WEB_USER").unwrap_or_else(|_| "admin".to_string()));
-    let config_password = PASSWORD
-        .get_or_init(|| std::env::var("FRP_WEB_PASSWORD").unwrap_or_else(|_| "admin".to_string()));
-
-    if username == *config_user && password == *config_password {
-        let session = base64::encode(format!("{}:{}", config_user, config_password));
-        axum::http::Response::builder()
-            .status(axum::http::StatusCode::SEE_OTHER)
-            .header("Location", "/")
-            .header(
-                "Set-Cookie",
-                format!("frp_session={}; HttpOnly; Path=/", session),
-            )
-            .body("Redirecting to dashboard".to_string())
-            .unwrap()
-    } else {
-        axum::http::Response::builder()
+    // 未配置凭据时不允许登录（不再回退 admin/admin）
+    if !auth.requires_login() || !auth.verify_credentials(&username, &password) {
+        // 固定小延时，抬高在线暴力破解成本
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return axum::http::Response::builder()
             .status(axum::http::StatusCode::UNAUTHORIZED)
-            .body("Unauthorized".to_string())
-            .unwrap()
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )
+            .body(axum::body::Body::from("Unauthorized"))
+            .unwrap_or_else(|_| axum::http::StatusCode::UNAUTHORIZED.into_response());
     }
+
+    let token = match auth.create_session().await {
+        Some(token) => token,
+        None => {
+            log::error!("Failed to generate session token: secure RNG unavailable");
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    // 仅在反向代理声明 HTTPS 时才加 Secure，避免明文部署下 cookie 无法回传
+    let secure = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+
+    let cookie = format!(
+        "{cookie}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{secure}",
+        cookie = WEB_SESSION_COOKIE,
+        token = token,
+        max_age = WEB_SESSION_TTL.as_secs(),
+        secure = if secure { "; Secure" } else { "" },
+    );
+
+    let mut response = axum::response::Redirect::to("/").into_response();
+    match axum::http::HeaderValue::from_str(&cookie) {
+        Ok(value) => {
+            response
+                .headers_mut()
+                .insert(axum::http::header::SET_COOKIE, value);
+        }
+        Err(_) => {
+            log::error!("Failed to build session cookie header");
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    response
 }
 
-async fn logout_handler() -> impl axum::response::IntoResponse {
-    axum::http::Response::builder()
-        .status(axum::http::StatusCode::SEE_OTHER)
-        .header("Location", "/login")
-        .header("Set-Cookie", "frp_session=; HttpOnly; Path=/; Max-Age=0")
-        .body("Logged out".to_string())
-        .unwrap()
+async fn logout_handler(
+    axum::extract::Extension(auth): axum::extract::Extension<std::sync::Arc<WebAuth>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Some(token) = session_token_from_headers(&headers) {
+        auth.revoke_session(&token).await;
+    }
+
+    let mut response = axum::response::Redirect::to("/login").into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_static(
+            "frp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        ),
+    );
+    response
 }
 
 /// Web 服务器（基于 axum）
@@ -3004,10 +3125,9 @@ impl WebServer {
 
     pub async fn start(&mut self, server: &Server) -> Result<(), Box<dyn std::error::Error>> {
         let server = std::sync::Arc::new(server.clone());
-        let user = self.user.clone();
-        let password = self.password.clone();
+        let auth = std::sync::Arc::new(WebAuth::new(self.user.clone(), self.password.clone()));
 
-        let app = create_routes(server, user, password);
+        let app = create_routes(server, auth);
         self.start_http(app).await?;
         Ok(())
     }
@@ -3510,30 +3630,51 @@ impl Server {
                     return Err("Unknown run_id".into());
                 }
 
-                // 验证 sign_key（如果服务器生成了 sign_key，客户端必须匹配）
-                if !work_msg.sign_key.is_empty() {
-                    match auth_manager
+                // 验证 sign_key（fail-closed + 常量时间比较）
+                //
+                // - 服务端配置了 token（即存在 encryption_key）时**必须**校验，
+                //   任何"取不到期望值"或"不匹配"的情况都直接拒绝，不再放行；
+                // - 未配置 token 时本层不适用（登录阶段同样不做鉴权）；
+                // - 比较走常量时间，避免通过响应时延侧信道逐字节爆破 sign_key。
+                if auth_manager.encryption_key().is_some() {
+                    let expected_key = match auth_manager
                         .generate_work_conn_sign_key(&work_msg.run_id)
                         .await
                     {
-                        Ok(expected_key) => {
-                            if work_msg.sign_key != expected_key {
-                                log::error!("Sign key mismatch for proxy: {}", work_msg.proxy_name);
-                                let resp =
-                                    Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
-                                        error: "Sign key verification failed".to_string(),
-                                        src_addr: String::new(),
-                                        src_port: 0,
-                                        dst_addr: String::new(),
-                                        dst_port: 0,
-                                    });
-                                rust_frp_core::write_message(&mut conn, &resp).await?;
-                                return Err("Sign key mismatch".into());
-                            }
-                        }
+                        Ok(key) => key,
                         Err(e) => {
-                            log::error!("Failed to generate expected sign_key: {:?}", e);
+                            log::error!(
+                                "Rejecting work conn: cannot derive sign_key for run_id {}: {:?}",
+                                work_msg.run_id,
+                                e
+                            );
+                            let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
+                                error: "Sign key verification unavailable".to_string(),
+                                src_addr: String::new(),
+                                src_port: 0,
+                                dst_addr: String::new(),
+                                dst_port: 0,
+                            });
+                            rust_frp_core::write_message(&mut conn, &resp).await?;
+                            return Err("Sign key verification unavailable".into());
                         }
+                    };
+
+                    if !constant_time_eq(&work_msg.sign_key, &expected_key) {
+                        log::error!(
+                            "Sign key mismatch for proxy: {} (run_id {})",
+                            work_msg.proxy_name,
+                            work_msg.run_id
+                        );
+                        let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
+                            error: "Sign key verification failed".to_string(),
+                            src_addr: String::new(),
+                            src_port: 0,
+                            dst_addr: String::new(),
+                            dst_port: 0,
+                        });
+                        rust_frp_core::write_message(&mut conn, &resp).await?;
+                        return Err("Sign key mismatch".into());
                     }
                 }
 
@@ -4451,5 +4592,236 @@ impl Clone for Server {
             reload_rx: None,
             reload_tx: self.reload_tx.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod web_auth_tests {
+    use super::*;
+
+    fn auth(user: Option<&str>, password: Option<&str>) -> std::sync::Arc<WebAuth> {
+        std::sync::Arc::new(WebAuth::new(
+            user.map(|s| s.to_string()),
+            password.map(|s| s.to_string()),
+        ))
+    }
+
+    fn form(values: &[(&str, &str)]) -> String {
+        values
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    fn headers_with_cookie(cookie: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(cookie).unwrap(),
+        );
+        headers
+    }
+
+    fn set_cookie_of(response: &axum::response::Response) -> Option<String> {
+        response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string())
+    }
+
+    #[test]
+    fn test_requires_login_only_when_both_configured() {
+        assert!(!auth(None, None).requires_login());
+        assert!(!auth(Some("boss"), None).requires_login());
+        assert!(!auth(None, Some("pw")).requires_login());
+        assert!(auth(Some("boss"), Some("pw")).requires_login());
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "abcd"));
+        assert!(!constant_time_eq("", "abc"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn test_verify_credentials() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+        assert!(auth.verify_credentials("boss", "s3cret"));
+        assert!(!auth.verify_credentials("boss", "wrong"));
+        assert!(!auth.verify_credentials("admin", "admin"));
+        assert!(!auth.verify_credentials("", ""));
+    }
+
+    #[test]
+    fn test_verify_credentials_is_disabled_without_config() {
+        let auth = auth(None, None);
+        assert!(!auth.verify_credentials("admin", "admin"));
+        assert!(!auth.verify_credentials("", ""));
+    }
+
+    #[tokio::test]
+    async fn test_session_lifecycle() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+
+        assert!(!auth.validate_session("not-a-real-token").await);
+        assert!(!auth.validate_session("").await);
+
+        let token = auth.create_session().await.expect("token generated");
+        assert!(auth.validate_session(&token).await);
+
+        auth.revoke_session(&token).await;
+        assert!(!auth.validate_session(&token).await);
+    }
+
+    #[tokio::test]
+    async fn test_session_tokens_are_random_and_not_derived_from_credentials() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+
+        let t1 = auth.create_session().await.unwrap();
+        let t2 = auth.create_session().await.unwrap();
+        assert_ne!(t1, t2, "sessions must not repeat");
+
+        // 旧实现把 base64("user:password") 直接当 cookie，这里必须不再出现
+        let legacy = base64::encode("boss:s3cret");
+        assert_ne!(t1, legacy);
+        assert!(!t1.contains(&legacy));
+        assert!(!t1.contains("boss"));
+        assert!(!t1.contains("s3cret"));
+
+        // 32 字节随机数 base64 后长度至少 40
+        assert!(t1.len() >= 40, "token too short: {}", t1);
+    }
+
+    #[test]
+    fn test_session_token_from_headers() {
+        assert_eq!(
+            session_token_from_headers(&headers_with_cookie("frp_session=abc; other=1")),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            session_token_from_headers(&headers_with_cookie("a=b; frp_session=xyz")),
+            Some("xyz".to_string())
+        );
+        // 空值不视为有效会话
+        assert_eq!(
+            session_token_from_headers(&headers_with_cookie("frp_session=")),
+            None
+        );
+        // 前缀相似但不同的 cookie 名不应被误匹配
+        assert_eq!(
+            session_token_from_headers(&headers_with_cookie("xfrp_session=evil")),
+            None
+        );
+        assert_eq!(
+            session_token_from_headers(&axum::http::HeaderMap::new()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_rejects_wrong_credentials() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+        let response = login_post_handler(
+            axum::extract::Extension(auth.clone()),
+            axum::http::HeaderMap::new(),
+            form(&[("username", "boss"), ("password", "nope")]),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            set_cookie_of(&response).is_none(),
+            "must not issue a session"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_rejects_admin_admin_fallback() {
+        // 未配置凭据时不得回退到 admin/admin
+        let auth = auth(None, None);
+        let response = login_post_handler(
+            axum::extract::Extension(auth.clone()),
+            axum::http::HeaderMap::new(),
+            form(&[("username", "admin"), ("password", "admin")]),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(set_cookie_of(&response).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_login_accepts_correct_credentials_and_issues_hardened_cookie() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+        let response = login_post_handler(
+            axum::extract::Extension(auth.clone()),
+            axum::http::HeaderMap::new(),
+            form(&[("username", "boss"), ("password", "s3cret")]),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+
+        let cookie = set_cookie_of(&response).expect("session cookie set");
+        assert!(cookie.contains("HttpOnly"), "cookie: {}", cookie);
+        assert!(cookie.contains("SameSite=Strict"), "cookie: {}", cookie);
+        assert!(cookie.contains("Path=/"), "cookie: {}", cookie);
+        assert!(cookie.contains("Max-Age="), "cookie: {}", cookie);
+        assert!(!cookie.contains("Secure"), "plain HTTP must not set Secure");
+
+        // cookie 中的令牌必须是服务端可识别的有效会话
+        let token = cookie
+            .strip_prefix(&format!("{}=", WEB_SESSION_COOKIE))
+            .and_then(|rest| rest.split(';').next())
+            .expect("token present")
+            .to_string();
+        assert!(auth.validate_session(&token).await);
+    }
+
+    #[tokio::test]
+    async fn test_login_sets_secure_cookie_behind_https_proxy() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("https"),
+        );
+
+        let response = login_post_handler(
+            axum::extract::Extension(auth),
+            headers,
+            form(&[("username", "boss"), ("password", "s3cret")]),
+        )
+        .await;
+
+        let cookie = set_cookie_of(&response).expect("session cookie set");
+        assert!(cookie.contains("Secure"), "cookie: {}", cookie);
+    }
+
+    #[tokio::test]
+    async fn test_logout_revokes_session_and_clears_cookie() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+        let token = auth.create_session().await.unwrap();
+        assert!(auth.validate_session(&token).await);
+
+        let response = logout_handler(
+            axum::extract::Extension(auth.clone()),
+            headers_with_cookie(&format!("{WEB_SESSION_COOKIE}={token}")),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+        assert!(
+            !auth.validate_session(&token).await,
+            "session must be revoked"
+        );
+
+        let cookie = set_cookie_of(&response).expect("clearing cookie set");
+        assert!(cookie.contains("Max-Age=0"), "cookie: {}", cookie);
     }
 }

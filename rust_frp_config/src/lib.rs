@@ -937,7 +937,9 @@ impl ConfigLoader {
         let mut file = File::open(path)?;
         let mut content = String::new();
         file.read_to_string(&mut content)?;
-        log::debug!("Raw config content: {}", content);
+        // 注意：绝不能把配置原文写进日志——配置文件里通常包含 auth token、
+        // web_server 密码、OIDC client_secret 等敏感信息。
+        log::debug!("Loaded config content ({} bytes)", content.len());
         Self::parse_config(&content)
     }
 
@@ -955,33 +957,53 @@ impl ConfigLoader {
     fn parse_config<T: serde::de::DeserializeOwned + Default>(
         content: &str,
     ) -> Result<T, Box<dyn std::error::Error>> {
-        // 尝试 TOML
+        // 按 TOML -> YAML -> JSON 顺序盲试；全部失败时把三种格式各自的
+        // 错误信息汇总后抛出，避免排障时只能看到一句无信息量的
+        // "Failed to parse config file"。
+        let mut errors: Vec<String> = Vec::new();
+
         log::info!("Trying to parse config as TOML");
-        if let Ok(config) = toml::from_str::<T>(content) {
-            log::info!("Successfully parsed config as TOML");
-            return Ok(config);
+        match toml::from_str::<T>(content) {
+            Ok(config) => {
+                log::info!("Successfully parsed config as TOML");
+                return Ok(config);
+            }
+            Err(e) => {
+                log::debug!("Failed to parse as TOML: {}", e);
+                errors.push(format!("TOML: {}", e));
+            }
         }
-        log::error!("Failed to parse as TOML");
 
-        // 尝试 YAML
         log::info!("Trying to parse config as YAML");
-        if let Ok(config) = serde_yaml::from_str::<T>(content) {
-            log::info!("Successfully parsed config as YAML");
-            return Ok(config);
+        match serde_yaml::from_str::<T>(content) {
+            Ok(config) => {
+                log::info!("Successfully parsed config as YAML");
+                return Ok(config);
+            }
+            Err(e) => {
+                log::debug!("Failed to parse as YAML: {}", e);
+                errors.push(format!("YAML: {}", e));
+            }
         }
-        log::error!("Failed to parse as YAML");
 
-        // 尝试 JSON
         log::info!("Trying to parse config as JSON");
-        if let Ok(config) = serde_json::from_str(content) {
-            log::info!("Successfully parsed config as JSON");
-            return Ok(config);
+        match serde_json::from_str::<T>(content) {
+            Ok(config) => {
+                log::info!("Successfully parsed config as JSON");
+                return Ok(config);
+            }
+            Err(e) => {
+                log::debug!("Failed to parse as JSON: {}", e);
+                errors.push(format!("JSON: {}", e));
+            }
         }
-        log::error!("Failed to parse as JSON");
 
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Failed to parse config file",
+            format!(
+                "Failed to parse config file; attempted TOML/YAML/JSON, all failed:\n  {}",
+                errors.join("\n  ")
+            ),
         )))
     }
 
@@ -1171,7 +1193,84 @@ impl ConfigLoader {
                 "bind_port is required",
             )));
         }
+
+        // Web 管理端凭据必须成对配置：只填一半会导致鉴权被静默关闭，
+        // dashboard 直接对全网暴露，因此这里直接拒绝启动。
+        let web = &config.web_server;
+        if web.port != 0 {
+            match (&web.user, &web.password) {
+                (Some(user), Some(password)) => {
+                    if user.is_empty() || password.is_empty() {
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "web_server.user and web_server.password must be non-empty \
+                             (an empty credential would disable dashboard authentication)",
+                        )));
+                    }
+                    if user == "admin" && password == "admin" {
+                        log::warn!(
+                            "web_server is using the default admin/admin credentials; \
+                             change them before exposing the dashboard"
+                        );
+                    }
+                }
+                (None, None) => {
+                    log::warn!(
+                        "web_server.user/password not configured: dashboard authentication \
+                         is DISABLED, anyone who can reach the port can read the dashboard"
+                    );
+                }
+                _ => {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "web_server.user and web_server.password must be configured together",
+                    )));
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// 校验带宽限制字符串
+    ///
+    /// 支持 `"1GB"` / `"10MB"` / `"500KB"` / `"1024B"` / `"1024"`（纯字节数）。
+    /// 非法值（空串、非数字、`0`、负数）一律报错——避免出现「配置里写了限速，
+    /// 运行期却被静默忽略」的情况。
+    fn validate_bandwidth_limit(
+        value: &str,
+        field: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let upper = value.trim().to_uppercase();
+        let num_part = if let Some(n) = upper.strip_suffix("GB") {
+            n.trim()
+        } else if let Some(n) = upper.strip_suffix("MB") {
+            n.trim()
+        } else if let Some(n) = upper.strip_suffix("KB") {
+            n.trim()
+        } else if let Some(n) = upper.strip_suffix('B') {
+            n.trim()
+        } else {
+            upper.as_str()
+        };
+
+        let valid = num_part
+            .parse::<f64>()
+            .map(|v| v.is_finite() && v > 0.0)
+            .unwrap_or(false);
+
+        if valid {
+            Ok(())
+        } else {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} = \"{}\" is invalid; expected a positive value such as \
+                     \"1GB\", \"10MB\", \"500KB\" or a plain number of bytes",
+                    field, value
+                ),
+            )))
+        }
     }
 
     /// 验证客户端配置
@@ -1193,6 +1292,20 @@ impl ConfigLoader {
                 "server_port is required",
             )));
         }
+
+        // 带宽限制：非法值直接报错，而不是运行期被静默丢弃
+        if let Some(limit) = &config.transport.bandwidth_limit {
+            Self::validate_bandwidth_limit(limit, "transport.bandwidth_limit")?;
+        }
+        for proxy in &config.proxies {
+            if let Some(limit) = &proxy.bandwidth_limit {
+                Self::validate_bandwidth_limit(
+                    limit,
+                    &format!("proxies[name={}].bandwidth_limit", proxy.name),
+                )?;
+            }
+        }
+
         Ok(())
     }
 }
