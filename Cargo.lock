@@ -1139,7 +1139,9 @@ name = "rust_frp_plugin"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.13.1",
  "log",
+ "ring 0.16.20",
  "rust_frp_config",
  "rust_frp_net",
  "rust_frp_util",

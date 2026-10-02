@@ -382,6 +382,34 @@
     </div>
 
     <script>
+        // 说明：所有来自服务端的数据（代理名、client_id、local_ip、type 等）
+        // 都由客户端控制，属于不可信输入。这里一律用 createElement + textContent
+        // 渲染，绝不再用 innerHTML 拼接，以消除存储型 XSS。
+        const ALLOWED_PROXY_TYPES = ['tcp', 'udp', 'http', 'https', 'stcp', 'xtcp', 'websocket', 'tcpmux'];
+
+        function makeCell(value, styles) {
+            const td = document.createElement('td');
+            if (styles) {
+                td.setAttribute('style', styles);
+            }
+            td.textContent = (value === undefined || value === null || value === '') ? '-' : String(value);
+            return td;
+        }
+
+        function makeEmptyRow(colspan, message) {
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = colspan;
+            td.className = 'empty-state';
+            const p = document.createElement('p');
+            p.textContent = message;
+            td.appendChild(p);
+            tr.appendChild(td);
+            return tr;
+        }
+
+        const MONO_STYLE = "font-family: 'Fira Code', monospace;";
+
         async function fetchData() {
             try {
                 const [metricsResponse, controllersResponse, proxiesResponse] = await Promise.all([
@@ -400,38 +428,64 @@
                 const clientsTable = document.getElementById('clients-table').querySelector('tbody');
 
                 if (controllers.length === 0) {
-                    clientsTable.innerHTML = '<tr><td colspan="4" class="empty-state"><p>等待客户端连接...</p></td></tr>';
+                    clientsTable.replaceChildren(makeEmptyRow(4, '等待客户端连接...'));
                 } else {
-                    clientsTable.innerHTML = controllers.map(client => {
-                            const connectedSeconds = client.connected_at || 0;
-                            const connectedStr = connectedSeconds < 60 ? `${connectedSeconds}秒` :
-                                               connectedSeconds < 3600 ? `${Math.floor(connectedSeconds/60)}分钟` :
-                                               `${Math.floor(connectedSeconds/3600)}小时`;
-                            return `
-                        <tr>
-                            <td style="font-family: 'Fira Code', monospace;">${client.client_id || '-'}</td>
-                            <td style="font-family: 'Fira Code', monospace;">${client.run_id || '-'}</td>
-                            <td style="color: #60A5FA;">已连接 ${connectedStr}</td>
-                            <td><span style="color: #22C55E;">${client.last_heartbeat || 0}秒前</span></td>
-                        </tr>
-                    `;
-                        }).join('');
+                    const rows = controllers.map(client => {
+                        const connectedSeconds = Number(client.connected_at) || 0;
+                        const connectedStr = connectedSeconds < 60 ? `${connectedSeconds}秒` :
+                                             connectedSeconds < 3600 ? `${Math.floor(connectedSeconds/60)}分钟` :
+                                             `${Math.floor(connectedSeconds/3600)}小时`;
+
+                        const tr = document.createElement('tr');
+                        tr.appendChild(makeCell(client.client_id, MONO_STYLE));
+                        tr.appendChild(makeCell(client.run_id, MONO_STYLE));
+
+                        const connectedTd = document.createElement('td');
+                        connectedTd.style.color = '#60A5FA';
+                        connectedTd.textContent = `已连接 ${connectedStr}`;
+                        tr.appendChild(connectedTd);
+
+                        const heartbeatTd = document.createElement('td');
+                        const heartbeatSpan = document.createElement('span');
+                        heartbeatSpan.style.color = '#22C55E';
+                        heartbeatSpan.textContent = `${Number(client.last_heartbeat) || 0}秒前`;
+                        heartbeatTd.appendChild(heartbeatSpan);
+                        tr.appendChild(heartbeatTd);
+
+                        return tr;
+                    });
+                    clientsTable.replaceChildren(...rows);
                 }
 
                 const proxiesTable = document.getElementById('proxies-table').querySelector('tbody');
 
                 if (proxies.length === 0) {
-                    proxiesTable.innerHTML = '<tr><td colspan="5" class="empty-state"><p>暂无配置的代理</p></td></tr>';
+                    proxiesTable.replaceChildren(makeEmptyRow(5, '暂无配置的代理'));
                 } else {
-                    proxiesTable.innerHTML = proxies.map(proxy => `
-                        <tr>
-                            <td style="font-weight: 600;">${proxy.name}</td>
-                            <td><span class="type-badge type-${proxy.type.toLowerCase()}">${proxy.type}</span></td>
-                            <td style="font-family: 'Fira Code', monospace;">${proxy.local_ip}:${proxy.local_port}</td>
-                            <td style="font-family: 'Fira Code', monospace;">${proxy.remote_port || '-'}</td>
-                            <td style="font-family: 'Fira Code', monospace;">${proxy.client || '-'}</td>
-                        </tr>
-                    `).join('');
+                    const rows = proxies.map(proxy => {
+                        const tr = document.createElement('tr');
+
+                        const nameTd = makeCell(proxy.name);
+                        nameTd.style.fontWeight = '600';
+                        tr.appendChild(nameTd);
+
+                        const typeTd = document.createElement('td');
+                        const badge = document.createElement('span');
+                        const rawType = String(proxy.type === undefined || proxy.type === null ? '' : proxy.type);
+                        const normalizedType = rawType.toLowerCase();
+                        const safeType = ALLOWED_PROXY_TYPES.includes(normalizedType) ? normalizedType : 'unknown';
+                        badge.className = `type-badge type-${safeType}`;
+                        badge.textContent = rawType === '' ? '-' : rawType;
+                        typeTd.appendChild(badge);
+                        tr.appendChild(typeTd);
+
+                        tr.appendChild(makeCell(`${proxy.local_ip ?? '-'}:${proxy.local_port ?? '-'}`, MONO_STYLE));
+                        tr.appendChild(makeCell(proxy.remote_port, MONO_STYLE));
+                        tr.appendChild(makeCell(proxy.client, MONO_STYLE));
+
+                        return tr;
+                    });
+                    proxiesTable.replaceChildren(...rows);
                 }
             } catch (error) {
                 console.error('Error fetching data:', error);

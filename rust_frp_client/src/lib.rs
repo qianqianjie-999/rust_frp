@@ -171,6 +171,8 @@ pub struct ClientProxyManager {
     listeners: RwLock<std::collections::HashMap<String, std::sync::Arc<tokio::net::TcpListener>>>,
     work_conn_handlers: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     work_conn_manager: Option<Arc<WorkConnManager>>,
+    /// 传输层全局带宽限制（transport.bandwidth_limit），作为代理级配置的回落值
+    default_bandwidth_limit: Option<String>,
 }
 
 impl Default for ClientProxyManager {
@@ -186,11 +188,17 @@ impl ClientProxyManager {
             listeners: RwLock::new(std::collections::HashMap::new()),
             work_conn_handlers: RwLock::new(std::collections::HashMap::new()),
             work_conn_manager: None,
+            default_bandwidth_limit: None,
         }
     }
 
     pub fn set_work_conn_manager(&mut self, work_conn_manager: Arc<WorkConnManager>) {
         self.work_conn_manager = Some(work_conn_manager);
+    }
+
+    /// 设置传输层全局带宽限制，作为代理级未配置时的回落值
+    pub fn set_default_bandwidth_limit(&mut self, bandwidth_limit: Option<String>) {
+        self.default_bandwidth_limit = bandwidth_limit;
     }
 
     /// 启动工作连接处理器
@@ -202,9 +210,21 @@ impl ClientProxyManager {
         bandwidth_limit: Option<String>,
     ) {
         let proxy_name_clone = proxy_name.clone();
-        let rate_bytes_per_sec = bandwidth_limit
-            .as_deref()
-            .and_then(rust_frp_util::parse_bandwidth_limit);
+        // 限速配置为空表示不限速；非法值给出明确告警，而不是静默失效
+        let rate_bytes_per_sec = match bandwidth_limit.as_deref() {
+            Some(spec) => match rust_frp_util::parse_bandwidth_limit(spec) {
+                Some(rate) => Some(rate),
+                None => {
+                    log::warn!(
+                        "invalid bandwidth_limit \"{}\" for proxy {}; rate limiting disabled",
+                        spec,
+                        proxy_name_clone
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         let handle = tokio::spawn(async move {
             log::info!(
@@ -353,13 +373,13 @@ impl ClientProxyManager {
                 // 为 TCP 代理创建工作连接通道
                 // 当服务器收到外部连接时，会通过这个通道通知客户端
                 let (tx, rx) = mpsc::channel::<(tokio::net::TcpStream, Vec<u8>)>(100);
-                self.start_work_conn_handler(
-                    config.name.clone(),
-                    local_addr,
-                    rx,
-                    config.bandwidth_limit.clone(),
-                )
-                .await;
+                // 代理级带宽限制优先；未配置时回落到传输层全局限制
+                let bandwidth_limit = config
+                    .bandwidth_limit
+                    .clone()
+                    .or_else(|| self.default_bandwidth_limit.clone());
+                self.start_work_conn_handler(config.name.clone(), local_addr, rx, bandwidth_limit)
+                    .await;
 
                 // 注册工作连接发送器到 WorkConnManager
                 if let Some(work_conn_manager) = &self.work_conn_manager {
@@ -512,9 +532,14 @@ impl VisitorManager for ClientVisitorManager {
 
 /// 构建客户端 TLS 配置（供控制连接与工作连接复用）
 ///
-/// 与原版 frp 保持一致：
-/// - 配置了 trusted_ca_file → 使用 CA 证书验证
-/// - 未配置 trusted_ca_file → 跳过证书验证（默认行为）
+/// - 配置了 `trusted_ca_file` → 使用 CA 证书验证（推荐）
+/// - 未配置 `trusted_ca_file` → 跳过证书验证
+///
+/// # ⚠️ 安全提示
+///
+/// 「未配置 CA 即跳过校验」与仓库内置的自签名证书/私钥叠加后，TLS 只提供
+/// **加密**而不提供**身份认证**：任何拿到仓库内置私钥的人都可以冒充服务端。
+/// 生产环境请务必配置 `transport.tls.trusted_ca_file`，并在服务端换用自建证书。
 fn build_client_tls_config(
     config: &rust_frp_config::ClientConfig,
 ) -> Result<Option<TlsConfig>, Box<dyn std::error::Error>> {
@@ -523,6 +548,11 @@ fn build_client_tls_config(
             if let Some(ref ca_file) = tls.trusted_ca_file {
                 Some(TlsConfig::new_client_with_ca_file(ca_file)?)
             } else {
+                log::warn!(
+                    "TLS is enabled but transport.tls.trusted_ca_file is not set: \
+                     the server certificate will NOT be verified. This provides encryption \
+                     only, NOT authentication. Set trusted_ca_file to pin the server CA."
+                );
                 Some(TlsConfig::new_client_insecure()?)
             }
         } else {
@@ -1741,6 +1771,8 @@ impl Client {
         let mut proxy_manager_instance = ClientProxyManager::new();
         let work_conn_manager = Arc::new(WorkConnManager::new());
         proxy_manager_instance.set_work_conn_manager(work_conn_manager.clone());
+        proxy_manager_instance
+            .set_default_bandwidth_limit(config.transport.bandwidth_limit.clone());
         let proxy_manager = Arc::new(proxy_manager_instance);
 
         let visitor_manager = Arc::new(ClientVisitorManager::new());

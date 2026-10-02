@@ -433,6 +433,10 @@ impl TlsConfig {
     /// 仅使用 TLS 加密，但不验证服务器证书
     /// 类似于原版 frp 中没有 trustedCaFile 时的行为
     pub fn new_client_insecure() -> Result<Self, NetError> {
+        log::warn!(
+            "TLS client configured with certificate verification DISABLED: \
+             traffic is encrypted but the server identity is NOT authenticated"
+        );
         let verifier = SkipServerVerification;
         let config = tokio_rustls::rustls::ClientConfig::builder()
             .dangerous()
@@ -494,7 +498,18 @@ impl TlsConfig {
     }
 
     /// 创建使用内置自签名证书的服务器 TLS 配置
+    ///
+    /// # ⚠️ 安全提示
+    ///
+    /// 内置证书与私钥随源码分发，属于**公开的、不安全的**演示凭据：
+    /// 任何拿到本仓库的人都可以用它伪造服务端身份。生产环境请通过
+    /// `transport.tls.cert_file` / `key_file` 指定自建证书。
     pub fn new_server_with_builtin_cert() -> Result<Self, NetError> {
+        log::warn!(
+            "Using the BUILT-IN self-signed TLS certificate: its private key ships with the \
+             source code, so it provides encryption but NOT authentication. \
+             Configure transport.tls.cert_file/key_file with your own certificate in production."
+        );
         let cert_pem = include_bytes!("../cert/frp.crt");
         let key_pem = include_bytes!("../cert/frp.key");
 
