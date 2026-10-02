@@ -53,7 +53,10 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 FROM alpine:3.21 AS frps
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/rust_frps /usr/local/bin/rust_frps
-COPY frps.toml /etc/frp/frps.toml
+# 不再把配置文件打进镜像：frps.toml 可能含 token/密码，烘焙进镜像层等于泄露。
+# 请在运行时挂载，例如：
+#   docker run -v /etc/frp/frps.toml:/etc/frp/frps.toml:ro frps
+VOLUME ["/etc/frp"]
 EXPOSE 9300 8080 8443 7500
 ENTRYPOINT ["rust_frps"]
 CMD ["-c", "/etc/frp/frps.toml"]
@@ -61,6 +64,7 @@ CMD ["-c", "/etc/frp/frps.toml"]
 FROM alpine:3.21 AS frpc
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/rust_frpc /usr/local/bin/rust_frpc
-COPY frpc.toml /etc/frp/frpc.toml
+# 同上：frpc.toml 运行时挂载，不要打进镜像
+VOLUME ["/etc/frp"]
 ENTRYPOINT ["rust_frpc"]
 CMD ["-c", "/etc/frp/frpc.toml"]
