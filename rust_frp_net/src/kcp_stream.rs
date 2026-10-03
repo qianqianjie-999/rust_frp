@@ -624,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn test_kcp_large_transfer() {
         let (a, b, aa, bb) = bind_pair().await;
-        let mut client = KcpStream::connect(a, vec![bb], 42).await.unwrap();
+        let client = KcpStream::connect(a, vec![bb], 42).await.unwrap();
         let mut server = KcpStream::accept(b, vec![aa]).await.unwrap();
 
         let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();

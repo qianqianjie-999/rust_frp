@@ -66,7 +66,9 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 ```
 rust_frp/
 ├── rust_frp_core/          # 核心协议：消息类型、连接封装、Wire 协议
-├── rust_frp_server/        # 服务端：控制连接管理、池模式工作连接、代理转发、vhost 路由
+├── rust_frp_server/        # 服务端（模块化）：control 控制连接 / proxy_manager 代理管理 /
+│                             web 管理端 / server 监听编排 / work_conn 连接池 / vhost 路由 /
+│                             metrics 监控 / secrets STCP-XTCP 密钥 / visitor / error
 ├── rust_frp_client/        # 客户端：工作连接建立、PROXY protocol、本地服务桥接
 ├── rust_frp_config/        # 配置：TOML/YAML/JSON 解析、验证、环境变量
 ├── rust_frp_net/           # 网络：TCP/TLS/WebSocket、连接池 (rustls)
