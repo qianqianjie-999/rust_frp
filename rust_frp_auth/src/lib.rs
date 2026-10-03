@@ -192,6 +192,37 @@ impl TokenAuthVerifier {
     }
 }
 
+/// 生成 STCP/XTCP 访问签名密钥（基于代理共享密钥 secret_key）
+///
+/// # 签名算法
+///
+/// ```text
+/// sign_key = Base64(HMAC-SHA256(secret_key, "stcp:" + proxy_name + ":" + timestamp))
+/// ```
+///
+/// # 用途
+///
+/// STCP/XTCP 访问者请求建立连接时，用访问者本地配置的 `secret_key`
+/// （与服务端代理注册的 `secret_key` 一致）对 `proxy_name + timestamp` 签名，
+/// 服务端用代理注册时保存的 secret_key 重新计算并常量时间比较，
+/// 证明访问者持有共享密钥且请求非重放。
+///
+/// # 参数
+///
+/// - `secret_key`: 共享密钥（访问者配置与服务端代理配置必须一致）
+/// - `proxy_name`: 要访问的代理名称
+/// - `timestamp`: 请求时间戳（秒）
+///
+/// # 返回值
+///
+/// Base64 编码的签名字符串
+pub fn generate_stcp_sign_key(secret_key: &str, proxy_name: &str, timestamp: i64) -> String {
+    let msg = format!("stcp:{}:{}", proxy_name, timestamp);
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, secret_key.as_bytes());
+    let tag = hmac::sign(&hmac_key, msg.as_bytes());
+    base64::encode(tag.as_ref())
+}
+
 #[async_trait]
 impl AuthVerifier for TokenAuthVerifier {
     /// 验证登录令牌
@@ -689,6 +720,29 @@ mod tests {
     #[test]
     fn test_constant_time_compare_empty() {
         assert!(constant_time_compare(b"", b""));
+    }
+
+    #[test]
+    fn test_generate_stcp_sign_key_deterministic() {
+        let a = generate_stcp_sign_key("shared_secret", "ssh_proxy", 1000);
+        let b = generate_stcp_sign_key("shared_secret", "ssh_proxy", 1000);
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn test_generate_stcp_sign_key_varies() {
+        let base = generate_stcp_sign_key("shared_secret", "ssh_proxy", 1000);
+        assert_ne!(
+            base,
+            generate_stcp_sign_key("shared_secret", "ssh_proxy", 1001)
+        );
+        assert_ne!(base, generate_stcp_sign_key("shared_secret", "other", 1000));
+        assert_ne!(
+            base,
+            generate_stcp_sign_key("wrong_secret", "ssh_proxy", 1000)
+        );
+        assert_ne!(base, generate_stcp_sign_key("", "ssh_proxy", 1000));
     }
 
     #[tokio::test]

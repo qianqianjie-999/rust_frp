@@ -553,6 +553,8 @@ pub struct StcpStartWorkConnMsg {
 /// - `nat_type`: NAT 类型（如 "easy", "hard", "unknown"）
 /// - `local_addr`: 本地地址
 /// - `public_addr`: 公网地址（服务器观察到的）
+/// - `sign_key`: 访问签名（visitor 侧发送时携带，基于 secret_key；
+///   owner 侧回传时为空，服务器据此区分并校验 visitor 身份）
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct XtcpNatInfoMsg {
     pub proxy_name: String,
@@ -560,6 +562,11 @@ pub struct XtcpNatInfoMsg {
     pub nat_type: String,
     pub local_addr: String,
     pub public_addr: String,
+    #[serde(default)]
+    pub sign_key: String,
+    /// 签名时间戳（秒，visitor 侧签名时填写；owner 侧为 0）
+    #[serde(default)]
+    pub timestamp: i64,
 }
 
 /// XTCP 打洞消息 - 用于 P2P NAT 穿透
