@@ -3449,7 +3449,7 @@ impl Server {
                     Some(TlsConfig::new_server(cert_file, key_file)?)
                 } else {
                     // 使用内置自签名证书
-                    Some(TlsConfig::new_server_with_builtin_cert()?)
+                    Some(TlsConfig::new_server_with_runtime_cert()?)
                 }
             } else {
                 None
@@ -3465,7 +3465,7 @@ impl Server {
         // tls_only 前置校验：强制 TLS 必须先启用 TLS
         if config.transport.tls_only && conn_manager.get_tls_config().is_none() {
             return Err(
-                "tls_only requires transport.tls.enable = true (with cert/key or builtin cert)"
+                "tls_only requires transport.tls.enable = true (with cert/key or runtime-generated cert)"
                     .into(),
             );
         }
@@ -4348,7 +4348,7 @@ impl Server {
                     {
                         Some(TlsConfig::new_server(cert_file, key_file)?)
                     } else {
-                        Some(TlsConfig::new_server_with_builtin_cert()?)
+                        Some(TlsConfig::new_server_with_runtime_cert()?)
                     }
                 } else {
                     None

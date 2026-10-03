@@ -203,5 +203,39 @@ cargo test --workspace      → 184 passed / 0 failed（较上轮 +6 个回归�
 
 ### 9.5 剩余事项（未在本轮范围）
 
-- P1-5 内置私钥入库：等网络可拉 `rcgen` 后改为运行时生成证书（原始 P0-3 的最后一块）
+- ~~P1-5 内置私钥入库~~ → **已在第四轮关闭**，见《十、修复记录（第四轮）》
 - 季度项：`Server` 改 `Arc<Server>`、拆 5000 行巨石文件、STCP/XTCP `secret_key` 协议级实现
+
+---
+
+## 十、修复记录（第四轮，2026-10-03）
+
+### 10.1 P1-5 / 原始 P0-3：内置 TLS 私钥入库 → 已关闭
+
+**方案**：未配置证书时的兜底由「编译期内嵌固定证书」改为「运行时生成自签证书」。
+
+- `rust_frp_net` 引入 `rcgen 0.13`（清华镜像源可拉取）
+- 新增 `TlsConfig::new_server_with_runtime_cert()`：证书与私钥仅在内存中存在，
+  进程每次启动重新生成（SAN 覆盖 `frp-server.local` / `localhost`），启动 WARN 保留
+- 移除 `new_server_with_builtin_cert()` / `new_client_trusting_builtin()` /
+  `get_builtin_cert_pem()` / `get_builtin_key_pem()` 及全部 `include_bytes!` 引用，
+  4 处调用点（plugin ×2、server ×2）+ 1 处测试同步更新
+- **删除 `rust_frp_net/cert/frp.crt` / `frp.key`**（git rm + 磁盘删除），
+  `.gitignore` 增加 `rust_frp_net/cert/*.crt|*.key`、`*.pem` 防回归
+- 文档同步：`cert/README.md` 重写、README 特性行与安全表、`frps.example.toml` 注释
+
+**回归测试 +2**（`rust_frp_net/tests/runtime_cert.rs`）：
+真实 TCP 上的完整 TLS 握手（accept_stream / connect_stream）+ 重复生成成功。
+
+### 10.2 验证结果（全绿）
+
+```
+cargo fmt --all --check     → 通过
+cargo clippy --workspace    → 0 error
+cargo test --workspace      → 186 passed / 0 failed（+2）
+```
+
+### 10.3 当前剩余（仅季度级重构项）
+
+- `Server` 改 `Arc<Server>`、拆 5000 行巨石文件
+- STCP/XTCP `secret_key` 协议级实现（README 已如实标注 ⚠️）

@@ -49,7 +49,7 @@ pool_count = 10
 # 非法的带宽值（空串 / 0 / 负数 / 非数字）会直接报配置错误
 # bandwidth_limit = "10MB"
 
-# 启用 TLS：请务必指定自建证书，否则会回落到仓库内置的不安全演示证书
+# 启用 TLS：请务必指定自建证书，否则会在启动时内存中生成自签证书（仅加密、不认证身份）
 # [transport.tls]
 # enable = true
 # cert_file = "/etc/frp/certs/server.crt"

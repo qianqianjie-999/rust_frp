@@ -21,3 +21,4 @@ kcp = { workspace = true }
 rand = { workspace = true }
 yamux = { workspace = true }
 tokio-util = { workspace = true }
+rcgen = "0.13"
