@@ -993,7 +993,26 @@ impl Control {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log::info!("Control::run started");
         // 读取登录消息
-        let msg_result = self.conn.read_message().await;
+        //
+        // 安全：登录前读必须带超时（安全评审 P0-1）。否则未认证连接可以
+        // 永久挂起本任务（Slowloris 式资源耗尽）；同时首帧上限收紧到
+        // 64KB（P0-2），登录消息是几百字节量级的 JSON，无需 10MB 预算。
+        let msg_result = match tokio::time::timeout(
+            LOGIN_READ_TIMEOUT,
+            self.conn
+                .read_message_with_limit(rust_frp_core::MAX_PREAUTH_MESSAGE_SIZE),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                log::warn!(
+                    "Login read timed out after {:?}, closing unauthenticated connection",
+                    LOGIN_READ_TIMEOUT
+                );
+                return Err("login read timeout".into());
+            }
+        };
 
         match msg_result {
             Ok(msg) => {
@@ -2724,6 +2743,12 @@ impl VisitorManager for ServerVisitorManager {
 /// 管理端会话有效期（默认 8 小时）
 const WEB_SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
+/// 登录/工作连接握手阶段的最长等待时间。
+///
+/// 认证前的读操作必须受此超时约束（安全评审 P0-1）：
+/// 未认证连接不允许永久占用服务端任务与缓冲区。
+const LOGIN_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 管理端会话 cookie 名称
 const WEB_SESSION_COOKIE: &str = "frp_session";
 
@@ -2748,6 +2773,56 @@ struct WebAuth {
     password: Option<String>,
     /// token -> 过期时间
     sessions: RwLock<std::collections::HashMap<String, Instant>>,
+    /// 登录爆破防护（P1-3）：连续失败计数 + 锁定截止时间
+    throttle: RwLock<LoginThrottle>,
+}
+
+/// 登录失败节流状态。
+///
+/// 采用服务端全局计数（而非按 IP）：管理面板只有一组凭据，
+/// 全局粒度实现简单且不会被伪造 X-Forwarded-For 绕过。
+#[derive(Default)]
+struct LoginThrottle {
+    consecutive_failures: u32,
+    locked_until: Option<Instant>,
+}
+
+/// 连续失败达到该次数后锁定登录
+const LOGIN_LOCK_THRESHOLD: u32 = 5;
+/// 锁定时长
+const LOGIN_LOCK_DURATION: Duration = Duration::from_secs(5 * 60);
+
+impl LoginThrottle {
+    /// 当前是否处于锁定状态
+    fn is_locked(&mut self, now: Instant) -> bool {
+        match self.locked_until {
+            Some(until) if until > now => true,
+            Some(_) => {
+                // 锁定已过期，重置计数重新起算
+                self.locked_until = None;
+                self.consecutive_failures = 0;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 记录一次失败，返回是否触发锁定
+    fn record_failure(&mut self, now: Instant) -> bool {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= LOGIN_LOCK_THRESHOLD {
+            self.locked_until = Some(now + LOGIN_LOCK_DURATION);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 登录成功后清零
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.locked_until = None;
+    }
 }
 
 impl WebAuth {
@@ -2756,6 +2831,7 @@ impl WebAuth {
             user,
             password,
             sessions: RwLock::new(std::collections::HashMap::new()),
+            throttle: RwLock::new(LoginThrottle::default()),
         }
     }
 
@@ -2804,6 +2880,26 @@ impl WebAuth {
     async fn revoke_session(&self, token: &str) {
         if !token.is_empty() {
             self.sessions.write().await.remove(token);
+        }
+    }
+
+    /// 尝试登录（P1-3 防爆破）：
+    ///
+    /// - 处于锁定期 → `Err(true)`，不做凭据比较
+    /// - 凭据正确   → `Ok(())`，失败计数清零
+    /// - 凭据错误   → `Err(false)`，连续失败达到阈值后锁定 [`LOGIN_LOCK_DURATION`]
+    async fn attempt_login(&self, user: &str, password: &str) -> Result<(), bool> {
+        let mut throttle = self.throttle.write().await;
+        let now = Instant::now();
+        if throttle.is_locked(now) {
+            return Err(true);
+        }
+        if self.verify_credentials(user, password) {
+            throttle.record_success();
+            Ok(())
+        } else {
+            let locked = throttle.record_failure(now);
+            Err(locked)
         }
     }
 }
@@ -3032,10 +3128,28 @@ async fn login_post_handler(
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
 
-    // 未配置凭据时不允许登录（不再回退 admin/admin）
-    if !auth.requires_login() || !auth.verify_credentials(&username, &password) {
-        // 固定小延时，抬高在线暴力破解成本
+    // 未配置凭据时不允许登录（不再回退 admin/admin）；
+    // 凭据校验接入防爆破节流（P1-3）：连续失败达阈值后锁定一段时间
+    if !auth.requires_login() {
         tokio::time::sleep(Duration::from_millis(300)).await;
+        return axum::http::Response::builder()
+            .status(axum::http::StatusCode::UNAUTHORIZED)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )
+            .body(axum::body::Body::from("Unauthorized"))
+            .unwrap_or_else(|_| axum::http::StatusCode::UNAUTHORIZED.into_response());
+    }
+
+    if let Err(locked) = auth.attempt_login(&username, &password).await {
+        // 固定小延时，抬高在线暴力破解成本；锁定期内同样延时但不提示差异
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        log::warn!(
+            "Web login failed (locked={}) for user: {}",
+            locked,
+            username
+        );
         return axum::http::Response::builder()
             .status(axum::http::StatusCode::UNAUTHORIZED)
             .header(
@@ -3527,11 +3641,23 @@ impl Server {
 
                     tokio::spawn(async move {
                         // 嗅探首字节：0x16 = TLS ClientHello，其余视为明文协议
+                        // 安全：peek 受握手超时约束，未认证连接不允许无限等待首字节
                         let mut first_byte = [0u8; 1];
-                        let n = match conn.peek(&mut first_byte).await {
-                            Ok(n) => n,
-                            Err(e) => {
+                        let peek_result =
+                            tokio::time::timeout(LOGIN_READ_TIMEOUT, conn.peek(&mut first_byte))
+                                .await;
+                        let n = match peek_result {
+                            Ok(Ok(n)) => n,
+                            Ok(Err(e)) => {
                                 log::debug!("Work conn peek failed from {:?}: {}", addr, e);
+                                return;
+                            }
+                            Err(_) => {
+                                log::debug!(
+                                    "Work conn peek timed out from {:?} after {:?}",
+                                    addr,
+                                    LOGIN_READ_TIMEOUT
+                                );
                                 return;
                             }
                         };
@@ -3606,7 +3732,26 @@ impl Server {
         stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取客户端发送的 NewWorkConn 消息
-        let msg = rust_frp_core::read_message(&mut conn).await?;
+        //
+        // 安全：认证前的握手读必须带超时（P0-1），首帧用预认证上限（P0-2）。
+        let msg = match tokio::time::timeout(
+            LOGIN_READ_TIMEOUT,
+            rust_frp_core::read_message_with_limit(
+                &mut conn,
+                rust_frp_core::MAX_PREAUTH_MESSAGE_SIZE,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                log::warn!(
+                    "Work conn handshake timed out after {:?}",
+                    LOGIN_READ_TIMEOUT
+                );
+                return Err("work conn handshake timeout".into());
+            }
+        };
 
         match msg {
             Message::NewWorkConn(work_msg) => {
@@ -4236,8 +4381,26 @@ impl Server {
         stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 首字节嗅探：TCP_MUX_MAGIC = tcp_mux 客户端（多路复用路径）
+        // 安全：入口嗅探与 TLS 握手都必须受握手超时约束（P0-1），
+        // 未认证连接不允许永久占用任务。
         let mut first = [0u8; 1];
-        if conn.peek(&mut first).await.is_ok_and(|n| n == 1) && first[0] == TCP_MUX_MAGIC {
+        let sniff = tokio::time::timeout(LOGIN_READ_TIMEOUT, conn.peek(&mut first)).await;
+        match sniff {
+            // 对端一直不发首字节：直接断开，不让未认证连接占用任务
+            Err(_) => {
+                log::debug!(
+                    "Control conn sniff timed out from peer after {:?}",
+                    LOGIN_READ_TIMEOUT
+                );
+                return Err("control conn sniff timeout".into());
+            }
+            Ok(Err(e)) => {
+                log::debug!("Control conn sniff failed: {}", e);
+                return Err(format!("control conn sniff failed: {}", e).into());
+            }
+            Ok(Ok(_)) => {}
+        }
+        if first[0] == TCP_MUX_MAGIC {
             // 消费 magic 字节（peek 不消费；不读掉会污染后续 TLS 握手）
             let mut b = [0u8; 1];
             conn.read_exact(&mut b).await?;
@@ -4261,14 +4424,20 @@ impl Server {
         let work_conn_tls = tls_config.is_some();
         let conn = if let Some(tls_config) = tls_config {
             // 处理 TLS 连接
-            let tls_stream = match tls_config.accept(conn).await {
-                Ok(s) => s,
-                Err(e) => {
-                    global_metrics().incr_tls_rejects();
-                    log::warn!("TLS accept failed: {}", e);
-                    return Err(format!("TLS accept failed: {}", e).into());
-                }
-            };
+            let tls_stream =
+                match tokio::time::timeout(LOGIN_READ_TIMEOUT, tls_config.accept(conn)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        global_metrics().incr_tls_rejects();
+                        log::warn!("TLS accept failed: {}", e);
+                        return Err(format!("TLS accept failed: {}", e).into());
+                    }
+                    Err(_) => {
+                        global_metrics().incr_tls_rejects();
+                        log::warn!("TLS handshake timed out after {:?}", LOGIN_READ_TIMEOUT);
+                        return Err("TLS handshake timeout".into());
+                    }
+                };
             ControlConn::new(Box::new(tls_stream))
         } else {
             // 处理普通 TCP 连接
@@ -4823,5 +4992,78 @@ mod web_auth_tests {
 
         let cookie = set_cookie_of(&response).expect("clearing cookie set");
         assert!(cookie.contains("Max-Age=0"), "cookie: {}", cookie);
+    }
+
+    #[tokio::test]
+    async fn test_login_throttle_locks_after_threshold() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+
+        // 前 LOGIN_LOCK_THRESHOLD - 1 次失败：凭据错误但未锁定
+        for _ in 0..LOGIN_LOCK_THRESHOLD - 1 {
+            assert_eq!(
+                auth.attempt_login("boss", "wrong").await,
+                Err(false),
+                "not locked yet"
+            );
+        }
+
+        // 第 LOGIN_LOCK_THRESHOLD 次失败：本次即触发锁定
+        assert_eq!(auth.attempt_login("boss", "wrong").await, Err(true));
+
+        // 锁定期内即使凭据正确也拒绝（fail-closed）
+        assert_eq!(
+            auth.attempt_login("boss", "s3cret").await,
+            Err(true),
+            "locked even with correct credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_throttle_resets_after_success() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+
+        for _ in 0..LOGIN_LOCK_THRESHOLD - 1 {
+            let _ = auth.attempt_login("boss", "wrong").await;
+        }
+        // 成功登录后计数清零，之后重新起算
+        assert!(auth.attempt_login("boss", "s3cret").await.is_ok());
+        for _ in 0..LOGIN_LOCK_THRESHOLD - 1 {
+            assert_eq!(auth.attempt_login("boss", "wrong").await, Err(false));
+        }
+        assert_eq!(auth.attempt_login("boss", "wrong").await, Err(true));
+        assert_eq!(auth.attempt_login("boss", "s3cret").await, Err(true));
+    }
+
+    #[tokio::test]
+    async fn test_login_handler_rejects_correct_credentials_when_locked() {
+        let auth = auth(Some("boss"), Some("s3cret"));
+
+        // 打满失败次数触发锁定
+        for _ in 0..LOGIN_LOCK_THRESHOLD {
+            let response = login_post_handler(
+                axum::extract::Extension(auth.clone()),
+                axum::http::HeaderMap::new(),
+                form(&[("username", "boss"), ("password", "nope")]),
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+
+        // 锁定期内正确凭据同样 401，且不下发会话 cookie
+        let response = login_post_handler(
+            axum::extract::Extension(auth.clone()),
+            axum::http::HeaderMap::new(),
+            form(&[("username", "boss"), ("password", "s3cret")]),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert!(set_cookie_of(&response).is_none(), "no session when locked");
+    }
+
+    #[tokio::test]
+    async fn test_login_read_timeout_constant_is_sane() {
+        // 预认证超时必须存在且为有限正值（P0-1 回归锚点）
+        assert!(LOGIN_READ_TIMEOUT.as_secs() >= 5);
+        assert!(LOGIN_READ_TIMEOUT.as_secs() <= 120);
     }
 }

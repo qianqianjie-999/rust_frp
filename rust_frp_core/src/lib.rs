@@ -619,6 +619,13 @@ pub struct ProxyStatusRespMsg {
 /// - 整数溢出：消息长度字段被操纵
 const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// 认证前的首帧上限。
+///
+/// 登录（LoginMsg）与工作连接（NewWorkConn）握手消息都是几百字节量级的 JSON，
+/// 认证完成前没有必要接受 10MB 级别的帧——收紧上限可以避免未认证连接
+/// 通过声明超大长度造成内存放大（见安全评审 P0-2）。
+pub const MAX_PREAUTH_MESSAGE_SIZE: usize = 64 * 1024;
+
 /// 从连接读取消息
 ///
 /// # 协议格式
@@ -649,19 +656,32 @@ const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 pub async fn read_message<T: AsyncRead + Unpin>(
     conn: &mut T,
 ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
+    read_message_with_limit(conn, MAX_MESSAGE_SIZE).await
+}
+
+/// 从连接读取消息，使用调用方指定的长度上限
+///
+/// 认证前阶段（登录首帧、工作连接握手）应传入 [`MAX_PREAUTH_MESSAGE_SIZE`]
+/// 收紧限制；认证后使用 [`read_message`]（10MB 上限）。
+///
+/// # 错误类型
+///
+/// - `InvalidData`: 消息长度超过 `max_size`
+/// - 其余同 [`read_message`]
+pub async fn read_message_with_limit<T: AsyncRead + Unpin>(
+    conn: &mut T,
+    max_size: usize,
+) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
     // 读取 4 字节长度字段（大端序）
     let mut len_buf = [0; 4];
     conn.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
     // 安全检查：防止内存耗尽攻击
-    if len > MAX_MESSAGE_SIZE {
+    if len > max_size {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "message size too large: {} bytes (max: {})",
-                len, MAX_MESSAGE_SIZE
-            ),
+            format!("message size too large: {} bytes (max: {})", len, max_size),
         )));
     }
 
@@ -747,6 +767,17 @@ impl ControlConn {
         &mut self,
     ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
         read_message(&mut self.conn).await
+    }
+
+    /// 异步读取消息，使用调用方指定的长度上限
+    ///
+    /// 认证前阶段（登录首帧、工作连接握手）应传入
+    /// [`MAX_PREAUTH_MESSAGE_SIZE`] 收紧限制。
+    pub async fn read_message_with_limit(
+        &mut self,
+        max_size: usize,
+    ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
+        read_message_with_limit(&mut self.conn, max_size).await
     }
 
     /// 异步发送消息
@@ -1149,5 +1180,34 @@ mod tests {
     #[test]
     fn test_max_message_size_constant() {
         assert_eq!(MAX_MESSAGE_SIZE, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_preauth_limit_constant() {
+        // 预认证首帧上限：64KB（P0-2 回归锚点）
+        assert_eq!(MAX_PREAUTH_MESSAGE_SIZE, 64 * 1024);
+        assert!(MAX_PREAUTH_MESSAGE_SIZE < MAX_MESSAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_read_message_with_limit_rejects_oversized() {
+        // 声明长度 65KB > 预认证上限 64KB：必须在分配缓冲前拒绝
+        let mut buf = std::io::Cursor::new((64 * 1024 + 1u32).to_be_bytes().to_vec());
+        let result = read_message_with_limit(&mut buf, MAX_PREAUTH_MESSAGE_SIZE).await;
+        assert!(result.is_err(), "oversized pre-auth frame must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("too large"), "unexpected error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_read_message_with_limit_accepts_small_frame() {
+        let msg = Message::Ping(PingMsg { timestamp: 1 });
+        let mut wire = Vec::new();
+        write_message(&mut wire, &msg).await.unwrap();
+        let mut buf = std::io::Cursor::new(wire);
+        let decoded = read_message_with_limit(&mut buf, MAX_PREAUTH_MESSAGE_SIZE)
+            .await
+            .expect("small frame within pre-auth limit");
+        assert!(matches!(decoded, Message::Ping(_)));
     }
 }
