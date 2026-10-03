@@ -54,7 +54,10 @@ struct UdpOutput(Arc<Mutex<Vec<Vec<u8>>>>);
 
 impl std::io::Write for UdpOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().push(buf.to_vec());
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(buf.to_vec());
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -110,20 +113,30 @@ impl Shared {
     }
 
     fn mark_dead(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.dead = true;
         Self::wake_read(&mut st);
         Self::wake_write(&mut st);
     }
 
     fn peers_of(&self) -> Vec<SocketAddr> {
-        self.state.lock().unwrap().peers.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .peers
+            .clone()
     }
 
     /// 冲刷 kcp 发送缓冲并经 UDP 发出
     fn flush_and_send(&self) {
         let pkts = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if st.dead {
                 return;
             }
@@ -135,7 +148,10 @@ impl Shared {
                 Self::wake_write(&mut st);
                 return;
             }
-            let mut out = st.out.lock().unwrap();
+            let mut out = st
+                .out
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             out.drain(..).collect::<Vec<Vec<u8>>>()
         };
         send_all(&self.socket, &pkts, self);
@@ -148,7 +164,10 @@ impl Shared {
 /// 数据仍留在 kcp 发送队列，由 update 心跳周期重传。
 fn send_all(socket: &Arc<UdpSocket>, pkts: &[Vec<u8>], shared: &Shared) {
     let target = {
-        let st = shared.state.lock().unwrap();
+        let st = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if st.dead {
             return;
         }
@@ -245,11 +264,17 @@ impl KcpStream {
             // connect 侧：立即发送带内握手字节驱动对端 conv 学习与 ACK，
             // 未获 ACK 前由 kcp 重传 + puncher 持续打洞，直到对端可达
             let pkts = {
-                let mut st = shared.state.lock().unwrap();
+                let mut st = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let _ = st.kcp.send(&[HANDSHAKE_MAGIC]);
                 let now = st.now_ms();
                 let _ = st.kcp.update(now);
-                let mut out = st.out.lock().unwrap();
+                let mut out = st
+                    .out
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 out.drain(..).collect::<Vec<Vec<u8>>>()
             };
             for pkt in &pkts {
@@ -264,18 +289,30 @@ impl KcpStream {
 
     /// 是否收到过对端有效 KCP 输入（打洞成功标志）
     pub fn has_activity(&self) -> bool {
-        self.shared.state.lock().unwrap().active
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
     }
 
     /// 当前锁定的对端地址
     pub fn peer_addr(&self) -> Option<SocketAddr> {
-        self.shared.state.lock().unwrap().active_peer
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_peer
     }
 
     /// 关闭流并停止全部后台任务
     pub fn close(&self) {
         self.shared.closed.store(true, Ordering::Relaxed);
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Shared::wake_read(&mut st);
         Shared::wake_write(&mut st);
     }
@@ -296,7 +333,11 @@ impl AsyncRead for KcpStream {
         // 循环读取：accept 侧可能先读到单字节握手段（丢弃后需继续读，
         // 不能返回空读——AsyncRead 返回 0 会被解释为 EOF）
         loop {
-            let mut st = self.shared.state.lock().unwrap();
+            let mut st = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if st.dead || self.shared.is_closed() {
                 return Poll::Ready(Ok(())); // EOF
             }
@@ -341,7 +382,10 @@ impl AsyncWrite for KcpStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let shared = &self.shared;
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if st.dead || shared.is_closed() {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -371,7 +415,12 @@ impl AsyncWrite for KcpStream {
                         e.to_string(),
                     )));
                 }
-                let pkts: Vec<Vec<u8>> = st.out.lock().unwrap().drain(..).collect();
+                let pkts: Vec<Vec<u8>> = st
+                    .out
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .drain(..)
+                    .collect();
                 drop(st);
                 send_all(&shared.socket, &pkts, shared);
                 Poll::Ready(Ok(n))
@@ -435,7 +484,10 @@ fn spawn_recv_loop(weak: Weak<Shared>) {
             }
 
             let got_data = {
-                let mut st = shared.state.lock().unwrap();
+                let mut st = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if st.dead {
                     continue;
                 }
@@ -454,7 +506,10 @@ fn spawn_recv_loop(weak: Weak<Shared>) {
             };
             if got_data {
                 shared.flush_and_send(); // 立即 ACK
-                let mut st = shared.state.lock().unwrap();
+                let mut st = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 Shared::wake_read(&mut st);
             }
         }
@@ -471,7 +526,10 @@ fn spawn_ticker(weak: Weak<Shared>) {
                 break;
             }
             let dead_link = {
-                let st = shared.state.lock().unwrap();
+                let st = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 st.kcp.is_dead_link() && !st.dead
             };
             if dead_link {
@@ -481,7 +539,10 @@ fn spawn_ticker(weak: Weak<Shared>) {
             }
             shared.flush_and_send();
             // 释放写背压（发送队列被 ACK 清空后唤醒阻塞的写）
-            let mut st = shared.state.lock().unwrap();
+            let mut st = shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if st.kcp.wait_snd() < st.kcp.snd_wnd() as usize {
                 Shared::wake_write(&mut st);
             }
@@ -498,7 +559,12 @@ fn spawn_puncher(weak: Weak<Shared>) {
             if shared.is_closed() {
                 break;
             }
-            let locked = shared.state.lock().unwrap().active_peer.is_some();
+            let locked = shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active_peer
+                .is_some();
             if locked {
                 break; // 已连通，停止打洞
             }

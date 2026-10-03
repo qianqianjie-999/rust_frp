@@ -36,6 +36,10 @@ allow_ports = [
 # port = 7500
 # user = "CHANGE_ME_DASHBOARD_USER"
 # password = "CHANGE_ME_STRONG_DASHBOARD_PASSWORD"
+# 是否公开 Prometheus 抓取端点 /metrics（默认 false，返回 404）
+# 注意：开启后 /metrics 免登录可读（含 run_id、代理名、流量计数），
+# 建议同时用反向代理限制来源；Dashboard 内的 /api/metrics 始终受登录保护。
+# expose_metrics = false
 
 # --- 传输配置 ---
 [transport]
