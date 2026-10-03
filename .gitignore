@@ -41,3 +41,8 @@ out/
 # Temporary files
 *.tmp
 *.temp
+
+# TLS 私钥/证书不得入库（运行时自签或用户自配）
+rust_frp_net/cert/*.crt
+rust_frp_net/cert/*.key
+*.pem

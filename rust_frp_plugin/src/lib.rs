@@ -620,7 +620,7 @@ impl TlsOffloadPlugin {
         // 证书：显式配置 crt_path/key_path 优先，否则内置自签名证书
         let tls_config = match (&config.crt_path, &config.key_path) {
             (Some(crt), Some(key)) => rust_frp_net::TlsConfig::new_server(crt, key)?,
-            (None, None) => rust_frp_net::TlsConfig::new_server_with_builtin_cert()?,
+            (None, None) => rust_frp_net::TlsConfig::new_server_with_runtime_cert()?,
             _ => {
                 return Err(invalid_input(
                     "crt_path and key_path must be configured together",
@@ -668,7 +668,7 @@ impl TlsBridgePlugin {
 
         let server_tls = match (&config.crt_path, &config.key_path) {
             (Some(crt), Some(key)) => rust_frp_net::TlsConfig::new_server(crt, key)?,
-            (None, None) => rust_frp_net::TlsConfig::new_server_with_builtin_cert()?,
+            (None, None) => rust_frp_net::TlsConfig::new_server_with_runtime_cert()?,
             _ => {
                 return Err(invalid_input(
                     "crt_path and key_path must be configured together",

@@ -9,8 +9,8 @@
 //!    - 实现了 `AsyncRead` 和 `AsyncWrite` trait，便于数据流操作
 //!
 //! 2. **TLS 加密支持**
-//!    - 支持自定义证书和内置自签名证书
-//!    - 客户端可配置为信任内置证书，简化部署
+//!    - 支持自定义证书与运行时生成的自签名证书（内存中，不落盘、不入库）
+//!    - 客户端可配置信任指定 CA 证书（trusted_ca_file）
 //!
 //! 3. **WebSocket 支持**
 //!    - 支持通过 WebSocket 协议进行连接，适用于复杂网络环境
@@ -22,8 +22,8 @@
 //! ## 安全性
 //!
 //! - TLS 1.2 及以上版本
-//! - 内置自签名证书，方便快速部署
-//! - 支持自定义证书，可用于生产环境
+//! - 未配置证书时服务端使用运行时生成的自签名证书（仅加密，不认证身份）
+//! - 生产环境请配置自定义证书
 
 use futures_util::{Sink, Stream};
 use std::io::BufReader;
@@ -37,7 +37,9 @@ use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use tokio_rustls::rustls::pki_types::UnixTime;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio_rustls::rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
+};
 use tokio_rustls::rustls::DigitallySignedStruct;
 use tokio_rustls::rustls::Error as TlsError;
 use tokio_rustls::rustls::SignatureScheme;
@@ -471,96 +473,39 @@ impl TlsConfig {
         })
     }
 
-    /// 创建客户端 TLS 配置，信任内置自签名证书
-    /// 将内置证书添加到 trust store 并启用证书验证
-    pub fn new_client_trusting_builtin() -> Result<Self, NetError> {
-        let cert_pem = include_bytes!("../cert/frp.crt");
-        let certs: Result<Vec<CertificateDer<'static>>, _> =
-            rustls_pemfile::certs(&mut &cert_pem[..]).collect();
-        let certs = certs.map_err(|e| NetError::PemDecode(format!("{}", e)))?;
-
-        let cert_der = certs
-            .into_iter()
-            .next()
-            .ok_or_else(|| NetError::Other("No certificate found in builtin cert".to_string()))?;
-
-        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-        root_store.add(cert_der).map_err(NetError::Tls)?;
-
-        let config = tokio_rustls::rustls::ClientConfig::builder()
-            .with_root_certificates(Arc::new(root_store))
-            .with_no_client_auth();
-
-        Ok(Self {
-            server_config: None,
-            client_config: Some(Arc::new(config)),
-        })
-    }
-
-    /// 创建使用内置自签名证书的服务器 TLS 配置
+    /// 创建使用**运行时生成**的自签名证书的服务器 TLS 配置
     ///
-    /// # ⚠️ 安全提示
-    ///
-    /// 内置证书与私钥随源码分发，属于**公开的、不安全的**演示凭据：
-    /// 任何拿到本仓库的人都可以用它伪造服务端身份。生产环境请通过
-    /// `transport.tls.cert_file` / `key_file` 指定自建证书。
-    pub fn new_server_with_builtin_cert() -> Result<Self, NetError> {
+    /// 证书与私钥仅在内存中存在，进程每次启动都重新生成：
+    /// - 私钥不再随源码分发，拿到仓库的人无法据此伪造服务端身份
+    /// - 但仍是自签名证书，客户端默认不验证时仅提供加密不提供认证；
+    ///   需要认证请配置 `transport.tls.cert_file` / `key_file`（服务端）
+    ///   与 `transport.tls.trusted_ca_file`（客户端）
+    pub fn new_server_with_runtime_cert() -> Result<Self, NetError> {
         log::warn!(
-            "Using the BUILT-IN self-signed TLS certificate: its private key ships with the \
-             source code, so it provides encryption but NOT authentication. \
+            "Using a RUNTIME-GENERATED self-signed TLS certificate (fresh per process): \
+             encryption only, server identity NOT authenticated. \
              Configure transport.tls.cert_file/key_file with your own certificate in production."
         );
-        let cert_pem = include_bytes!("../cert/frp.crt");
-        let key_pem = include_bytes!("../cert/frp.key");
 
-        let certs: Result<Vec<CertificateDer<'static>>, _> =
-            rustls_pemfile::certs(&mut &cert_pem[..]).collect();
-        let cert_chain = certs.map_err(|e| NetError::PemDecode(format!("{}", e)))?;
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "frp-server.local".to_string(),
+            "localhost".to_string(),
+        ])
+        .map_err(|e| {
+            NetError::Other(format!("failed to generate self-signed certificate: {}", e))
+        })?;
 
-        let pkcs8_keys: Result<Vec<_>, _> =
-            rustls_pemfile::pkcs8_private_keys(&mut &key_pem[..]).collect();
-        let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_keys
-            .map_err(|e| NetError::PemDecode(format!("{}", e)))?
-            .into_iter()
-            .map(|k| k.into())
-            .collect();
-
-        if keys.is_empty() {
-            let rsa_keys: Result<Vec<_>, _> =
-                rustls_pemfile::rsa_private_keys(&mut &key_pem[..]).collect();
-            let rsa_keys: Vec<PrivateKeyDer<'static>> = rsa_keys
-                .map_err(|e| NetError::PemDecode(format!("{}", e)))?
-                .into_iter()
-                .map(|k| k.into())
-                .collect();
-            keys.extend(rsa_keys);
-        }
-
-        if keys.is_empty() {
-            return Err(NetError::Other(
-                "No private key found in builtin cert".to_string(),
-            ));
-        }
-        let key = keys.remove(0);
+        let cert_der = cert.cert.der().to_owned();
+        let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
 
         let config = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)?;
+            .with_single_cert(vec![cert_der], key_der.into())?;
 
         Ok(Self {
             server_config: Some(Arc::new(config)),
             client_config: None,
         })
-    }
-
-    /// 获取内置证书的 PEM 数据（用于 Web 服务器 HTTPS）
-    pub fn get_builtin_cert_pem() -> &'static [u8] {
-        include_bytes!("../cert/frp.crt")
-    }
-
-    /// 获取内置私钥的 PEM 数据（用于 Web 服务器 HTTPS）
-    pub fn get_builtin_key_pem() -> &'static [u8] {
-        include_bytes!("../cert/frp.key")
     }
 
     /// 接受 TLS 连接（服务端）

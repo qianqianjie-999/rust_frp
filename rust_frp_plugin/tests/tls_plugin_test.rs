@@ -29,7 +29,7 @@ async fn spawn_echo_server() -> String {
 async fn spawn_tls_echo_server() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let tls_config = rust_frp_net::TlsConfig::new_server_with_builtin_cert().unwrap();
+    let tls_config = rust_frp_net::TlsConfig::new_server_with_runtime_cert().unwrap();
     tokio::spawn(async move {
         loop {
             if let Ok((conn, _)) = listener.accept().await {
