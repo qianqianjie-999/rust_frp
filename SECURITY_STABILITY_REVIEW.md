@@ -2,7 +2,8 @@
 
 > 审查日期：2026-10-03 ｜ 范围：`fix/p0-security-hardening`（e627958）当前代码
 > 方式：客观命令实测 + 逐行安全走读 + 前置守卫核验
-> **2026-10-03 更新：P0-1 / P0-2 / P1-3 已修复，见文末《八、修复记录（第二轮）》**
+> **2026-10-03 更新：P0-1 / P0-2 / P1-3 已修复（见《八、修复记录（第二轮）》）；
+> P1-1 / P1-2 / P1-4 已修复（见《九、修复记录（第三轮）》）**
 
 ---
 
@@ -154,7 +155,53 @@ cargo test --workspace      → 178 passed / 0 failed
 
 ### 8.4 本轮未做 + 原因
 
-- **P1-1 锁中毒链**：涉及 20+ 处 `.lock().unwrap()` 的机械替换，改动面广但风险低，建议单独一个提交做（与安全修复分开，便于 revert）
-- **P1-2 写方向超时**：需要改控制循环 `write_msg` 的全部调用点，属下一批
-- **P1-4 `/metrics` 开关**：涉及新增配置字段与文档，属下一批
-- **P0-1 附注**：全局并发连接 Semaphore（如上限 512）未加——超时修复已消除无限挂起，连接数上限作为纵深防御列入下一批
+> 以下各项均已在第三轮修复中完成，见《九、修复记录（第三轮）》。
+
+- ~~P1-1 锁中毒链~~（24 处已改 `unwrap_or_else(into_inner)`）
+- ~~P1-2 写方向超时~~（`WRITE_TIMEOUT = 30s`，覆盖控制通道与工作连接响应路径）
+- ~~P1-4 `/metrics` 开关~~（`expose_metrics` 默认 false）
+- ~~P0-1 附注：全局连接 Semaphore~~（`MAX_INFLIGHT_CONNECTIONS = 4096`，超限直接拒绝）
+
+---
+
+## 九、修复记录（第三轮，2026-10-03）
+
+### 9.1 P1-1 锁中毒连锁 panic → 已修复
+
+- **server 3 处**（`proxy_stats` 的 read/write）：`.lock().unwrap()` / `.read().unwrap()` / `.write().unwrap()` 统一改为 `.unwrap_or_else(std::sync::PoisonError::into_inner)`
+- **client 2 处**（`pending`）、**net/kcp_stream 19 处**（`state` / `out`）同样处理
+- 语义：任一持锁线程 panic 后，后续调用**取回数据继续工作**而不是连锁 panic；全局生产代码中锁 unwrap 已清零
+- 回归测试：`test_poisoned_lock_recovery`（真实 panic 中毒 Mutex / RwLock 后取回数据）
+
+### 9.2 P1-2 写方向无超时 → 已修复
+
+- 新增 `WRITE_TIMEOUT = 30s` 常量
+- `Control::write_msg`（控制通道全部下行消息）包 30s 超时：零窗口客户端不再能钉死控制任务
+- 工作连接握手阶段的 3 处错误响应写入改走 `write_message_with_timeout()` 辅助函数
+- 回归测试：`test_write_timeout_constant` 常量锚点
+
+### 9.3 P1-4 `/metrics` 公开 + 无全局连接上限 → 已修复
+
+**指标端点开关**
+- `WebServerConfig` 新增 `expose_metrics: bool`（serde 默认 **false**）
+- 默认不注册 `/metrics` 路由（请求 404）；Dashboard 内的 `/api/metrics` 始终受登录保护
+- 显式开启后 `/metrics` 免鉴权（供 Prometheus 抓取），`frps.example.toml` 已补说明
+- 回归测试：config 默认 false / 可显式开启
+
+**全局连接上限（纵深防御）**
+- 新增 `MAX_INFLIGHT_CONNECTIONS = 4096` 与进程级 `Semaphore`
+- 控制口（含 reload select 分支共 2 处）与工作连接口 accept 循环：许可耗尽时**直接拒绝新连接**（不做排队），许可随连接任务生命周期持有与释放
+- 回归测试：`test_conn_limit_constant`、`test_conn_limiter_rejects_when_exhausted`
+
+### 9.4 验证结果（全绿）
+
+```
+cargo fmt --all --check     → 通过
+cargo clippy --workspace    → 0 error（告警集合与修复前一致，均为既有风格类）
+cargo test --workspace      → 184 passed / 0 failed（较上轮 +6 个回归测试）
+```
+
+### 9.5 剩余事项（未在本轮范围）
+
+- P1-5 内置私钥入库：等网络可拉 `rcgen` 后改为运行时生成证书（原始 P0-3 的最后一块）
+- 季度项：`Server` 改 `Arc<Server>`、拆 5000 行巨石文件、STCP/XTCP `secret_key` 协议级实现

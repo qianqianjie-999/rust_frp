@@ -734,12 +734,19 @@ impl MonitorMetrics {
 
     /// 代理注销时移除统计
     pub fn remove_proxy_stat(&self, name: &str) {
-        self.proxy_stats.write().unwrap().remove(name);
+        self.proxy_stats
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
     }
 
     /// 获取代理统计（用于连接计数守卫）
     pub fn get_proxy_stat(&self, name: &str) -> Option<std::sync::Arc<ProxyStat>> {
-        self.proxy_stats.read().unwrap().get(name).cloned()
+        self.proxy_stats
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
     }
 
     /// 输出 Prometheus text exposition format (v0.0.4)。
@@ -834,7 +841,10 @@ impl MonitorMetrics {
         );
 
         // per-proxy 指标（label: name/type）
-        let stats = self.proxy_stats.read().unwrap();
+        let stats = self
+            .proxy_stats
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for stat in stats.values() {
             let labels = format!(
                 "{{name=\"{}\",type=\"{}\"}}",
@@ -984,7 +994,12 @@ impl Control {
         &mut self,
         msg: &Message,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.conn.write_message(msg).await
+        // 写方向超时（P1-2）：防止零窗口客户端无限阻塞控制任务
+        tokio::time::timeout(WRITE_TIMEOUT, self.conn.write_message(msg))
+            .await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                "write timeout: peer is not consuming data (zero-window?)".into()
+            })?
     }
 
     pub async fn run(
@@ -2749,6 +2764,41 @@ const WEB_SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 /// 未认证连接不允许永久占用服务端任务与缓冲区。
 const LOGIN_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 全局并发连接上限（安全评审 P1-4 纵深防御）：
+/// 即使所有预认证读都有超时，攻击者仍可用大量短连接消耗任务/内存预算，
+/// 这里对控制口 + 工作连接口的在途连接总数做硬性兜底。
+const MAX_INFLIGHT_CONNECTIONS: usize = 4096;
+
+fn conn_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SEM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CONNECTIONS)))
+}
+
+/// 尝试获取连接许可；达到上限时返回 None（调用方应立即关闭连接，不接受排队）
+fn try_acquire_conn_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    std::sync::Arc::clone(conn_limiter())
+        .try_acquire_owned()
+        .ok()
+}
+
+/// 写方向超时（安全评审 P1-2）：恶意客户端可以把 TCP 窗口压到 0，
+/// 让服务端 write 无限阻塞、钉死控制/工作连接任务。
+/// 30s 内对端没有消费数据即视为连接失效。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 带超时的消息写入（工作连接握手等原始流路径使用）
+async fn write_message_with_timeout<T: tokio::io::AsyncWrite + Unpin>(
+    conn: &mut T,
+    msg: &Message,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tokio::time::timeout(WRITE_TIMEOUT, rust_frp_core::write_message(conn, msg))
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            "write timeout: peer is not consuming data (zero-window?)".into()
+        })?
+}
+
 /// 管理端会话 cookie 名称
 const WEB_SESSION_COOKIE: &str = "frp_session";
 
@@ -2930,10 +2980,23 @@ fn session_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String>
     })
 }
 
-fn create_routes(server: std::sync::Arc<Server>, auth: std::sync::Arc<WebAuth>) -> axum::Router {
+fn create_routes(
+    server: std::sync::Arc<Server>,
+    auth: std::sync::Arc<WebAuth>,
+    expose_metrics: bool,
+) -> axum::Router {
+    // /metrics 仅在显式开启时注册（安全评审 P1-4）：默认 404，
+    // 避免 run_id / 代理名 / 流量计数等内部信息对未认证调用方泄露。
+    // 注意 /api/metrics 是 Dashboard 自身的指标视图，始终受登录保护。
+    let metrics_routes = if expose_metrics {
+        axum::Router::new().route("/metrics", axum::routing::get(prometheus_handler))
+    } else {
+        axum::Router::new()
+    };
+
     let app = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
-        .route("/metrics", axum::routing::get(prometheus_handler))
+        .merge(metrics_routes)
         .route("/api/metrics", axum::routing::get(metrics_handler))
         .route("/api/controllers", axum::routing::get(controllers_handler))
         .route("/api/proxies", axum::routing::get(proxies_handler))
@@ -2956,7 +3019,11 @@ fn create_routes(server: std::sync::Arc<Server>, auth: std::sync::Arc<WebAuth>) 
 
                     // 登录页、存活探针与指标端点免鉴权：
                     // /health 必须放行，否则容器探针会一直被 303 打回。
-                    if path == "/login" || path == "/health" || path == "/metrics" {
+                    // /metrics 仅在 expose_metrics 开启时存在且免鉴权（P1-4）。
+                    if path == "/login"
+                        || path == "/health"
+                        || (expose_metrics && path == "/metrics")
+                    {
                         return next.run(request).await;
                     }
 
@@ -3222,6 +3289,7 @@ pub struct WebServer {
     server: Option<tokio::task::JoinHandle<()>>,
     user: Option<String>,
     password: Option<String>,
+    expose_metrics: bool,
 }
 
 impl WebServer {
@@ -3234,6 +3302,7 @@ impl WebServer {
             server: None,
             user: config.user.clone(),
             password: config.password.clone(),
+            expose_metrics: config.expose_metrics,
         })
     }
 
@@ -3241,7 +3310,7 @@ impl WebServer {
         let server = std::sync::Arc::new(server.clone());
         let auth = std::sync::Arc::new(WebAuth::new(self.user.clone(), self.password.clone()));
 
-        let app = create_routes(server, auth);
+        let app = create_routes(server, auth, self.expose_metrics);
         self.start_http(app).await?;
         Ok(())
     }
@@ -3633,6 +3702,18 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((mut conn, addr)) => {
+                    // 全局连接上限（P1-4）：超过即直接拒绝，不做排队
+                    let permit = match try_acquire_conn_permit() {
+                        Some(p) => p,
+                        None => {
+                            log::warn!(
+                                "Inflight connection limit ({}) reached, rejecting work conn from {:?}",
+                                MAX_INFLIGHT_CONNECTIONS,
+                                addr
+                            );
+                            continue;
+                        }
+                    };
                     let cm = control_manager.clone();
                     let wcm = work_conn_manager.clone();
                     let am = auth_manager.clone();
@@ -3640,6 +3721,7 @@ impl Server {
                     let tls_config = tls_config.clone();
 
                     tokio::spawn(async move {
+                        let _permit = permit;
                         // 嗅探首字节：0x16 = TLS ClientHello，其余视为明文协议
                         // 安全：peek 受握手超时约束，未认证连接不允许无限等待首字节
                         let mut first_byte = [0u8; 1];
@@ -3771,7 +3853,7 @@ impl Server {
                         dst_addr: String::new(),
                         dst_port: 0,
                     });
-                    rust_frp_core::write_message(&mut conn, &resp).await?;
+                    write_message_with_timeout(&mut conn, &resp).await?;
                     return Err("Unknown run_id".into());
                 }
 
@@ -3800,7 +3882,7 @@ impl Server {
                                 dst_addr: String::new(),
                                 dst_port: 0,
                             });
-                            rust_frp_core::write_message(&mut conn, &resp).await?;
+                            write_message_with_timeout(&mut conn, &resp).await?;
                             return Err("Sign key verification unavailable".into());
                         }
                     };
@@ -3818,7 +3900,7 @@ impl Server {
                             dst_addr: String::new(),
                             dst_port: 0,
                         });
-                        rust_frp_core::write_message(&mut conn, &resp).await?;
+                        write_message_with_timeout(&mut conn, &resp).await?;
                         return Err("Sign key mismatch".into());
                     }
                 }
@@ -4291,6 +4373,19 @@ impl Server {
                             };
                             log::info!("new connection from: {:?}", addr);
                             self.metrics.increment_connections();
+                            // 全局连接上限（P1-4）：超过即直接拒绝，不做排队
+                            let permit = match try_acquire_conn_permit() {
+                                Some(p) => p,
+                                None => {
+                                    self.metrics.decrement_connections();
+                                    log::warn!(
+                                        "Inflight connection limit ({}) reached, rejecting control conn from {:?}",
+                                        MAX_INFLIGHT_CONNECTIONS,
+                                        addr
+                                    );
+                                    continue;
+                                }
+                            };
                             let control_manager = self.control_manager.clone();
                             let proxy_manager = self.proxy_manager.clone();
                             let visitor_manager = self.visitor_manager.clone();
@@ -4303,6 +4398,7 @@ impl Server {
                             let xtcp_visitors = self.xtcp_visitors.clone();
 
                             tokio::spawn(async move {
+                                let _conn_permit = permit;
                                 if let Err(e) = Self::handle_connection(
                                     conn,
                                     control_manager,
@@ -4331,6 +4427,19 @@ impl Server {
                     let (conn, addr) = listener.accept().await?;
                     log::info!("new connection from: {:?}", addr);
                     self.metrics.increment_connections();
+                    // 全局连接上限（P1-4）：超过即直接拒绝，不做排队
+                    let permit = match try_acquire_conn_permit() {
+                        Some(p) => p,
+                        None => {
+                            self.metrics.decrement_connections();
+                            log::warn!(
+                                "Inflight connection limit ({}) reached, rejecting control conn from {:?}",
+                                MAX_INFLIGHT_CONNECTIONS,
+                                addr
+                            );
+                            continue;
+                        }
+                    };
                     let control_manager = self.control_manager.clone();
                     let proxy_manager = self.proxy_manager.clone();
                     let visitor_manager = self.visitor_manager.clone();
@@ -4343,6 +4452,7 @@ impl Server {
                     let xtcp_visitors = self.xtcp_visitors.clone();
 
                     tokio::spawn(async move {
+                        let _conn_permit = permit;
                         if let Err(e) = Self::handle_connection(
                             conn,
                             control_manager,
@@ -5065,5 +5175,53 @@ mod web_auth_tests {
         // 预认证超时必须存在且为有限正值（P0-1 回归锚点）
         assert!(LOGIN_READ_TIMEOUT.as_secs() >= 5);
         assert!(LOGIN_READ_TIMEOUT.as_secs() <= 120);
+    }
+
+    #[test]
+    fn test_write_timeout_constant() {
+        // P1-2：写方向必须有 30s 超时锚点
+        assert_eq!(WRITE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_conn_limit_constant() {
+        // P1-4：全局在途连接上限锚点
+        assert_eq!(MAX_INFLIGHT_CONNECTIONS, 4096);
+    }
+
+    #[test]
+    fn test_conn_limiter_rejects_when_exhausted() {
+        // P1-4：许可耗尽时必须直接拒绝（try_acquire 失败），而非排队等待
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let p1 = sem.clone().try_acquire_owned().unwrap();
+        assert!(sem.clone().try_acquire_owned().is_err());
+        drop(p1);
+        assert!(sem.clone().try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn test_poisoned_lock_recovery() {
+        // P1-1：锁中毒后 unwrap_or_else(into_inner) 必须取回数据而不是 panic
+        let lock = std::sync::Mutex::new(41usize);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = lock.lock().unwrap();
+            panic!("poison the mutex");
+        }));
+        let value = *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(value, 41);
+
+        let rw = std::sync::RwLock::new(String::from("data"));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = rw.read().unwrap();
+            panic!("poison the rwlock");
+        }));
+        assert_eq!(
+            rw.read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_str(),
+            "data"
+        );
     }
 }

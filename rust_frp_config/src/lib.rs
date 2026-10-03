@@ -324,6 +324,14 @@ pub struct WebServerConfig {
 
     /// Dashboard 密码
     pub password: Option<String>,
+
+    /// 是否公开 Prometheus 抓取端点 /metrics（默认 false）
+    ///
+    /// 安全说明（评审 P1-4）：/metrics 包含 run_id、代理名、流量计数等
+    /// 内部信息。默认关闭（请求返回 404）；需要 Prometheus 抓取时显式
+    /// 置为 true，并建议同时用反向代理限制来源。
+    #[serde(default)]
+    pub expose_metrics: bool,
 }
 
 /// 认证配置 - 定义客户端认证方式
@@ -1569,5 +1577,33 @@ remote_port = 9302
         assert_eq!(target.server_addr, "10.0.0.1");
         assert_eq!(target.server_port, 9999);
         assert_eq!(target.user, Some("admin".to_string()));
+    }
+
+    #[test]
+    fn test_web_server_expose_metrics_defaults_to_false() {
+        // 安全默认：未配置 expose_metrics 时必须关闭 /metrics（P1-4）
+        let config: WebServerConfig = toml::from_str(
+            r#"
+addr = "127.0.0.1"
+port = 7500
+user = "boss"
+password = "pw"
+"#,
+        )
+        .unwrap();
+        assert!(!config.expose_metrics);
+    }
+
+    #[test]
+    fn test_web_server_expose_metrics_can_be_enabled() {
+        let config: WebServerConfig = toml::from_str(
+            r#"
+addr = "127.0.0.1"
+port = 7500
+expose_metrics = true
+"#,
+        )
+        .unwrap();
+        assert!(config.expose_metrics);
     }
 }

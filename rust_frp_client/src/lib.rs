@@ -645,13 +645,21 @@ impl XtcpRegistry {
     /// 同 proxy 已有等待者时替换之（旧接收端收到 RecvError → STCP 回退）。
     fn register(&self, proxy_name: String) -> tokio::sync::oneshot::Receiver<(String, String)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().unwrap().insert(proxy_name, tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(proxy_name, tx);
         rx
     }
 
     /// owner 地址到达时唤醒等待者；返回是否有等待者
     fn resolve(&self, proxy_name: &str, addrs: (String, String)) -> bool {
-        if let Some(tx) = self.pending.lock().unwrap().remove(proxy_name) {
+        if let Some(tx) = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(proxy_name)
+        {
             let _ = tx.send(addrs);
             true
         } else {
