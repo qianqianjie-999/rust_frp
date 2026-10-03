@@ -1220,13 +1220,15 @@ async fn run_xtcp_owner(
     let public = stun_discover(&socket).await;
     let local_addr = local_endpoint_of(&socket).await;
 
-    // 回送自己的 NAT info
+    // 回送自己的 NAT info（owner 侧无需 secret_key 签名，服务端仅校验 visitor 侧）
     let nat_info = rust_frp_core::XtcpNatInfoMsg {
         proxy_name: proxy.name.clone(),
         run_id,
         nat_type: "unknown".to_string(),
         local_addr: local_addr.clone(),
         public_addr: public.as_ref().map(|a| a.to_string()).unwrap_or_default(),
+        sign_key: String::new(),
+        timestamp: 0,
     };
     if let Err(e) = msg_tx.send(Message::XtcpNatInfo(nat_info)).await {
         log::error!("XTCP owner failed to send NAT info: {}", e);
@@ -1290,6 +1292,7 @@ async fn xtcp_try_p2p(
     proxy_name: &str,
     msg_tx: &tokio::sync::mpsc::Sender<Message>,
     run_id: &str,
+    secret_key: &str,
     registry: &XtcpRegistry,
     local_conn: tokio::net::TcpStream,
 ) -> Option<tokio::net::TcpStream> {
@@ -1307,13 +1310,17 @@ async fn xtcp_try_p2p(
     // 2. 注册等待 owner 回传地址
     let addr_rx = registry.register(proxy_name.to_string());
 
-    // 3. 发送自己的 NAT info
+    // 3. 发送自己的 NAT info（携带 secret_key 签名，服务端校验 visitor 身份）
+    let timestamp = get_timestamp();
+    let sign_key = rust_frp_auth::generate_stcp_sign_key(secret_key, proxy_name, timestamp);
     let nat_info = rust_frp_core::XtcpNatInfoMsg {
         proxy_name: proxy_name.to_string(),
         run_id: run_id.to_string(),
         nat_type: "unknown".to_string(),
         local_addr,
         public_addr: public.as_ref().map(|a| a.to_string()).unwrap_or_default(),
+        sign_key,
+        timestamp,
     };
     if msg_tx.send(Message::XtcpNatInfo(nat_info)).await.is_err() {
         log::warn!("XTCP visitor: control channel closed, falling back");
@@ -1447,9 +1454,26 @@ async fn handle_stcp_visitor_conn(
         .iter()
         .any(|v| v.server_name == proxy_name && v.r#type == "xtcp");
 
+    // 访问者配置的 secret_key（需与服务端代理的 secret_key 一致）
+    let secret_key = config
+        .visitors
+        .iter()
+        .find(|v| v.server_name == proxy_name)
+        .and_then(|v| v.secret_key.clone())
+        .unwrap_or_default();
+
     // XTCP：先尝试 P2P 打洞，成功则本地连接直接桥接到 KCP 流
     let local_conn = if is_xtcp {
-        match xtcp_try_p2p(&proxy_name, &stcp_tx, &run_id, &xtcp_registry, local_conn).await {
+        match xtcp_try_p2p(
+            &proxy_name,
+            &stcp_tx,
+            &run_id,
+            &secret_key,
+            &xtcp_registry,
+            local_conn,
+        )
+        .await
+        {
             None => return Ok(()), // P2P 成功，桥接已在内部完成
             Some(conn) => {
                 log::info!(
@@ -1463,13 +1487,10 @@ async fn handle_stcp_visitor_conn(
         local_conn
     };
 
+    // STCP/XTCP 访问签名：基于访问者配置的 secret_key（与服务端代理 secret_key 一致）
+    // sign_key = Base64(HMAC-SHA256(secret_key, "stcp:{proxy_name}:{timestamp}"))
     let timestamp = get_timestamp();
-    let sign_key = config
-        .auth
-        .token
-        .as_ref()
-        .map(|_| timestamp.to_string())
-        .unwrap_or_default();
+    let sign_key = rust_frp_auth::generate_stcp_sign_key(&secret_key, &proxy_name, timestamp);
 
     let stcp_msg = rust_frp_core::StcpVisitorMsg {
         proxy_name: proxy_name.clone(),

@@ -320,6 +320,8 @@ fn test_xtcp_nat_info_msg_serialization() {
         nat_type: "full_cone".to_string(),
         local_addr: "192.168.1.5:3389".to_string(),
         public_addr: "1.2.3.4:12345".to_string(),
+        sign_key: "abc_sign".to_string(),
+        timestamp: 1700000000,
     });
     let json = serde_json::to_string(&msg).unwrap();
     let parsed: Message = serde_json::from_str(&json).unwrap();

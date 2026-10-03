@@ -883,6 +883,92 @@ pub fn global_metrics() -> std::sync::Arc<MonitorMetrics> {
     })
 }
 
+/// STCP/XTCP 代理共享密钥注册表（proxy_name -> secret_key）
+///
+/// 仅 stcp/xtcp 类型且配置了 secret_key 的代理会注册；
+/// 访问者请求到达时据此校验签名（fail-closed：查不到即拒绝）。
+pub struct ProxySecretRegistry {
+    keys: std::sync::RwLock<std::collections::HashMap<String, String>>,
+}
+
+impl Default for ProxySecretRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProxySecretRegistry {
+    pub fn new() -> Self {
+        Self {
+            keys: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 注册代理共享密钥（stcp/xtcp 代理注册成功后调用）
+    pub fn register(&self, proxy_name: &str, secret_key: &str) {
+        self.keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(proxy_name.to_string(), secret_key.to_string());
+    }
+
+    /// 查询代理共享密钥
+    pub fn get(&self, proxy_name: &str) -> Option<String> {
+        self.keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(proxy_name)
+            .cloned()
+    }
+
+    /// 移除代理共享密钥（代理注销/客户端断开时调用）
+    pub fn remove(&self, proxy_name: &str) {
+        self.keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(proxy_name);
+    }
+}
+
+/// 进程级共享密钥注册表单例：供 Control::run 等深层调用点零参数获取，
+/// 与 global_metrics 同一模式，避免给已超长的构造参数链加参。Server::new 时注册。
+static GLOBAL_PROXY_SECRETS: std::sync::OnceLock<std::sync::Arc<ProxySecretRegistry>> =
+    std::sync::OnceLock::new();
+
+fn global_proxy_secrets() -> std::sync::Arc<ProxySecretRegistry> {
+    GLOBAL_PROXY_SECRETS.get().cloned().unwrap_or_else(|| {
+        let r = std::sync::Arc::new(ProxySecretRegistry::new());
+        let _ = GLOBAL_PROXY_SECRETS.set(r.clone());
+        r
+    })
+}
+
+/// 校验 STCP/XTCP 访问签名（fail-closed + 常量时间比较 + 防重放时间窗）
+///
+/// # 校验规则
+///
+/// 1. 时间戳与服务器当前时间偏差超过 120 秒拒绝（防重放）；
+/// 2. 用代理注册的 secret_key 重算签名，常量时间比较（防时序侧信道）。
+fn verify_stcp_visitor_sign(
+    secret_key: &str,
+    proxy_name: &str,
+    timestamp: i64,
+    provided_sign: &str,
+) -> bool {
+    let now = get_timestamp();
+    if (now - timestamp).abs() > STCP_SIGN_MAX_AGE_SECS {
+        log::warn!(
+            "STCP/XTCP visitor sign rejected for {}: timestamp drift {}s exceeds {}s",
+            proxy_name,
+            now - timestamp,
+            STCP_SIGN_MAX_AGE_SECS
+        );
+        return false;
+    }
+    let expected = rust_frp_auth::generate_stcp_sign_key(secret_key, proxy_name, timestamp);
+    constant_time_eq(provided_sign, &expected)
+}
+
 /// 控制器
 pub struct Control {
     conn: ControlConn,
@@ -986,6 +1072,8 @@ impl Control {
             global_metrics().remove_proxy_stat(proxy_name);
             // 清理代理所有权
             self.proxy_owners.write().await.remove(proxy_name);
+            // 清理 STCP/XTCP 共享密钥登记
+            global_proxy_secrets().remove(proxy_name);
         }
     }
 
@@ -1119,6 +1207,7 @@ impl Control {
                                                     let proxy_name = proxy.name.clone();
                                                     let proxy_type = proxy.r#type.clone();
                                                     let proxy_remote_port = proxy.remote_port;
+                                                    let proxy_secret_key = proxy.secret_key.clone();
                                                     let result = self
                                                         .proxy_manager
                                                         .add_proxy_for_user(proxy, &self.user)
@@ -1128,6 +1217,21 @@ impl Control {
                                                         Ok(_) => {
                                                             self.registered_proxies.push(proxy_name.clone());
                                                             self.proxy_owners.write().await.insert(proxy_name.clone(), self.run_id.clone());
+                                                            // stcp/xtcp 代理登记共享密钥，供访问者签名校验（fail-closed）
+                                                            if matches!(proxy_type.as_str(), "stcp" | "xtcp") {
+                                                                match proxy_secret_key.as_deref() {
+                                                                    Some(sk) if !sk.is_empty() => {
+                                                                        global_proxy_secrets().register(&proxy_name, sk);
+                                                                        log::info!("secret_key registered for {} proxy: {}", proxy_type, proxy_name);
+                                                                    }
+                                                                    _ => {
+                                                                        log::warn!(
+                                                                            "stcp/xtcp proxy {} has no secret_key configured; visitor access will be rejected",
+                                                                            proxy_name
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
                                                             global_metrics().register_proxy_stat(&proxy_name, &proxy_type, proxy_remote_port);
                                                             "".to_string()
                                                         },
@@ -1194,71 +1298,91 @@ impl Control {
                                                     let proxy_name = stcp_msg.proxy_name.clone();
                                                     let visitor_run_id = self.run_id.clone();
 
-                                                    let proxy_run_id = {
+                                                    // 查代理所有者与注册的共享密钥（先取值再 await，避免跨 await 持锁）
+                                                    let (proxy_run_id, registered_secret) = {
                                                         let owners = self.proxy_owners.read().await;
-                                                        owners.get(&proxy_name).cloned()
+                                                        let owner = owners.get(&proxy_name).cloned();
+                                                        let secret = global_proxy_secrets().get(&proxy_name);
+                                                        (owner, secret)
                                                     };
 
-                                                    let proxy_run_id = match proxy_run_id {
-                                                        Some(id) => id,
-                                                        None => {
-                                                            log::error!("No proxy owner found for STCP: {}", proxy_name);
-                                                            let resp = StcpVisitorRespMsg {
-                                                                proxy_name: proxy_name.clone(),
-                                                                error: "proxy not found".to_string(),
-                                                                visitor_run_id: visitor_run_id.clone(),
-                                                            };
-                                                            if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
-                                                                log::error!("Failed to send StcpVisitorResp: {:?}", e);
+                                                    // fail-closed：代理不存在、未登记 secret_key、签名不匹配均拒绝
+                                                    let rejection = match (&proxy_run_id, &registered_secret) {
+                                                        (None, _) => Some("proxy not found".to_string()),
+                                                        (Some(_), None) => {
+                                                            log::error!(
+                                                                "STCP proxy {} has no secret_key registered; rejecting visitor {}",
+                                                                proxy_name,
+                                                                visitor_run_id
+                                                            );
+                                                            Some("proxy secret_key not configured".to_string())
+                                                        }
+                                                        (Some(_), Some(secret)) => {
+                                                            if verify_stcp_visitor_sign(
+                                                                secret,
+                                                                &proxy_name,
+                                                                stcp_msg.timestamp,
+                                                                &stcp_msg.sign_key,
+                                                            ) {
+                                                                None
+                                                            } else {
+                                                                log::error!(
+                                                                    "STCP visitor sign verification failed for proxy {} (visitor {})",
+                                                                    proxy_name,
+                                                                    visitor_run_id
+                                                                );
+                                                                Some("invalid secret key".to_string())
                                                             }
-                                                            continue;
                                                         }
                                                     };
 
-                                                    if proxy_run_id == visitor_run_id {
-                                                        self.stcp_bridge_manager.create_bridge(
-                                                            proxy_name.clone()
-                                                        ).await;
-
-                                                        let msg_tx_proxy = self.control_manager.get_msg_tx(&proxy_run_id).await;
-                                                        let msg_tx_visitor = self.control_manager.get_msg_tx(&visitor_run_id).await;
-
-                                                        if let Some(tx) = &msg_tx_proxy {
-                                                            let req = ReqWorkConnMsg {
-                                                                proxy_name: proxy_name.clone(),
-                                                            };
-                                                            if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
-                                                                log::error!("Failed to send ReqWorkConn to proxy: {:?}", e);
-                                                            }
-                                                        }
-
-                                                        if let Some(tx) = &msg_tx_visitor {
-                                                            let req = ReqWorkConnMsg {
-                                                                proxy_name: proxy_name.clone(),
-                                                            };
-                                                            if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
-                                                                log::error!("Failed to send ReqWorkConn to visitor: {:?}", e);
-                                                            }
-                                                        }
-
+                                                    if let Some(error) = rejection {
                                                         let resp = StcpVisitorRespMsg {
                                                             proxy_name: proxy_name.clone(),
-                                                            error: String::new(),
-                                                            visitor_run_id: visitor_run_id.clone(),
-                                                        };
-                                                        if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
-                                                            log::error!("Failed to send StcpVisitorResp: {:?}", e);
-                                                        }
-                                                    } else {
-                                                        log::error!("STCP proxy {} owned by another client", proxy_name);
-                                                        let resp = StcpVisitorRespMsg {
-                                                            proxy_name: proxy_name.clone(),
-                                                            error: "proxy owned by another client".to_string(),
+                                                            error,
                                                             visitor_run_id,
                                                         };
                                                         if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
                                                             log::error!("Failed to send StcpVisitorResp: {:?}", e);
                                                         }
+                                                        continue;
+                                                    }
+
+                                                    // 签名校验通过：允许同客户端与跨客户端访问，
+                                                    // 桥接以 proxy_name 为 id，双方各自建工作连接后由桥接管理器配对
+                                                    let proxy_run_id = proxy_run_id.unwrap();
+                                                    self.stcp_bridge_manager.create_bridge(
+                                                        proxy_name.clone()
+                                                    ).await;
+
+                                                    let msg_tx_proxy = self.control_manager.get_msg_tx(&proxy_run_id).await;
+                                                    let msg_tx_visitor = self.control_manager.get_msg_tx(&visitor_run_id).await;
+
+                                                    if let Some(tx) = &msg_tx_proxy {
+                                                        let req = ReqWorkConnMsg {
+                                                            proxy_name: proxy_name.clone(),
+                                                        };
+                                                        if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
+                                                            log::error!("Failed to send ReqWorkConn to proxy: {:?}", e);
+                                                        }
+                                                    }
+
+                                                    if let Some(tx) = &msg_tx_visitor {
+                                                        let req = ReqWorkConnMsg {
+                                                            proxy_name: proxy_name.clone(),
+                                                        };
+                                                        if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
+                                                            log::error!("Failed to send ReqWorkConn to visitor: {:?}", e);
+                                                        }
+                                                    }
+
+                                                    let resp = StcpVisitorRespMsg {
+                                                        proxy_name: proxy_name.clone(),
+                                                        error: String::new(),
+                                                        visitor_run_id: visitor_run_id.clone(),
+                                                    };
+                                                    if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                                                        log::error!("Failed to send StcpVisitorResp: {:?}", e);
                                                     }
                                                 }
                                                 Message::XtcpNatInfo(xtcp_msg) => {
@@ -1284,16 +1408,40 @@ impl Control {
                                                         }
                                                     };
 
-                                                    let relay = XtcpNatInfoMsg {
+                                                    let mut relay = XtcpNatInfoMsg {
                                                         proxy_name: proxy_name.clone(),
                                                         run_id: from_run_id.clone(),
                                                         nat_type: xtcp_msg.nat_type.clone(),
                                                         local_addr: xtcp_msg.local_addr.clone(),
                                                         public_addr: xtcp_msg.public_addr.clone(),
+                                                        sign_key: xtcp_msg.sign_key.clone(),
+                                                        timestamp: xtcp_msg.timestamp,
                                                     };
 
                                                     if from_run_id != owner_run_id {
-                                                        // 来自 visitor，存储 visitor run_id 并中继给 proxy owner
+                                                        // 来自 visitor：先校验 secret_key 签名（fail-closed）
+                                                        let registered_secret = global_proxy_secrets().get(&proxy_name);
+                                                        let sign_ok = match &registered_secret {
+                                                            Some(secret) => verify_stcp_visitor_sign(
+                                                                secret,
+                                                                &proxy_name,
+                                                                xtcp_msg.timestamp,
+                                                                &xtcp_msg.sign_key,
+                                                            ),
+                                                            None => false,
+                                                        };
+                                                        if !sign_ok {
+                                                            log::error!(
+                                                                "XTCP visitor sign verification failed for proxy {} (visitor {})",
+                                                                proxy_name,
+                                                                from_run_id
+                                                            );
+                                                            continue;
+                                                        }
+                                                        // 校验通过后转发时不携带签名（owner 侧无需也不可信）
+                                                        relay.sign_key = String::new();
+
+                                                        // 存储 visitor run_id 并中继给 proxy owner
                                                         {
                                                             let mut visitors = self.xtcp_visitors.write().await;
                                                             visitors.insert(proxy_name.clone(), from_run_id.clone());
@@ -2786,6 +2934,10 @@ fn try_acquire_conn_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
 /// 让服务端 write 无限阻塞、钉死控制/工作连接任务。
 /// 30s 内对端没有消费数据即视为连接失效。
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// STCP/XTCP 访问签名的时间戳最大允许偏差（秒）：
+/// 签名绑定 timestamp，超出窗口的请求视为重放，直接拒绝。
+const STCP_SIGN_MAX_AGE_SECS: i64 = 120;
 
 /// 带超时的消息写入（工作连接握手等原始流路径使用）
 async fn write_message_with_timeout<T: tokio::io::AsyncWrite + Unpin>(
@@ -4925,6 +5077,47 @@ mod web_auth_tests {
         assert!(!constant_time_eq("abc", "abcd"));
         assert!(!constant_time_eq("", "abc"));
         assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn test_proxy_secret_registry_lifecycle() {
+        let registry = ProxySecretRegistry::new();
+        assert_eq!(registry.get("ssh"), None);
+
+        registry.register("ssh", "s3cret");
+        assert_eq!(registry.get("ssh"), Some("s3cret".to_string()));
+
+        registry.remove("ssh");
+        assert_eq!(registry.get("ssh"), None);
+    }
+
+    #[test]
+    fn test_verify_stcp_visitor_sign_accepts_valid() {
+        let secret = "shared_secret";
+        let ts = get_timestamp();
+        let sign = rust_frp_auth::generate_stcp_sign_key(secret, "ssh", ts);
+        assert!(verify_stcp_visitor_sign(secret, "ssh", ts, &sign));
+    }
+
+    #[test]
+    fn test_verify_stcp_visitor_sign_rejects_wrong_secret() {
+        let ts = get_timestamp();
+        let sign = rust_frp_auth::generate_stcp_sign_key("right", "ssh", ts);
+        assert!(!verify_stcp_visitor_sign("wrong", "ssh", ts, &sign));
+        assert!(!verify_stcp_visitor_sign("right", "ssh", ts, ""));
+    }
+
+    #[test]
+    fn test_verify_stcp_visitor_sign_rejects_replay() {
+        let secret = "shared_secret";
+        // 超出时间窗的旧签名（重放）必须拒绝
+        let old_ts = get_timestamp() - STCP_SIGN_MAX_AGE_SECS - 10;
+        let sign = rust_frp_auth::generate_stcp_sign_key(secret, "ssh", old_ts);
+        assert!(!verify_stcp_visitor_sign(secret, "ssh", old_ts, &sign));
+        // 时间窗内但代理名不匹配也拒绝
+        let ts = get_timestamp();
+        let sign2 = rust_frp_auth::generate_stcp_sign_key(secret, "other", ts);
+        assert!(!verify_stcp_visitor_sign(secret, "ssh", ts, &sign2));
     }
 
     #[test]
