@@ -41,6 +41,16 @@ token = "CHANGE_ME_RANDOM_LONG_TOKEN"
 # --- 传输配置 ---
 [transport]
 protocol = "tcp"
+# ── 可选：改用 QUIC（弱网推荐）──
+# 把上面一行改为 protocol = "quic" 即启用。QUIC 强制 TLS 1.3、无明文模式，
+# 因此必须显式声明信任来源，否则启动即报错（与 TLS 一致的 fail-closed）：
+#   * 推荐：transport.tls.trusted_ca_file = "/etc/frp/certs/ca.crt"（CA 验签，可认证身份）
+#   * 或：  transport.tls.skip_verify = true（只加密不认证，仅限测试/自签名环境）
+# 控制连接与工作连接复用同一 QUIC 连接上的多条双向流，省去重复握手。
+# [transport.quic]
+# max_idle_timeout = 30        # 秒，0 = 禁用空闲超时
+# max_incoming_streams = 100000
+# keepalive_period = 0         # 秒，0 = 不主动保活
 tcp_mux = true
 pool_count = 10
 # 全局带宽限制（代理级 bandwidth_limit 优先）

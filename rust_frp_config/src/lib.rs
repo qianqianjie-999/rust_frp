@@ -118,8 +118,9 @@ pub struct ServerConfig {
     pub kcp_bind_port: Option<u16>,
 
     /// QUIC 协议绑定端口（可选，UDP）
-    // 路线图配置项：字段先随配置 schema 固化，协议实现后接通
-    #[allow(dead_code)]
+    ///
+    /// 配置后服务端在该端口上起 QUIC endpoint；客户端 `transport.protocol = "quic"`
+    /// 即可通过 QUIC 建立控制连接与工作连接（工作连接为同一 QUIC 连接上的新双向流）。
     #[serde(alias = "quicBindPort")]
     pub quic_bind_port: Option<u16>,
 
@@ -533,6 +534,34 @@ pub struct OidcConfig {
 /// # 连接池 (pool_count)
 ///
 /// 客户端预建立的工作连接数量，范围 1-1000
+///
+/// # QUIC (quic)
+///
+/// `protocol = "quic"` 时的传输参数，对齐原版 frp 的 `transport.quic.*`
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
+pub struct QuicConfig {
+    /// QUIC 空闲超时（秒）；0 表示禁用空闲超时
+    ///
+    /// # 默认值
+    ///
+    /// **30**（对齐原版 frp）
+    #[serde(alias = "maxIdleTimeout")]
+    pub max_idle_timeout: Option<u64>,
+
+    /// QUIC 允许对端并发打开的双向流上限
+    ///
+    /// # 默认值
+    ///
+    /// **100000**（对齐原版 frp）
+    #[serde(alias = "maxIncomingStreams")]
+    pub max_incoming_streams: Option<u32>,
+
+    /// QUIC 保活间隔（秒）；0 或未配置表示不主动保活
+    #[serde(alias = "keepalivePeriod")]
+    pub keepalive_period: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct TransportConfig {
@@ -597,6 +626,10 @@ pub struct TransportConfig {
     #[serde(default, alias = "useCompression")]
     pub use_compression: bool,
 
+    /// QUIC 传输参数（`protocol = "quic"` 时生效，兼容原版 `transport.quic`）
+    #[serde(default)]
+    pub quic: Option<QuicConfig>,
+
     /// 带宽限制模式（兼容原版 `transport.bandwidthLimitMode`，"client"/"server"）
     ///
     // 路线图配置项：仅 client 模式实际生效，server 模式未实现。
@@ -623,6 +656,7 @@ impl Default for TransportConfig {
             bandwidth_limit: None,
             use_encryption: false,
             use_compression: false,
+            quic: None,
             bandwidth_limit_mode: None,
             proxy_protocol_version: None,
         }
@@ -1564,6 +1598,18 @@ impl ConfigLoader {
             }
         }
 
+        // KCP 与 QUIC 都是 UDP 监听：同端口会第二个 bind 失败，提前拒绝更清晰
+        if let (Some(kcp), Some(quic)) = (config.kcp_bind_port, config.quic_bind_port) {
+            if kcp == quic && quic > 0 {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "kcp_bind_port and quic_bind_port cannot share the same UDP port ({kcp})"
+                    ),
+                )));
+            }
+        }
+
         // 服务端 HTTP 插件：name/addr/ops 必须有效，op 必须是已知回调类型。
         // 非法配置直接拒绝启动，避免「配了插件却静默不回调」。
         for (i, plugin) in config.http_plugins.iter().enumerate() {
@@ -1715,6 +1761,36 @@ impl ConfigLoader {
         if let Some(limit) = &config.transport.bandwidth_limit {
             Self::validate_bandwidth_limit(limit, "transport.bandwidth_limit")?;
         }
+
+        // 传输协议：非法值直接报错，避免拼写错误静默回退到 TCP
+        const VALID_PROTOCOLS: &[&str] = &["tcp", "kcp", "quic", "websocket"];
+        if !VALID_PROTOCOLS.contains(&config.transport.protocol.as_str()) {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "transport.protocol {:?} is not supported (expected one of {:?})",
+                    config.transport.protocol, VALID_PROTOCOLS
+                ),
+            )));
+        }
+
+        // QUIC 强制 TLS 1.3、无明文模式：与 TLS 一致地 fail-closed 要求显式信任来源
+        if config.transport.protocol == "quic" {
+            let tls = config.transport.tls.as_ref();
+            let has_ca = tls
+                .and_then(|t| t.trusted_ca_file.as_deref())
+                .is_some_and(|f| !f.trim().is_empty());
+            let insecure = tls.is_some_and(|t| t.skip_verify);
+            if !has_ca && !insecure {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "transport.protocol = \"quic\" always uses TLS 1.3 and has no plaintext \
+                     mode: set transport.tls.trusted_ca_file to pin the server CA, or \
+                     transport.tls.skip_verify = true to accept encryption without authentication",
+                )));
+            }
+        }
+
         for proxy in &config.proxies {
             if let Some(limit) = &proxy.bandwidth_limit {
                 Self::validate_bandwidth_limit(
@@ -2399,6 +2475,65 @@ skipIssuerCheck = false
             );
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// QUIC：协议字段非法值必须报错（避免拼写错误静默回退到 TCP）
+    #[test]
+    fn test_unsupported_transport_protocol_rejected() {
+        let content =
+            "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n[transport]\nprotocol = \"quicc\"\n";
+        let path = write_temp_config("frpc_bad_proto", content);
+        let err = ConfigLoader::load_client_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("transport.protocol"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// QUIC：强制 TLS 1.3 无明文模式 → 必须显式声明信任来源（CA 或 skip_verify）
+    #[test]
+    fn test_quic_requires_explicit_trust_source() {
+        let content =
+            "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n[transport]\nprotocol = \"quic\"\n";
+        let path = write_temp_config("frpc_quic_no_trust", content);
+        let err = ConfigLoader::load_client_config(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("trusted_ca_file") && text.contains("skip_verify"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// QUIC：原版 camelCase 的 transport.quic.* 参数可被识别（并满足信任来源校验）
+    #[test]
+    fn test_quic_transport_config_parses() {
+        let content = "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n\
+            [transport]\nprotocol = \"quic\"\n\n\
+            [transport.quic]\nmaxIdleTimeout = 15\nmaxIncomingStreams = 4096\nkeepalivePeriod = 5\n\n\
+            [transport.tls]\nskipVerify = true\n";
+        let path = write_temp_config("frpc_quic_ok", content);
+        let config =
+            ConfigLoader::load_client_config(&path).expect("quic client config must parse");
+        let q = config.transport.quic.expect("transport.quic parsed");
+        assert_eq!(q.max_idle_timeout, Some(15));
+        assert_eq!(q.max_incoming_streams, Some(4096));
+        assert_eq!(q.keepalive_period, Some(5));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 服务端：KCP 与 QUIC 共用同一 UDP 端口必须被拒绝
+    #[test]
+    fn test_server_kcp_quic_port_clash_rejected() {
+        let content = "bindPort = 7000\nkcpBindPort = 7001\nquicBindPort = 7001\n";
+        let path = write_temp_config("frps_udp_clash", content);
+        let err = ConfigLoader::load_server_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("same UDP port"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 未知的 auth.method 必须被拒绝（避免「配了个不认识的方法却静默放行」）。

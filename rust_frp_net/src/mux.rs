@@ -236,6 +236,14 @@ async fn driver_loop<T>(
     closed.store(true, Ordering::SeqCst);
 }
 
+/// yamux 会话作为 [`crate::Session`]：与 QUIC 会话统一供客户端打开逻辑连接流
+#[async_trait::async_trait]
+impl crate::Session for MuxSession {
+    async fn open_stream(&self) -> Result<AnyConn, NetError> {
+        MuxSession::open_stream(self).await
+    }
+}
+
 /// yamux 流（经 Compat 适配）满足 FrpConn：多路复用流无独立远端地址
 impl FrpConn for tokio_util::compat::Compat<yamux::Stream> {
     fn remote_addr(&self) -> Option<std::net::SocketAddr> {

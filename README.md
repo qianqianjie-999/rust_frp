@@ -11,6 +11,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **XTCP（P2P TCP）**：点对点直连，支持 NAT 穿透打洞，失败自动回退 STCP
 - **UDP 代理**：支持 UDP 数据包双向转发，适用于游戏、DNS 等场景
 - **KCP 协议**：基于 UDP 的低延迟可靠传输协议，适合弱网和跨国场景
+- **QUIC 协议**：基于 quinn 的 QUIC (TLS 1.3) 传输，单 UDP 连接多路复用承载控制连接与全部工作连接，适合弱网/移动网络
 - **TLS 加密**：使用 rustls 实现，未配置证书时服务端在运行时生成自签名证书（内存中、不落盘不入库），也支持自定义证书；控制连接和数据连接均默认启用加密；客户端支持跳过证书验证模式，方便使用自签名证书
 - **HMAC 签名验证**：工作连接使用 HMAC-SHA256 签名，防止连接伪造
 - **PROXY Protocol**：可选启用，透传真实访问者 IP 给本地 nginx/haproxy，方便日志记录和访问控制
@@ -41,7 +42,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | STCP (安全 TCP) | ✅ | `secret_key` HMAC-SHA256 签名校验（常量时间比较 + 120s 防重放），支持跨客户端访问 |
 | XTCP (P2P TCP) | ✅ | NAT 穿透打洞 + STCP 回退可用，鉴权规则与 STCP 一致 |
 | KCP 协议 | ✅ | 完整实现 |
-| QUIC 协议 | 🚧 | **未实现**（路线图项），配置字段 `quic_bind_port` 已预留但无效果 |
+| QUIC 协议 | ✅ | 基于 quinn 完整实现；TLS 1.3 强制（无明文模式），单 UDP 端口承载控制+工作连接，客户端 fail-closed 校验 |
 | 应用层加密 | ✅ | `use_encryption`：工作连接 AES-256-GCM 加密（**仅加密不认证**，密钥派生自 token；无 token 时 fail-closed） |
 | 应用层压缩 | ✅ | `use_compression`：工作连接 snappy 压缩（**需两端配置一致**；与 `use_encryption` 可叠加，顺序为先压缩后加密） |
 | tcpmux 代理 | ✅ | HTTP CONNECT 复用：服务器在 `tcpmux_http_connect_port` 单端口按域名（+ 可选 `route_by_http_user` / `http_user` / `http_password`）路由，多个 tcpmux 代理共享同一端口 |
@@ -129,6 +130,14 @@ rust_frp/
 | 跨国连接 | 优化国际网络传输延迟 |
 | 弱网环境 | 高丢包率网络下保持稳定连接 |
 | 实时游戏 | 降低延迟抖动，提升游戏体验 |
+
+### QUIC 协议 ✅
+
+| 场景 | 说明 |
+|------|------|
+| 移动网络 | 连接迁移特性，WiFi↔4G 切网不断连 |
+| 弱网高丢包 | 基于 UDP 的拥塞控制，比 TCP 更抗丢包 |
+| 多路复用 | 单 UDP 连接承载控制连接与全部工作连接，无队头阻塞 |
 
 ### OIDC 认证 ✅
 
@@ -402,6 +411,7 @@ bind_port = 9300
 vhost_http_port = 9090
 vhost_https_port = 9091
 kcp_bind_port = 7001  # KCP 协议监听端口
+quic_bind_port = 7002  # QUIC 协议监听端口（UDP，TLS 1.3 强制；未配证书时运行时自签）
 
 # 端口白名单配置（默认拒绝所有未明确允许的端口）
 allow_ports = [
@@ -464,6 +474,13 @@ tls = { enable = true, skip_verify = true }  # 自签名环境：显式跳过证
 # 可选：配置自定义 CA 证书进行验证（防止中间人攻击，生产推荐）
 # tls = { enable = true, trusted_ca_file = "/path/to/ca.crt" }
 
+# QUIC 传输：将上面 protocol 改为 "quic"。QUIC 强制 TLS 1.3，
+# 必须提供信任来源（trusted_ca_file 或 skip_verify = true），否则拒绝启动。
+# [transport.quic]
+# maxIdleTimeout = 30        # 空闲超时（秒）
+# maxIncomingStreams = 100000
+# keepalivePeriod = 10       # 保活间隔（秒，可选）
+
 # HTTP 代理
 [[proxies]]
 name = "http_web"
@@ -523,6 +540,7 @@ path = "/health"
 | `vhost_http_port` | 9090 | HTTP 虚主机端口（访问内网 HTTP 服务） |
 | `vhost_https_port` | 9091 | HTTPS 虚主机端口（访问内网 HTTPS 服务） |
 | `kcp_bind_port` | 7001 | KCP 协议监听端口 |
+| `quic_bind_port` | 7002 | QUIC 协议监听端口（UDP，TLS 1.3 强制） |
 | `web_server.port` | 0 (禁用) | Web Dashboard 端口（port > 0 时启用） |
 
 > ⚠️ 注意：1024 以下端口需要 root 权限，建议使用非特权端口（如 9090/9091）。
@@ -936,6 +954,36 @@ pub struct KcpListener {
 | sndwnd | 128 | 发送窗口 |
 | rcvwnd | 128 | 接收窗口 |
 | mtu | 1400 | 最大传输单元 |
+
+### QUIC 协议
+
+**核心类型**（`rust_frp_net::quic`）：
+
+```rust
+// QUIC ALPN 标识
+pub const QUIC_ALPN: &[u8] = b"frp";
+
+// QUIC 连接（实现 FrpConn trait，基于 quinn SendStream/RecvStream）
+pub struct QuicConn { /* ... */ }
+
+// QUIC 监听器（服务端）：绑定 UDP 端口，accept 返回 QuicConnection
+pub struct QuicListener { /* ... */ }
+
+// QUIC 会话（客户端）：在已有连接上按需 open_stream 开工作连接
+pub struct QuicSession { /* ... */ }
+
+// 传输参数（transport.quic.*）
+pub struct QuicOptions {
+    pub max_idle_timeout: Duration,
+    pub max_incoming_streams: u32,
+    pub keep_alive_interval: Option<Duration>,
+}
+```
+
+**QUIC 传输说明**：
+- **TLS 1.3 强制**：QUIC 无明文模式；服务端未配证书时运行时自签（仅加密不认证）。客户端默认 fail-closed——需配 `trusted_ca_file` 或显式 `skip_verify` 才启动。
+- **单端口多路复用**：控制连接与工作连接是同一条 QUIC 连接上的多个双向流（`Session::open_stream`）；服务端按每条流的首帧区分 `Login`（控制路径）与 `NewWorkConn`（工作路径）。
+- **参数**（`[transport.quic]`）：`maxIdleTimeout`（默认 30s）、`maxIncomingStreams`（默认 100000）、`keepalivePeriod`（默认关闭）。
 
 ### STCP/XTCP (P2P)
 

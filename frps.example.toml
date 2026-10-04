@@ -23,8 +23,12 @@ vhost_https_port = 9091
 # 未配置时，服务端会拒绝注册 tcpmux 代理（fail-closed）
 tcpmux_http_connect_port = 7777
 
-# KCP 协议监听端口
+# KCP 协议监听端口（UDP）
 # kcp_bind_port = 7001
+
+# QUIC 协议监听端口（UDP）。QUIC 强制 TLS 1.3，适合弱网；
+# 客户端 protocol = "quic" 时必需；控制连接与工作连接复用同一 QUIC 连接上的多条双向流。
+quic_bind_port = 7002
 
 # --- 端口白名单（为空即拒绝所有 TCP 代理端口，显式允许更安全） ---
 allow_ports = [

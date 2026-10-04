@@ -95,7 +95,7 @@ use axum::{
 use rust_frp_auth::AuthManager;
 use rust_frp_config::ClientConfig;
 use rust_frp_core::{ControlConn, Message, NewWorkConnMsg, ProxyManager, VisitorManager};
-use rust_frp_net::{ConnManager, KcpStream, MuxSession, TlsConfig, TCP_MUX_MAGIC};
+use rust_frp_net::{ConnManager, KcpStream, MuxSession, Session, TlsConfig, TCP_MUX_MAGIC};
 use rust_frp_util::{
     get_timestamp, rand_id,
     retry::{retry, ConnectionError, RetryConfig},
@@ -662,6 +662,16 @@ fn work_conn_port_of(config: &rust_frp_config::ClientConfig) -> u16 {
     config.work_conn_port.unwrap_or(config.server_port + 1000)
 }
 
+/// 由 `transport.quic` 构造 QUIC 传输参数（未配置时用与原版 frp 一致的默认值）
+fn quic_options(config: &rust_frp_config::ClientConfig) -> rust_frp_net::QuicOptions {
+    let q = config.transport.quic.as_ref();
+    rust_frp_net::QuicOptions::from_config(
+        q.and_then(|q| q.max_idle_timeout),
+        q.and_then(|q| q.max_incoming_streams),
+        q.and_then(|q| q.keepalive_period),
+    )
+}
+
 /// 客户端连接器
 pub struct Connector {
     config: Arc<rust_frp_config::ClientConfig>,
@@ -716,6 +726,31 @@ impl Connector {
         Box<dyn std::error::Error>,
     > {
         Ok(self.conn_manager.connect_websocket(url).await?)
+    }
+
+    /// 建立到服务端的 QUIC 连接（控制连接与工作连接复用同一 QUIC 连接）
+    ///
+    /// QUIC 强制 TLS 1.3，无明文模式：证书校验沿用 `transport.tls` 的
+    /// fail-closed 语义（`trusted_ca_file` 认证，或显式 `skip_verify = true`）。
+    pub async fn connect_quic(
+        &mut self,
+    ) -> Result<Arc<rust_frp_net::QuicSession>, Box<dyn std::error::Error>> {
+        let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
+            .parse::<SocketAddr>()?;
+        let tls = self.config.transport.tls.as_ref();
+        let ca = tls.and_then(|t| t.trusted_ca_file.as_deref());
+        let insecure = tls.map(|t| t.skip_verify).unwrap_or(false);
+        let opts = quic_options(&self.config);
+        let cfg = rust_frp_net::build_quic_client_config(ca, insecure, &opts).map_err(|e| {
+            format!(
+                "QUIC always uses TLS 1.3 and has no plaintext mode: {e}. \
+                 Set transport.tls.trusted_ca_file to pin the server CA, or \
+                 transport.tls.skip_verify = true to accept encryption without authentication"
+            )
+        })?;
+        let session =
+            rust_frp_net::QuicSession::connect(addr, &self.config.server_addr, cfg).await?;
+        Ok(Arc::new(session))
     }
 }
 
@@ -785,11 +820,11 @@ pub struct ClientControl {
     plugin_rejected_heartbeat: bool,
     /// 工作连接是否使用 TLS（来自服务器 LoginRespMsg.work_conn_tls 协商）
     work_conn_tls: bool,
-    /// yamux 多路复用会话（tcp_mux 开启时存在）
+    /// 多路复用会话：tcp_mux 的 yamux 会话，或 QUIC 连接
     ///
-    /// 工作连接不再新建 TCP，而是从会话打开新流；
-    /// TLS 在会话层（底层 TCP 已含），流上无需重复加密。
-    mux_session: Option<Arc<MuxSession>>,
+    /// 存在时工作连接不再新建底层连接，而是从会话打开新流；
+    /// tcp_mux 的 TLS 在会话层（底层 TCP 已含），QUIC 则由协议内建 TLS 1.3。
+    session: Option<Arc<dyn Session>>,
     /// XTCP 打洞会话注册表（visitor 等待 owner NAT 信息）
     xtcp_registry: Arc<XtcpRegistry>,
 }
@@ -804,7 +839,7 @@ pub struct ClientControlDeps {
     pub work_conn_manager: Arc<WorkConnManager>,
     pub config: Arc<ClientConfig>,
     pub work_conn_tls: bool,
-    pub mux_session: Option<Arc<MuxSession>>,
+    pub session: Option<Arc<dyn Session>>,
 }
 
 impl ClientControl {
@@ -818,7 +853,7 @@ impl ClientControl {
             work_conn_manager,
             config,
             work_conn_tls,
-            mux_session,
+            session,
         } = deps;
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(256);
         let (stcp_tx, stcp_rx) = tokio::sync::mpsc::channel::<Message>(100);
@@ -838,7 +873,7 @@ impl ClientControl {
             last_pong_time: std::time::Instant::now(),
             plugin_rejected_heartbeat: false,
             work_conn_tls,
-            mux_session,
+            session,
             xtcp_registry: Arc::new(XtcpRegistry::default()),
         }
     }
@@ -962,7 +997,7 @@ impl ClientControl {
                 let run_id = self.run_id.clone();
                 let config = Arc::clone(&self.config);
                 let work_conn_tls = self.work_conn_tls;
-                let mux_session = self.mux_session.clone();
+                let session = self.session.clone();
 
                 tokio::spawn(async move {
                     log::debug!("开始建立工作连接: proxy={}", proxy_name);
@@ -971,7 +1006,7 @@ impl ClientControl {
                         &run_id,
                         &config,
                         work_conn_tls,
-                        mux_session.as_ref(),
+                        session.as_ref(),
                     )
                     .await
                     {
@@ -1187,8 +1222,8 @@ struct WorkConnRequest<'a> {
     proxy_name: &'a str,
     run_id: &'a str,
     work_conn_tls: bool,
-    /// `Some` 时经 tcp_mux 会话流建立（协议与直连工作端口一致）
-    mux_session: Option<&'a Arc<MuxSession>>,
+    /// `Some` 时经多路复用会话流建立（tcp_mux / QUIC，协议与直连工作端口一致）
+    session: Option<&'a Arc<dyn Session>>,
     use_encryption: bool,
     use_compression: bool,
 }
@@ -1212,18 +1247,18 @@ async fn open_work_conn(
         proxy_name,
         run_id,
         work_conn_tls,
-        mux_session,
+        session,
         use_encryption,
         use_compression,
     } = req;
 
-    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if let Some(session) = mux_session {
-        // tcp_mux：工作连接 = 会话流（服务端分发循环经 process_work_conn 处理，
-        // 协议与直连工作端口完全一致）
+    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if let Some(session) = session {
+        // 多路复用（tcp_mux / QUIC）：工作连接 = 会话流（服务端分发循环经
+        // process_work_conn 处理，协议与直连工作端口完全一致）
         let stream = session
             .open_stream()
             .await
-            .map_err(|e| format!("mux open work stream failed: {}", e))?;
+            .map_err(|e| format!("session open work stream failed: {}", e))?;
         log::info!("Mux work stream established for proxy: {}", proxy_name);
         stream
     } else {
@@ -1320,7 +1355,7 @@ async fn establish_work_connection(
     run_id: &str,
     config: &ClientConfig,
     work_conn_tls: bool,
-    mux_session: Option<&Arc<MuxSession>>,
+    session: Option<&Arc<dyn Session>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 查找代理配置
     let proxy_config = config
@@ -1346,7 +1381,7 @@ async fn establish_work_connection(
             proxy_name,
             run_id,
             work_conn_tls,
-            mux_session,
+            session,
             use_encryption,
             use_compression,
         },
@@ -1786,7 +1821,7 @@ async fn handle_stcp_visitor_conn(
             proxy_name: &proxy_name,
             run_id: &run_id,
             work_conn_tls,
-            mux_session: None,
+            session: None,
             use_encryption,
             use_compression,
         },
@@ -2082,7 +2117,7 @@ async fn sudp_open_session(
             proxy_name: &ctx.proxy_name,
             run_id: &ctx.run_id,
             work_conn_tls: ctx.work_conn_tls,
-            mux_session: None,
+            session: None,
             use_encryption: ctx.use_encryption,
             use_compression: ctx.use_compression,
         },
@@ -2969,7 +3004,7 @@ impl Client {
             .map(|t| t.enable)
             .unwrap_or(true);
 
-        let (mut conn, mux_session): (ControlConn, Option<Arc<MuxSession>>) = match protocol {
+        let (mut conn, session): (ControlConn, Option<Arc<dyn Session>>) = match protocol {
             "kcp" => {
                 let kcp_conn = self
                     .connector
@@ -2977,6 +3012,21 @@ impl Client {
                     .await
                     .map_err(|e| format!("KCP connection failed: {}", e))?;
                 (ControlConn::new(Box::new(kcp_conn)), None)
+            }
+            "quic" => {
+                // QUIC：单个 QUIC 连接内多路复用，控制连接 = 首条双向流，
+                // 后续工作连接为同一连接上的新流（QUIC 自带 TLS 1.3）
+                let session: Arc<dyn Session> = self
+                    .connector
+                    .connect_quic()
+                    .await
+                    .map_err(|e| format!("QUIC connection failed: {}", e))?;
+                let control_stream = session
+                    .open_stream()
+                    .await
+                    .map_err(|e| format!("QUIC open control stream failed: {}", e))?;
+                log::info!("QUIC control stream established");
+                (ControlConn::new(control_stream), Some(session))
             }
             "websocket" => {
                 let scheme = if use_tls { "wss" } else { "ws" };
@@ -3014,7 +3064,7 @@ impl Client {
                     Box::new(tcp)
                 };
 
-                let session = MuxSession::new_client(io);
+                let session: Arc<dyn Session> = MuxSession::new_client(io);
                 // 首条流 = 控制流（服务端 accept 后作为控制连接处理）
                 let control_stream = session
                     .open_stream()
@@ -3093,7 +3143,7 @@ impl Client {
                     work_conn_manager: Arc::clone(&self.work_conn_manager),
                     config: Arc::clone(&self.config),
                     work_conn_tls,
-                    mux_session,
+                    session,
                 });
                 self.control = Some(Mutex::new(control));
 

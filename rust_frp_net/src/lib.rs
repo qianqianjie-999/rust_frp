@@ -56,6 +56,13 @@ pub use stun::{default_stun_socket_addrs, discover_public_endpoint};
 pub mod kcp_stream;
 pub use kcp_stream::KcpStream;
 
+pub mod quic;
+pub use quic::{
+    build_client_config as build_quic_client_config,
+    build_server_config as build_quic_server_config, QuicConn, QuicConnection, QuicListener,
+    QuicOptions, QuicSession, QUIC_ALPN,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     #[error("I/O error: {0}")]
@@ -91,6 +98,16 @@ impl FrpConn for Box<dyn FrpConn> {
     fn remote_addr(&self) -> Option<SocketAddr> {
         (**self).remote_addr()
     }
+}
+
+/// 可打开多条逻辑连接流的上层会话（tcp_mux 的 yamux 会话、QUIC 连接）
+///
+/// 客户端借此把「控制连接」与「工作连接」复用在同一底层连接上：
+/// 一条会话可反复 `open_stream` 得到彼此独立的「逻辑连接」。
+#[async_trait::async_trait]
+pub trait Session: Send + Sync {
+    /// 打开一条新的逻辑连接流
+    async fn open_stream(&self) -> Result<AnyConn, NetError>;
 }
 
 /// 实现 TokioTcpStream 的 FrpConn trait

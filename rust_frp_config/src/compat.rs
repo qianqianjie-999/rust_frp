@@ -125,6 +125,7 @@ mod fields {
         "useEncryption",
         "use_compression",
         "useCompression",
+        "quic",
         "bandwidth_limit_mode",
         "bandwidthLimitMode",
         "proxy_protocol_version",
@@ -142,6 +143,15 @@ mod fields {
         "skip_verify",
         "skipVerify",
         "force",
+    ];
+
+    pub const QUIC: &[&str] = &[
+        "max_idle_timeout",
+        "maxIdleTimeout",
+        "max_incoming_streams",
+        "maxIncomingStreams",
+        "keepalive_period",
+        "keepalivePeriod",
     ];
 
     pub const PROXY: &[&str] = &[
@@ -251,6 +261,7 @@ fn section_fields(section: &str) -> &'static [&'static str] {
         "oidc" => fields::OIDC,
         "transport" => fields::TRANSPORT,
         "tls" => fields::TLS,
+        "quic" => fields::QUIC,
         "proxy" => fields::PROXY,
         "visitor" => fields::VISITOR,
         "health_check" => fields::HEALTH_CHECK,
@@ -276,7 +287,11 @@ fn child_section(section: &str, key: &str) -> Option<&'static str> {
             _ => None,
         },
         "auth" => (key == "oidc").then_some("oidc"),
-        "transport" => (key == "tls").then_some("tls"),
+        "transport" => match key {
+            "tls" => Some("tls"),
+            "quic" => Some("quic"),
+            _ => None,
+        },
         "proxy" => match key {
             "transport" => Some("transport"),
             "plugin" => Some("plugin"),
@@ -383,6 +398,25 @@ mod tests {
             unknown.contains(&"proxies[0].metadatas".to_string()),
             "got {unknown:?}"
         );
+    }
+
+    /// 回归：`transport.quic.*`（camelCase）必须属于客户端已知键，
+    /// 否则 `protocol = "quic"` 的配置会被整体误报为未知字段。
+    #[test]
+    fn test_transport_quic_keys_are_known() {
+        let root = json!({
+            "serverAddr": "1.2.3.4",
+            "serverPort": 7000,
+            "transport": {
+                "protocol": "quic",
+                "quic": {
+                    "maxIdleTimeout": 30,
+                    "maxIncomingStreams": 100000,
+                    "keepalivePeriod": 0
+                }
+            }
+        });
+        assert!(collect_unknown_fields(ConfigKind::Client, &root).is_empty());
     }
 
     /// 回归：`http_plugins`/`httpPlugins` 必须属于服务端已知键，

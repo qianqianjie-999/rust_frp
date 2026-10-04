@@ -4,8 +4,8 @@ use rust_frp_auth::AuthManager;
 use rust_frp_config::ServerConfig;
 use rust_frp_core::{ControlConn, Message};
 use rust_frp_net::{
-    AnyConn, ConnManager, KcpConn, KcpListener, MuxSession, TcpListener, TlsConfig, UdpListener,
-    TCP_MUX_MAGIC,
+    AnyConn, ConnManager, KcpConn, KcpListener, MuxSession, QuicConnection, QuicListener,
+    QuicOptions, TcpListener, TlsConfig, UdpListener, TCP_MUX_MAGIC,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -80,6 +80,16 @@ pub(crate) struct ServerManagers {
 #[allow(dead_code)]
 /// 优雅关闭排空轮询间隔
 const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 由 `transport.quic` 构造 QUIC 传输参数（未配置时用与原版 frp 一致的默认值）
+fn quic_options(config: &ServerConfig) -> QuicOptions {
+    let q = config.transport.quic.as_ref();
+    QuicOptions::from_config(
+        q.and_then(|q| q.max_idle_timeout),
+        q.and_then(|q| q.max_incoming_streams),
+        q.and_then(|q| q.keepalive_period),
+    )
+}
 
 pub struct Server {
     config: ServerConfig,
@@ -411,6 +421,44 @@ impl Server {
             });
         }
 
+        // QUIC 监听器（如果配置了 quic_bind_port）
+        //
+        // QUIC 强制 TLS 1.3，故 tls_only 天然满足（不同于明文 UDP 的 KCP，无需拒绝）。
+        if let Some(quic_port) = self.config.quic_bind_port.filter(|p| *p > 0) {
+            let addr = format!("{}:{}", self.config.bind_addr, quic_port).parse::<SocketAddr>()?;
+            let tls = self.config.transport.tls.as_ref();
+            let quic_cfg = rust_frp_net::build_quic_server_config(
+                tls.and_then(|t| t.cert_file.as_deref()),
+                tls.and_then(|t| t.key_file.as_deref()),
+                &quic_options(&self.config),
+            )?;
+            let listener = QuicListener::bind(addr, quic_cfg)?;
+            log::info!("QUIC listener started on {} (ALPN frp)", addr);
+
+            let managers = self.managers();
+            let metrics = self.metrics.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok(conn) => {
+                            log::info!("new QUIC connection from: {}", conn.remote_addr());
+                            metrics.increment_connections();
+                            let managers = managers.clone();
+                            let m = metrics.clone();
+                            tokio::spawn(async move {
+                                Self::handle_quic_connection(conn, managers).await;
+                                m.decrement_connections();
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("Failed to accept QUIC connection: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         // 启动 TCP 连接处理器
         self.handle_tcp_connections().await?;
         Ok(())
@@ -546,7 +594,7 @@ impl Server {
         log::info!("Work connection handler stopped");
     }
 
-    /// 处理单个工作连接
+    /// 处理单个工作连接（TCP / TLS 直连工作端口）：读取首消息后交给共用处理逻辑
     async fn process_work_conn(
         mut conn: AnyConn,
         control_manager: Arc<ControlManager>,
@@ -576,7 +624,28 @@ impl Server {
                 return Err("work conn handshake timeout".into());
             }
         };
+        Self::process_work_conn_msg(
+            conn,
+            msg,
+            control_manager,
+            work_conn_manager,
+            auth_manager,
+            stcp_bridge_manager,
+            plugin_manager,
+        )
+        .await
+    }
 
+    /// 处理一条已完成首消息读取的工作连接（TCP / TLS / QUIC 流共用）
+    async fn process_work_conn_msg(
+        mut conn: AnyConn,
+        msg: Message,
+        control_manager: Arc<ControlManager>,
+        work_conn_manager: Arc<ServerWorkConnManager>,
+        auth_manager: Arc<AuthManager>,
+        stcp_bridge_manager: Arc<StcpBridgeManager>,
+        plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match msg {
             Message::NewWorkConn(work_msg) => {
                 log::info!(
@@ -1432,6 +1501,7 @@ impl Server {
                 plugin_manager,
             },
             work_conn_tls,
+            None,
         );
 
         Ok(())
@@ -1444,6 +1514,7 @@ impl Server {
         conn: ControlConn,
         managers: ServerManagers,
         work_conn_tls: bool,
+        pre_read_login: Option<rust_frp_core::LoginMsg>,
     ) -> tokio::task::JoinHandle<()> {
         let ServerManagers {
             control_manager,
@@ -1481,6 +1552,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
+            pre_read_login,
             plugin_manager,
         });
 
@@ -1579,6 +1651,7 @@ impl Server {
                 plugin_manager,
             },
             work_conn_tls,
+            None,
         );
 
         // 后续流 = 工作连接，逐条分发
@@ -1650,6 +1723,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
+            pre_read_login: None,
             plugin_manager,
         });
 
@@ -1676,6 +1750,89 @@ impl Server {
         });
 
         Ok(())
+    }
+
+    /// 处理一条 QUIC 连接：在该连接上循环接受双向流，逐条分派
+    async fn handle_quic_connection(conn: QuicConnection, managers: ServerManagers) {
+        let remote = conn.remote_addr();
+        loop {
+            match conn.accept_stream().await {
+                Ok(stream) => {
+                    let managers = managers.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_quic_stream(stream, managers).await {
+                            log::debug!("QUIC stream from {} ended: {:?}", remote, e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    log::debug!("QUIC connection from {} closed: {:?}", remote, e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 处理一条 QUIC 双向流：按首条消息分派到控制连接或工作连接路径
+    ///
+    /// QUIC 在单条连接上复用多条流，服务端无法像 TCP 那样按端口区分控制/工作
+    /// 连接，因此读取首条消息后分派（`Login` → 控制，`NewWorkConn` → 工作连接）。
+    async fn handle_quic_stream(
+        mut stream: rust_frp_net::QuicConn,
+        managers: ServerManagers,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 安全：首帧读取受认证前超时与大小上限约束（P0-1 / P0-2）
+        let msg = match tokio::time::timeout(
+            LOGIN_READ_TIMEOUT,
+            rust_frp_core::read_message_with_limit(
+                &mut stream,
+                rust_frp_core::MAX_PREAUTH_MESSAGE_SIZE,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                log::warn!(
+                    "QUIC stream first message timed out after {:?}",
+                    LOGIN_READ_TIMEOUT
+                );
+                return Err("QUIC stream handshake timeout".into());
+            }
+        };
+
+        let conn: AnyConn = Box::new(stream);
+        match msg {
+            Message::Login(login) => {
+                // QUIC 自带 TLS 1.3：工作连接复用同连接的新流，无需再协商 work_conn_tls
+                Self::spawn_control(ControlConn::new(conn), managers, false, Some(login));
+                Ok(())
+            }
+            m @ Message::NewWorkConn(_) => {
+                let ServerManagers {
+                    control_manager,
+                    work_conn_manager,
+                    auth_manager,
+                    stcp_bridge_manager,
+                    plugin_manager,
+                    ..
+                } = managers;
+                Self::process_work_conn_msg(
+                    conn,
+                    m,
+                    control_manager,
+                    work_conn_manager,
+                    auth_manager,
+                    stcp_bridge_manager,
+                    plugin_manager,
+                )
+                .await
+            }
+            other => {
+                log::warn!("Unexpected first message on QUIC stream: {:?}", other);
+                Err("unexpected first message on QUIC stream".into())
+            }
+        }
     }
 
     /// 热重载配置
