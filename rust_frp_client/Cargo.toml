@@ -27,3 +27,6 @@ rust_frp_auth = { path = "../rust_frp_auth" }
 rust_frp_core = { path = "../rust_frp_core" }
 notify = { workspace = true }
 futures-util = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

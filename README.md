@@ -50,6 +50,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
 | PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP |
 | 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容），不支持的字段 WARN 提示 |
+| frpc CLI 子命令 | ✅ | `frpc verify`（校验配置）/ `frpc reload`（热重载）/ `frpc status`（代理状态），后两者走 frpc 管理端口（Basic Auth 保护） |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
 ---
@@ -134,6 +135,11 @@ rust_frp/
 | 审计日志 | 与企业身份系统集成，便于审计 |
 
 ### 配置热重载 ✅
+
+**触发方式**（统一走 Client 内部 reload 通知通道）：
+- **SIGHUP 信号**：`kill -HUP <pid>`
+- **文件监听**：自动监听配置文件变化（500ms 防抖）
+- **CLI**：`frpc reload -c frpc.toml`（走管理端口 `POST /reload`）
 
 | 场景 | 说明 |
 |------|------|
@@ -265,6 +271,23 @@ RUST_LOG=debug ./target/release/rust_frpc -c frpc.toml
 # 指定配置文件路径
 RUST_LOG=debug ./target/release/rust_frpc -c /opt/rust_frp/conf/frpc.toml
 ```
+
+### frpc 子命令（运维）
+
+```bash
+# 校验配置文件（语法 + 校验规则，不连接服务端），失败退出码 1
+./target/release/rust_frpc verify -c frpc.toml
+
+# 热重载运行中的 frpc（走管理端口 POST /reload）
+./target/release/rust_frpc reload -c frpc.toml
+
+# 查询代理/访客运行状态（走管理端口 GET /status）
+./target/release/rust_frpc status -c frpc.toml
+```
+
+> 说明：`reload`/`status` 需要 frpc 配置文件中启用管理端口
+> （`[webServer] port > 0`）；配置了 `user` + `password` 时自动附带
+> Basic 认证。建议 `addr` 仅监听 `127.0.0.1`。
 
 ### 日志级别说明
 
@@ -807,14 +830,14 @@ pub struct KcpListener {
 **触发方式**：
 - **SIGHUP 信号**：`kill -HUP <pid>`
 - **文件监听**：使用 `notify` 库自动监听配置文件变化
-- **API 接口**：`POST /api/reload`
+- **CLI**：`frpc reload`（走客户端管理端口 `POST /reload`）
 
 **热重载机制**：
 
 ```text
-SIGHUP ──→ channel ──→ tokio::select! → reload_config()
-文件变更 ──→ channel ──→ tokio::select! → reload_config()
-POST /api/reload ──→ channel ──→ tokio::select! → reload_config()
+SIGHUP ──────────┐
+文件变更 ─────────┼→ reload_notify (Notify) ──→ Client::start 主循环 select! → reload_config()
+POST /reload ────┘
 ```
 
 **关键实现**：
@@ -826,10 +849,13 @@ tokio::select! {
     _ = reload_rx.recv() => { /* reload config without dropping listener */ }
 }
 
-// 客户端：在主循环中处理重载信号
+// 客户端：所有 reload 来源共用 Notify 通道，统一在 Client::start 主循环处理
+// （reload 后走重连清理路径，按新配置整体重新注册，保证已删除代理下线）
 tokio::select! {
-    result = client.start() => { /* handle connection result */ }
-    _ = reload_rx.recv() => { client.reload_config().await; continue; }
+    _ = async { /* login + 控制循环 */ } => { /* 连接断开 */ }
+    _ = reload_notify.notified() => { reload_requested = true; }
+    _ = sighup.recv() => { reload_requested = true; }
+    _ = sigint.recv() => { /* graceful shutdown */ }
 }
 ```
 

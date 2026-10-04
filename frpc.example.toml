@@ -17,6 +17,13 @@ server_port = 9300
 method = "token"
 token = "CHANGE_ME_RANDOM_LONG_TOKEN"
 
+# --- 管理端口（frpc reload / frpc status 子命令依赖此项，默认禁用） ---
+# [webServer]
+# addr = "127.0.0.1"   # 建议仅监听本地
+# port = 7400
+# user = "admin"       # user/password 成对配置后启用 Basic 认证
+# password = "CHANGE_ME_STRONG_PASSWORD"
+
 # --- 传输配置 ---
 [transport]
 protocol = "tcp"
