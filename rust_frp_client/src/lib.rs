@@ -182,6 +182,35 @@ pub struct ClientProxyManager {
     work_conn_manager: Option<Arc<WorkConnManager>>,
     /// 传输层全局带宽限制（transport.bandwidth_limit），作为代理级配置的回落值
     default_bandwidth_limit: Option<String>,
+    /// per-proxy 累计流量（键为代理名）
+    traffic: RwLock<std::collections::HashMap<String, Arc<ProxyTraffic>>>,
+}
+
+/// per-proxy 累计流量计数器（客户端视角）
+#[derive(Default)]
+pub struct ProxyTraffic {
+    /// 服务端 → 本地服务（下行）
+    pub bytes_down: std::sync::atomic::AtomicU64,
+    /// 本地服务 → 服务端（上行）
+    pub bytes_up: std::sync::atomic::AtomicU64,
+}
+
+impl ProxyTraffic {
+    /// 累加一次转发（桥接结束后调用）
+    pub fn add(&self, down: u64, up: u64) {
+        use std::sync::atomic::Ordering;
+        self.bytes_down.fetch_add(down, Ordering::Relaxed);
+        self.bytes_up.fetch_add(up, Ordering::Relaxed);
+    }
+
+    /// 读取快照 (down, up)
+    pub fn snapshot(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.bytes_down.load(Ordering::Relaxed),
+            self.bytes_up.load(Ordering::Relaxed),
+        )
+    }
 }
 
 impl Default for ClientProxyManager {
@@ -198,7 +227,33 @@ impl ClientProxyManager {
             work_conn_handlers: RwLock::new(std::collections::HashMap::new()),
             work_conn_manager: None,
             default_bandwidth_limit: None,
+            traffic: RwLock::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// 取（或创建）某代理的流量计数器
+    async fn traffic_counter(&self, proxy_name: &str) -> Arc<ProxyTraffic> {
+        {
+            let map = self.traffic.read().await;
+            if let Some(c) = map.get(proxy_name) {
+                return c.clone();
+            }
+        }
+        let mut map = self.traffic.write().await;
+        map.entry(proxy_name.to_string())
+            .or_insert_with(|| Arc::new(ProxyTraffic::default()))
+            .clone()
+    }
+
+    /// 记录一次转发流量（工作连接处理热路径调用）
+    pub async fn record_traffic(&self, proxy_name: &str, down: u64, up: u64) {
+        self.traffic_counter(proxy_name).await.add(down, up);
+    }
+
+    /// 读取某代理的流量快照 (down, up)，无记录时返回 None
+    pub async fn traffic_snapshot(&self, proxy_name: &str) -> Option<(u64, u64)> {
+        let map = self.traffic.read().await;
+        map.get(proxy_name).map(|c| c.snapshot())
     }
 
     pub fn set_work_conn_manager(&mut self, work_conn_manager: Arc<WorkConnManager>) {
@@ -219,6 +274,8 @@ impl ClientProxyManager {
         bandwidth_limit: Option<String>,
     ) {
         let proxy_name_clone = proxy_name.clone();
+        // 预取流量计数器（Arc），供转发任务在桥接结束后累加
+        let traffic = self.traffic_counter(&proxy_name).await;
         // 限速配置为空表示不限速；非法值给出明确告警，而不是静默失效
         let rate_bytes_per_sec = match bandwidth_limit.as_deref() {
             Some(spec) => match rust_frp_util::parse_bandwidth_limit(spec) {
@@ -295,12 +352,18 @@ impl ClientProxyManager {
                                 )
                                 .await
                                 {
-                                    Ok(n) => log::info!(
-                                        "Server to local: {} bytes transferred (rate: {}B/s)",
-                                        n,
-                                        rate
-                                    ),
-                                    Err(e) => log::error!("Server to local error: {:?}", e),
+                                    Ok(n) => {
+                                        log::info!(
+                                            "Server to local: {} bytes transferred (rate: {}B/s)",
+                                            n,
+                                            rate
+                                        );
+                                        n
+                                    }
+                                    Err(e) => {
+                                        log::error!("Server to local error: {:?}", e);
+                                        0
+                                    }
                                 }
                             };
 
@@ -311,22 +374,36 @@ impl ClientProxyManager {
                                 )
                                 .await
                                 {
-                                    Ok(n) => log::info!(
-                                        "Local to server: {} bytes transferred (rate: {}B/s)",
-                                        n,
-                                        rate
-                                    ),
-                                    Err(e) => log::error!("Local to server error: {:?}", e),
+                                    Ok(n) => {
+                                        log::info!(
+                                            "Local to server: {} bytes transferred (rate: {}B/s)",
+                                            n,
+                                            rate
+                                        );
+                                        n
+                                    }
+                                    Err(e) => {
+                                        log::error!("Local to server error: {:?}", e);
+                                        0
+                                    }
                                 }
                             };
 
-                            futures_util::future::join(server_to_local, local_to_server).await;
+                            // 下行 = 服务端→本地，上行 = 本地→服务端
+                            let (down, up) =
+                                futures_util::future::join(server_to_local, local_to_server).await;
+                            traffic.add(down, up);
                         } else {
-                            match rust_frp_util::bridge_streams(server_conn, local_conn).await {
-                                Ok(_) => log::info!(
-                                    "Bidirectional bridge completed for proxy: {}",
-                                    proxy_name_clone
-                                ),
+                            match rust_frp_util::bridge_streams_counted(server_conn, local_conn)
+                                .await
+                            {
+                                Ok((down, up)) => {
+                                    log::info!(
+                                        "Bidirectional bridge completed for proxy: {}",
+                                        proxy_name_clone
+                                    );
+                                    traffic.add(down, up);
+                                }
                                 Err(e) => log::error!(
                                     "Bridge error for proxy {}: {:?}",
                                     proxy_name_clone,
@@ -1816,19 +1893,37 @@ async fn visitors_handler(
 /// `GET /status`：代理/访客运行状态（对齐 frp 原版 `frpc status` 的语义）
 async fn status_handler(State(state): State<Arc<WebServerState>>) -> Json<serde_json::Value> {
     let proxies = state.proxy_manager.proxies.read().await;
-    let proxy_list: Vec<serde_json::Value> = proxies
+    let proxy_names: Vec<(String, String, u16, Option<u16>)> = proxies
         .values()
         .map(|p| {
-            serde_json::json!({
-                "name": p.name,
-                "type": p.r#type,
-                "status": "running",
-                "local_port": p.local_port,
-                "remote_port": p.remote_port,
-            })
+            (
+                p.name.clone(),
+                p.r#type.clone(),
+                p.local_port,
+                p.remote_port,
+            )
         })
         .collect();
     drop(proxies);
+
+    let mut proxy_list: Vec<serde_json::Value> = Vec::with_capacity(proxy_names.len());
+    for (name, proxy_type, local_port, remote_port) in proxy_names {
+        // 累计流量（客户端视角）：down = 服务端→本地，up = 本地→服务端
+        let (bytes_down, bytes_up) = state
+            .proxy_manager
+            .traffic_snapshot(&name)
+            .await
+            .unwrap_or((0, 0));
+        proxy_list.push(serde_json::json!({
+            "name": name,
+            "type": proxy_type,
+            "status": "running",
+            "local_port": local_port,
+            "remote_port": remote_port,
+            "traffic_down": bytes_down,
+            "traffic_up": bytes_up,
+        }));
+    }
 
     let visitors = state.visitor_manager.visitors.read().await;
     let visitor_list: Vec<serde_json::Value> = visitors
@@ -2995,6 +3090,8 @@ mod web_admin_tests {
             })
             .await
             .unwrap();
+        // 记录一次流量，验证 /status 暴露的累计字节数
+        state.proxy_manager.record_traffic("ssh", 123, 456).await;
 
         let app = Router::new()
             .route("/status", get(status_handler))
@@ -3016,6 +3113,8 @@ mod web_admin_tests {
         assert_eq!(json["proxies"][0]["name"], "ssh");
         assert_eq!(json["proxies"][0]["status"], "running");
         assert_eq!(json["proxies"][0]["remote_port"], 6000);
+        assert_eq!(json["proxies"][0]["traffic_down"], 123);
+        assert_eq!(json["proxies"][0]["traffic_up"], 456);
         assert_eq!(json["visitors"].as_array().unwrap().len(), 0);
     }
 
@@ -3180,5 +3279,25 @@ mod web_admin_tests {
         assert_eq!(resp.status(), 400);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), VALID_CONFIG);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod client_traffic_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_manager_records_and_snapshots_traffic() {
+        let mgr = ClientProxyManager::new();
+        assert_eq!(mgr.traffic_snapshot("ssh").await, None);
+
+        mgr.record_traffic("ssh", 100, 200).await;
+        assert_eq!(mgr.traffic_snapshot("ssh").await, Some((100, 200)));
+
+        // 累加语义，且不同代理互不影响
+        mgr.record_traffic("ssh", 5, 6).await;
+        mgr.record_traffic("web", 1, 2).await;
+        assert_eq!(mgr.traffic_snapshot("ssh").await, Some((105, 206)));
+        assert_eq!(mgr.traffic_snapshot("web").await, Some((1, 2)));
     }
 }

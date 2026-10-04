@@ -9,6 +9,10 @@ pub struct ProxyStat {
     pub remote_port: Option<u16>,
     pub current_conns: AtomicUsize,
     pub total_conns: AtomicUsize,
+    /// 入口方向累计字节（访问者 → 工作连接，即客户端视角的上行）
+    pub bytes_in: AtomicUsize,
+    /// 出口方向累计字节（工作连接 → 访问者）
+    pub bytes_out: AtomicUsize,
 }
 
 impl ProxyStat {
@@ -19,7 +23,16 @@ impl ProxyStat {
             remote_port,
             current_conns: AtomicUsize::new(0),
             total_conns: AtomicUsize::new(0),
+            bytes_in: AtomicUsize::new(0),
+            bytes_out: AtomicUsize::new(0),
         }
+    }
+
+    /// 累加一次转发流量（桥接结束后调用）
+    pub fn add_bytes(&self, bytes_in: u64, bytes_out: u64) {
+        self.bytes_in.fetch_add(bytes_in as usize, Ordering::SeqCst);
+        self.bytes_out
+            .fetch_add(bytes_out as usize, Ordering::SeqCst);
     }
 }
 
@@ -114,6 +127,19 @@ impl MonitorMetrics {
         self.bytes_received.fetch_add(bytes, Ordering::SeqCst);
     }
 
+    /// 记录一次代理转发的双向流量（全局计数 + per-proxy 计数）。
+    ///
+    /// 方向语义：`bytes_in` = 访问者 → 工作连接（入方向），
+    /// `bytes_out` = 工作连接 → 访问者（出方向）；与全局
+    /// `bytes_received` / `bytes_sent` 对应。代理未注册时仅累加全局计数。
+    pub fn record_traffic(&self, proxy_name: &str, bytes_in: u64, bytes_out: u64) {
+        self.add_bytes_received(bytes_in as usize);
+        self.add_bytes_sent(bytes_out as usize);
+        if let Some(stat) = self.get_proxy_stat(proxy_name) {
+            stat.add_bytes(bytes_in, bytes_out);
+        }
+    }
+
     pub fn uptime(&self) -> Duration {
         self.start_time.elapsed()
     }
@@ -183,7 +209,9 @@ impl MonitorMetrics {
     /// 输出 Prometheus text exposition format (v0.0.4)。
     /// 手写实现，零第三方依赖；label 值做转义防止注入。
     ///
-    /// 说明：bytes_sent/bytes_received 当前未在数据面接线，恒为 0（best-effort）。
+    /// 说明：bytes_sent/bytes_received 由数据面桥接结束时累加
+    /// （`record_traffic`），仅统计完整结束的转发会话；被强杀/取消的
+    /// 连接不计数。
     pub fn render_prometheus(&self) -> String {
         fn esc(s: &str) -> String {
             s.replace('\\', "\\\\")
@@ -291,6 +319,16 @@ impl MonitorMetrics {
                 labels,
                 stat.total_conns.load(Ordering::SeqCst)
             ));
+            out.push_str(&format!(
+                "# TYPE frps_proxy_traffic_bytes_in_total counter\nfrps_proxy_traffic_bytes_in_total{} {}\n",
+                labels,
+                stat.bytes_in.load(Ordering::SeqCst)
+            ));
+            out.push_str(&format!(
+                "# TYPE frps_proxy_traffic_bytes_out_total counter\nfrps_proxy_traffic_bytes_out_total{} {}\n",
+                labels,
+                stat.bytes_out.load(Ordering::SeqCst)
+            ));
         }
         out
     }
@@ -312,4 +350,48 @@ pub fn global_metrics() -> std::sync::Arc<MonitorMetrics> {
         let _ = GLOBAL_METRICS.set(m.clone());
         m
     })
+}
+
+#[cfg(test)]
+mod traffic_tests {
+    use super::*;
+
+    #[test]
+    fn test_record_traffic_updates_global_and_proxy_stats() {
+        let m = MonitorMetrics::new();
+        let stat = m.register_proxy_stat("ssh", "tcp", Some(6000));
+
+        m.record_traffic("ssh", 100, 250);
+
+        assert_eq!(m.bytes_received.load(Ordering::SeqCst), 100);
+        assert_eq!(m.bytes_sent.load(Ordering::SeqCst), 250);
+        assert_eq!(stat.bytes_in.load(Ordering::SeqCst), 100);
+        assert_eq!(stat.bytes_out.load(Ordering::SeqCst), 250);
+
+        // 累加语义
+        m.record_traffic("ssh", 1, 2);
+        assert_eq!(stat.bytes_in.load(Ordering::SeqCst), 101);
+        assert_eq!(stat.bytes_out.load(Ordering::SeqCst), 252);
+    }
+
+    #[test]
+    fn test_record_traffic_without_proxy_stat_still_counts_global() {
+        let m = MonitorMetrics::new();
+        m.record_traffic("未知代理", 7, 9);
+        assert_eq!(m.bytes_received.load(Ordering::SeqCst), 7);
+        assert_eq!(m.bytes_sent.load(Ordering::SeqCst), 9);
+    }
+
+    #[test]
+    fn test_prometheus_includes_per_proxy_traffic() {
+        let m = MonitorMetrics::new();
+        m.register_proxy_stat("web", "http", Some(9090));
+        m.record_traffic("web", 11, 22);
+
+        let text = m.render_prometheus();
+        assert!(text.contains("frps_proxy_traffic_bytes_in_total{name=\"web\",type=\"http\"} 11"));
+        assert!(text.contains("frps_proxy_traffic_bytes_out_total{name=\"web\",type=\"http\"} 22"));
+        assert!(text.contains("frps_traffic_bytes_received_total"));
+        assert!(text.contains("frps_traffic_bytes_sent_total"));
+    }
 }

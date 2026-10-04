@@ -357,6 +357,17 @@ async fn proxies_handler(
                 .cloned()
                 .unwrap_or_else(|| "-".to_string());
 
+            // 累计流量（服务端视角）：in = 访问者→工作连接，out = 工作连接→访问者
+            let (traffic_in, traffic_out) = crate::metrics::global_metrics()
+                .get_proxy_stat(&proxy.name)
+                .map(|st| {
+                    (
+                        st.bytes_in.load(std::sync::atomic::Ordering::SeqCst),
+                        st.bytes_out.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                })
+                .unwrap_or((0, 0));
+
             serde_json::json!({
                 "name": proxy.name,
                 "type": proxy.r#type,
@@ -365,6 +376,8 @@ async fn proxies_handler(
                 "remote_port": proxy.remote_port,
                 "plugin": proxy.plugin,
                 "client": client_id,
+                "traffic_in": traffic_in,
+                "traffic_out": traffic_out,
             })
         })
         .collect();
