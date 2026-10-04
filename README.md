@@ -19,7 +19,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **重试机制**：客户端连接本地服务时使用指数退避重试
 - **端口白名单**：服务器默认拒绝未明确允许的端口，必须配置才能正常使用
 - **环境变量**：配置文件支持 `${VAR_NAME}` 环境变量替换
-- **多格式配置**：支持 TOML、YAML、JSON 配置格式
+- **多格式配置**：支持 TOML、YAML、JSON 配置格式；**兼容原版 frp 的 camelCase 字段名**（`serverAddr`/`localIP`/`bindPort` 等可直接使用），原版配置文件可直接复用；无法识别的字段（如原版 `log.to`）加载时打印 WARN 但不拒绝启动
 - **优雅关闭**：客户端支持 SIGINT/SIGTERM 信号优雅退出
 - **OIDC 认证**：支持 OpenID Connect 认证，集成企业身份系统
 - **配置热重载**：支持 SIGHUP 信号、文件监听、API 触发三种方式重载配置
@@ -40,11 +40,16 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | XTCP (P2P TCP) | ✅ | NAT 穿透打洞 + STCP 回退可用，鉴权规则与 STCP 一致 |
 | KCP 协议 | ✅ | 完整实现 |
 | QUIC 协议 | 🚧 | **未实现**（路线图项），配置字段 `quic_bind_port` 已预留但无效果 |
+| 应用层加密 | ✅ | `use_encryption`：工作连接 AES-256-GCM 加密（**仅加密不认证**，密钥派生自 token；无 token 时 fail-closed） |
+| 应用层压缩 | 🚧 | **未实现**（路线图项），`use_compression` 字段存在但恒为 false |
+| tcpmux 代理 | 🚧 | **未实现**，`tcpmux_http_connect_port` 字段已预留但无效果 |
+| sudp 代理 | ❌ | **未实现**（安全 UDP） |
 | OIDC 认证 | ✅ | 支持 HS256 JWT 验证 |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
 | PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP |
+| 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容），不支持的字段 WARN 提示 |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
 ---
@@ -55,7 +60,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 |------|------|------|
 | 运行时自签证书 | 服务端未配置证书时，启动时在**内存中生成**自签证书（不落盘、不入库，每次启动更换），只能加密、**不能认证服务端身份** | 生产环境用 `transport.tls.cert_file/key_file` 指定自建证书；客户端配置 `trusted_ca_file` |
 | 客户端证书校验 | **fail-closed**：配置了 TLS 但既无 `trusted_ca_file` 又未显式 `skip_verify = true` 时，客户端**拒绝启动**；`skip_verify = true` 为显式跳过（打印 WARN） | 生产环境配置 `trusted_ca_file`；自签名测试环境才用 `skip_verify = true` |
-| 应用层加密 | **不支持**（frp 的 `use_encryption` 特性未实现；仅提供 TLS 传输加密） | 依赖 TLS 即可，勿期待应用层加密字段生效 |
+| 应用层加密 | ✅ **已实现**：`use_encryption` 对工作连接做 AES-256-GCM 加密（密钥派生自 token，**仅加密不认证**）；代理端启用时访问端须同步启用 | 与 TLS 叠加使用即可；如需认证服务端身份仍须配置 `trusted_ca_file` |
 | Dashboard 凭据 | `web_server.user/password` 必须成对配置且非空，否则服务端拒绝启动；未配置则鉴权关闭并告警 | 用强密码，只监听 `127.0.0.1` 并前置 Nginx 提供 HTTPS |
 | 会话机制 | 随机会话令牌 + 服务端存储 + 8 小时过期 + `HttpOnly; SameSite=Strict` | 反向代理声明 `X-Forwarded-Proto: https` 时会自动附加 `Secure` |
 | 配置文件 | `frpc.toml` / `frps.toml` 已被 `.gitignore` 忽略，仅提供 `*.example.toml` | 不要把含 token/密码的配置提交进版本库 |

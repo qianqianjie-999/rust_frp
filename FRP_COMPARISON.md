@@ -1,0 +1,233 @@
+# rust_frp ↔ 原版 frp 能力对照报告
+
+> 对照基线：`/home/qianqianjie/frp`（fatedier/frp，v0.71.0，commit `832df8d`） vs `/home/qianqianjie/rust_frp`（本地 master，`5d91934`）
+> 生成日期：2026-10-04　｜　方法：源码级逐项核对（非 README 宣称）
+
+---
+
+## 一、一页纸摘要
+
+| 指标 | rust_frp | frp 0.71 | 结论 |
+|------|---------|----------|------|
+| 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
+| 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
+| 单元测试 | ~217 个 | ~300 个 `Test` 函数 | 基本相当 |
+| 功能点覆盖率 | **约 68%**（44 项能力点中 30 项等价或更强，配置兼容层已于 2026-10-04 落地） | 100%（基线） | — |
+| 配置字段兼容 | ✅ 双向兼容（alias） | camelCase | 原版配置可直接复用（2026-10-04 起） |
+| 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
+| CLI 子命令 | 仅 `-c` | reload/status/stop/verify/… | 原版更强 |
+| 安全默认值 | ✅ 更保守（见第九节） | 一般 | **rust 更严** |
+| 运行时依赖 | rustls/ring（无 OpenSSL） | golib/quic-go/kcp-go | 均为单二进制 |
+
+**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型主体、TLS/KCP/WebSocket 传输、应用层加密、STCP/XTCP 真打洞、负载均衡、限速、连接池），但**「周边工程化能力」缺口明显**——QUIC、压缩、完整 OIDC、tcpmux/sudp、服务端插件、配置管理 API、CLI 子命令、优雅关闭等 12 项未落地或仅占位。**它现在是一个「内核达标、周边偏瘦」的实现**。
+
+---
+
+## 二、能力覆盖计分卡（44 项口径）
+
+| 分类 | 覆盖 | 覆盖率 | 主要缺口 |
+|------|:----:|:------:|----------|
+| 代理类型 | 7/9 | 78% | tcpmux、sudp |
+| 传输与协议 | 6/8 | 75% | QUIC、wss |
+| 插件体系 | 6/8 | 75% | http2http、http2https、virtual_net、服务端插件 |
+| 配置兼容 | 4/5 | 80% | 严格未知字段校验（现为 WARN 告警模式，见 P0-2） |
+| 认证与安全 | 4/7 | 57% | 完整 OIDC、tokenSource、SSH 隧道 |
+| 管理 API | 2/4 | 50% | 流量/详情统计、代理 CRUD |
+| CLI 运维 | 1/3 | 33% | reload/status/verify |
+| **合计** | **30/44** | **68%** | — |
+
+> 计分口径：一项能力「等价或更强」记 1 分；缺失 / 仅占位 / 显著弱化记 0 分。
+
+---
+
+## 三、规模与结构对照
+
+| 维度 | rust_frp | frp 0.71 |
+|------|----------|----------|
+| 模块组织 | 8 个 crate 分包（core/net/auth/config/plugin/server/client/util） | pkg/ 下 17 个子包 + client/ + server/ 顶层 |
+| 服务端 | `rust_frp_server` 拆 10 个子模块 | `server/`（control/proxy/group/ports/registry/http/metrics…） |
+| 客户端 | `rust_frp_client` 单文件为主 + `src/bin/rust_frpc.rs` | `client/`（control/proxy/visitor/health/configmgmt/http…） |
+| 二进制 | `rust_frpc` / `rust_frps` 两个 | `frpc` / `frps` 两个 |
+| 前端构建 | 无（`include_str!` 内嵌 `web_ui.html`） | Vite 构建，`web/frpc` + `web/frps` + `web/shared` |
+| 配置体系 | 单份 TOML/YAML/JSON | 双体系：`config/legacy`（INI）+ `config/v1`（TOML/YAML/JSON） |
+| 线协议 | 单一：`[4B 大端长度][JSON]` | **双版本**：v1（类型字节+JSON）与 v2（魔数分帧+AEAD+能力协商） |
+
+---
+
+## 四、代理类型对照
+
+| 代理类型 | rust_frp | frp 0.71 | 备注 |
+|----------|:--------:|:--------:|------|
+| tcp | ✅ | ✅ | 等价 |
+| udp | ✅ | ✅ | 等价 |
+| http | ✅ | ✅ | rust 缺 `RequestHeaders`/`ResponseHeaders`/`RouteByHTTPUser` 等细粒度字段 |
+| https | ✅ | ✅ | 等价 |
+| stcp | ✅ | ✅ | rust 有 `secret_key` HMAC 签名 + 跨客户端；原版另有 `AllowUsers` |
+| xtcp | ✅ | ✅ | rust 为 STUN + KCP 真打洞，失败回退 STCP；原版默认 QUIC 打洞，模式更全 |
+| **tcpmux** | ❌ | ✅ | rust 仅有 `tcpmux_http_connect_port` 占位字段，未实现 |
+| **sudp** | ❌ | ✅ | rust 完全没有 |
+| **websocket** | ✅（作为代理类型，rust 特有） | ❌（仅作传输协议） | rust 把 websocket 也当代理 type，原版无此代理类型 |
+| visitor: stcp/xtcp | ✅ | ✅ | rust 支持 stcp/xtcp visitor；原版另有 **sudp visitor** |
+
+**净差**：rust **缺 2 种代理（tcpmux / sudp）**，多 1 种自定义用法（websocket 作为代理类型）。
+
+---
+
+## 五、传输与协议对照
+
+| 传输/协议 | rust_frp | frp 0.71 | 备注 |
+|-----------|:--------:|:--------:|------|
+| tcp | ✅ | ✅ | — |
+| kcp | ✅ | ✅ | rust 自研 `kcp_stream.rs`；原版用 `xtaci/kcp-go` |
+| websocket | ✅ | ✅ | rust 有 `WebSocketConn` / `accept_websocket` |
+| wss | ⚠️ | ✅ | rust 需自行叠加 TLS，无 `wss` 一键协议 |
+| **quic** | ❌ 占位 | ✅ | rust `quic_bind_port` / `protocol="quic"` 仅字段，无实现；原版 quic-go v0.60 完整 |
+| tcp_mux | ✅ | ✅ | rust `mux.rs`（魔数 `0x5A`）；原版 wire v1 内置 |
+| wire protocol v2 | ❌ | ✅ | 原版 `pkg/proto/wire`（能力协商 + AEAD aes-256-gcm/xchacha20） |
+| TLS 默认加密 | ✅（默认 on） | ✅（默认 on） | 双方无证书时均**运行时自签** |
+| TLS force / 仅 TLS | ✅ `tls_only` | ✅ `transport.tls.force` | 等价 |
+| TLS 客户端校验 | ✅ fail-closed（无 CA 且未显式 skip → 拒绝启动） | ⚠️ 有 TrustedCAFile 才 force | **rust 更严** |
+| 应用层加密 `use_encryption` | ✅ AES-256-GCM（自研帧） | ✅ libio WithEncryption | 双方均已实现 |
+| **应用层压缩 `use_compression`** | ❌ 占位 | ✅ snappy（libio） | rust 字段存在但硬编码 false |
+
+---
+
+## 六、认证与安全对照
+
+| 能力 | rust_frp | frp 0.71 | 备注 |
+|------|:--------:|:--------:|------|
+| token 认证 | ✅ | ✅ | 双方常量时间比较 |
+| 工作连接签名 | ✅ HMAC-SHA256 + run_id | ✅ `GetAuthKey(token,ts)` | 等价（rust fail-closed：配了 token 就强制验签） |
+| OIDC 认证 | ⚠️ **仅本地 HS256 JWT 验签** | ✅ 完整 | rust **不连 issuer、不拉 JWKS、无 OAuth2 令牌交换**；`token_endpoint_url` 未被使用 |
+| tokenSource（file/exec 动态取 token） | ❌ | ✅ | 原版可避免明文写 token |
+| auth additionalScopes | ⚠️ 部分 | ✅ HeartBeats / NewWorkConns | — |
+| SSH 隧道网关 | ❌ | ✅ `SSHTunnelGateway`（forwarded-tcpip） | 原版独有 |
+| FeatureGate / --allow-unsafe | ❌ | ✅ | 原版独有 |
+| 登录防爆破 | ✅ 5 次失败锁 5 分钟 | ❌ 无 | **rust 更严** |
+| Dashboard 会话 | ✅ 随机令牌 + 8h TTL + HttpOnly/SameSite | ✅ Basic Auth | rust 更强 |
+| 端口白名单默认拒绝 | ✅ 默认空 = 拒绝所有端口 | ⚠️ 默认放开 | **rust 更严** |
+
+---
+
+## 七、插件体系对照
+
+**客户端插件**
+
+| 插件 | rust_frp | frp 0.71 |
+|------|:--------:|:--------:|
+| unix_domain_socket | ✅ | ✅ |
+| static_file | ✅（含路径遍历防护 + Basic Auth） | ✅（gorilla/mux） |
+| http_proxy | ✅ | ✅ |
+| socks5 | ✅（不支持 IPv6） | ✅（支持 IPv6） |
+| https2http / tls2raw | ✅（`TlsOffloadPlugin`） | ✅（两个独立插件） |
+| https2https | ✅（`TlsBridgePlugin`） | ✅ |
+| http2http | ❌ | ✅ |
+| http2https | ❌ | ✅ |
+| virtual_net | ❌ | ✅（配合 pkg/vnet） |
+
+**服务端插件**
+
+| 能力 | rust_frp | frp 0.71 |
+|------|:--------:|:--------:|
+| 独立服务端插件机制 | ❌ 无 | ✅ `plugin/server/manager` |
+| 通用 HTTP 回调插件 | ❌ | ✅ 六类钩子：Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn |
+| 链路追踪 tracer | ❌ | ✅ |
+
+> 差异性质：rust 的插件是**代理级**（客户端侧替代 local_ip），原版是**注册式 + 六类操作钩子 + 外部 HTTP 回调**，可扩展性高一个量级。
+
+---
+
+## 八、管理面（Dashboard / API / CLI）对照
+
+**frps 侧 HTTP API**
+
+| 端点 | rust_frp | frp 0.71 |
+|------|:--------:|:--------:|
+| `/health` / `/healthz` | ✅ | ✅ |
+| `/metrics`（Prometheus） | ✅（默认关） | ✅（默认关） |
+| 服务器信息 | ❌ | ✅ `/api/serverinfo` |
+| 代理列表 | ✅ `/api/proxies` | ✅ `/api/proxies`、`/api/proxy/{type}`、`/api/v2/proxies` |
+| **代理详情 / 流量统计** | ❌ | ✅ `/api/traffic/{name}`、`/api/v2/proxies/{name}/traffic` |
+| 客户端列表 / 详情 | ⚠️ `/api/controllers`（简版） | ✅ `/api/clients`、`/api/v2/clients/{key}` |
+| 离线代理清理 | ❌ | ✅ `DELETE /api/proxies?status=offline` |
+| **运行时增删代理（CRUD）** | ❌ 只有 reload | ✅ 通过 frpc `PUT /api/config` |
+| 用户管理 | ❌ | ✅ `/api/v2/users` |
+
+**frpc 侧管理 API**
+
+| 端点 | rust_frp | frp 0.71 |
+|------|:--------:|:--------:|
+| reload / stop / status / config | ❌ | ✅ `/api/reload`、`/api/stop`、`/api/status`、`GET/PUT /api/config` |
+| Store 源代理 CRUD | ❌ | ✅ Create/Update/Delete StoreProxy |
+
+**CLI 子命令**
+
+| 命令 | rust_frp | frp 0.71 |
+|------|:--------:|:--------:|
+| 启动（`-c config`） | ✅ | ✅ |
+| `frpc reload` / `status` / `stop` | ❌ | ✅ |
+| `frpc verify`（配置校验） | ❌ | ✅ |
+| `frpc nathole`（打洞调试） | ❌ | ✅ |
+| 每类代理独立子命令 | ❌ | ✅ |
+| `--config_dir`（多实例） | ❌ | ✅ |
+
+---
+
+## 九、rust_frp 更严格 / 更优的项（保留优势）
+
+1. **安全默认值更保守**：端口白名单默认「空即拒绝」；`web_server.user/password` 不成对则拒绝启动；TLS fail-closed；`/metrics` 默认关闭；Dashboard 登录 5 次失败锁 5 分钟。
+2. **无 C 依赖**：rustls/ring，无 OpenSSL，Alpine/musl 天然友好（原版 Go 也静态，但依赖 golib/quic-go/kcp-go 体积更大）。
+3. **内存安全 + 无 GC**：Rust 所有权模型，无 STW 停顿。
+4. **TLS 客户端校验 fail-closed**：原版「未配 CA 时是否校验」语义弱于 rust 的显式拒绝。
+5. **代码量仅 1/3**：19k vs 57k 行，服务端拆 10 模块，可读性更高。
+6. **配置包含 `includes` + 环境变量 `${VAR}`**：原版是模板渲染，rust 是 env 替换，各有取舍。
+
+---
+
+## 十、差距清单（按优先级）
+
+### P0 — 影响可用性 / 兼容性
+| # | 缺口 | 状态 |
+|---|------|------|
+| 1 | 配置字段命名 snake_case（原版 camelCase） | ✅ **已落地**（2026-10-04）：全部结构体加 serde `alias`，snake_case/camelCase 双向兼容，原版配置可直接复用 |
+| 2 | 未启用 `deny_unknown_fields` | ⚠️ **以 WARN 告警模式落地**（2026-10-04）：未知字段逐条 WARN 不拒绝——硬拒绝会误杀原版配置中本项目暂不支持的字段（`log.*`、`loginFailExit` 等），告警是兼容性取舍 |
+| 3 | **无 `frpc reload/status/verify` CLI** | ❌ 待实现：运维只能靠信号 / Dashboard，脚本化能力弱 |
+| 4 | **无代理 CRUD / frpc 管理 API** | ❌ 待实现：无法运行时动态增删代理（原版 `PUT /api/config`） |
+
+### P1 — 能力缺口（功能对不齐）
+| # | 缺口 | 现状 |
+|---|------|------|
+| 5 | QUIC 传输 | 仅配置占位 |
+| 6 | `use_compression` 压缩 | 字段占位、硬编码 false |
+| 7 | OIDC 完整流程 | 仅本地 HS256 验签，不连 issuer |
+| 8 | tcpmux 代理 | 仅端口占位 |
+| 9 | sudp 代理 | 完全缺失 |
+| 10 | 服务端插件机制 | 无（含 HTTP 回调插件） |
+| 11 | 优雅关闭 | SIGINT 直接 `exit(0)`，无连接排水 |
+| 12 | 流量统计 / 客户端详情 API | 缺失 |
+
+### P2 — 增强项（原版有、非必需）
+vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧道网关、tokenSource、端口保留（断线 24h）、PROXY protocol v2（rust 仅 v1）、服务端带宽限制模式、legacy INI 配置、wire protocol v2。
+
+---
+
+## 十一、结论与建议
+
+**定位判断**：rust_frp 的**数据面（data plane）已达标**——TCP/UDP/HTTP/HTTPS/STCP/XTCP 转发、TLS/KCP/WebSocket 传输、AES-256-GCM 应用层加密、STUN 真打洞、负载均衡、健康检查、限速、连接池、配置热重载全部可用且经 217 个单测覆盖。短板集中在**控制面与运维面（control / ops plane）**。
+
+**建议路线（按投入产出排序）**：
+1. ~~**配置兼容层**（P0-1/2）~~ ✅ 已落地（2026-10-04）：serde `alias` 双向兼容 + 未知字段 WARN 告警，新增 `rust_frp_config::compat` 模块与原版风格配置回归测试。
+2. **CLI 子命令**（P0-3）：先补 `reload` / `status` / `verify` 三个，对齐脚本化运维。
+3. **代理 CRUD API**（P0-4）：为 frpc 加 `GET/PUT /api/config` + Store CRUD。
+4. **use_compression**（P1-6）：字段已就绪，接入 snappy/zstd 成本低，可与 `use_encryption` 对称实现。
+5. **优雅关闭**（P1-11）：SIGINT 改走连接排水 + 超时兜底，替换 `exit(0)`。
+6. **OIDC / QUIC / tcpmux / sudp**（P1）：按业务是否需要企业 SSO、弱网、端口复用再排期。
+
+**不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关——这些是原版的「生态扩展」，除非有明确场景，否则投入产出比低。
+
+---
+
+## 附：本次对照同步的文档修正
+
+- `README.md` 功能实现状态表：新增「应用层加密 ✅」「应用层压缩 🚧」「tcpmux 代理 🚧」「sudp 代理 ❌」四行。
+- `README.md` 安全说明表：原「应用层加密 **不支持**」为过时描述（该功能已于 `5d91934` 落地），已改为 **✅ 已实现（AES-256-GCM，仅加密不认证）**。
