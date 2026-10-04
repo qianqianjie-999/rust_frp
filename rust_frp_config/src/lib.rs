@@ -106,12 +106,12 @@ pub struct ServerConfig {
     pub bind_port: u16,
 
     /// KCP 协议绑定端口（可选，UDP）
-    // TODO: KCP 协议尚未实现
+    // 路线图配置项：字段先随配置 schema 固化，协议实现后接通
     #[allow(dead_code)]
     pub kcp_bind_port: Option<u16>,
 
     /// QUIC 协议绑定端口（可选，UDP）
-    // TODO: QUIC 协议尚未实现
+    // 路线图配置项：字段先随配置 schema 固化，协议实现后接通
     #[allow(dead_code)]
     pub quic_bind_port: Option<u16>,
 

@@ -396,6 +396,7 @@ impl Plugin for StaticFilePlugin {
 }
 
 /// HTTP 代理插件
+// 功能脚手架：http_user/http_password 尚未在 handle 流程消费（插件级认证待实现）
 #[allow(dead_code)]
 pub struct HttpProxyPlugin {
     http_user: Option<String>,
@@ -466,6 +467,7 @@ impl Plugin for HttpProxyPlugin {
 }
 
 /// SOCKS5 代理插件
+// 功能脚手架：username/password 尚未在 handle 流程消费（插件级认证待实现）
 #[allow(dead_code)]
 pub struct Socks5Plugin {
     username: Option<String>,

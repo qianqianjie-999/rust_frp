@@ -276,6 +276,8 @@ impl AuthVerifier for TokenAuthVerifier {
 /// client_secret = "secret"
 /// token_endpoint_url = "https://issuer.example.com/token"
 /// ```
+// 功能脚手架：OIDC 校验器字段尚未被 token 校验流程完整消费（需对接真实 issuer），
+// 结构保留以便后续扩展，引用点见 AuthManager::new 的 oidc 分支
 #[allow(dead_code)]
 pub struct OidcAuthVerifier {
     /// OIDC 发行者 URL

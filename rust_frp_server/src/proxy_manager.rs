@@ -183,6 +183,15 @@ impl GroupRegistry {
     }
 }
 
+/// TCP 访客桥接依赖集合（accept 循环按连接克隆，字段均为 Arc 廉价拷贝）
+pub(crate) struct TcpVisitorDeps {
+    pub proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub control_manager: Arc<ControlManager>,
+    pub work_conn_manager: Arc<ServerWorkConnManager>,
+    pub plugin_config: Option<rust_frp_config::PluginConfig>,
+    pub group_registry: Arc<GroupRegistry>,
+}
+
 pub struct ServerProxyManager {
     pub(crate) proxies: RwLock<std::collections::HashMap<String, rust_frp_config::ProxyConfig>>,
     listeners: ListenerMap,
@@ -342,21 +351,19 @@ impl ServerProxyManager {
                             );
 
                             let proxy_name_clone = proxy_name.clone();
-                            let proxy_owners = proxy_owners.clone();
-                            let control_manager = control_manager.clone();
-                            let work_conn_manager = work_conn_manager.clone();
-                            let plugin_config = plugin_config.clone();
-                            let group_registry = group_registry.clone();
+                            let deps = TcpVisitorDeps {
+                                proxy_owners: proxy_owners.clone(),
+                                control_manager: control_manager.clone(),
+                                work_conn_manager: work_conn_manager.clone(),
+                                plugin_config: plugin_config.clone(),
+                                group_registry: group_registry.clone(),
+                            };
                             tokio::spawn(ServerProxyManager::serve_tcp_visitor(
                                 proxy_name_clone,
                                 group_port,
                                 visitor_conn,
                                 visitor_addr,
-                                proxy_owners,
-                                control_manager,
-                                work_conn_manager,
-                                plugin_config,
-                                group_registry,
+                                deps,
                             ));
                         }
                         Err(e) => {
@@ -552,18 +559,20 @@ impl ServerProxyManager {
     }
 
     /// 处理单个 TCP 访客连接：分组分发 / 插件处理 / 工作连接桥接（由 accept 循环 spawn）
-    #[allow(clippy::too_many_arguments)]
     async fn serve_tcp_visitor(
         proxy_name_clone: String,
         group_port: Option<u16>,
         visitor_conn: tokio::net::TcpStream,
         visitor_addr: SocketAddr,
-        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        control_manager: Arc<ControlManager>,
-        work_conn_manager: Arc<ServerWorkConnManager>,
-        plugin_config: Option<rust_frp_config::PluginConfig>,
-        group_registry: Arc<GroupRegistry>,
+        deps: TcpVisitorDeps,
     ) {
+        let TcpVisitorDeps {
+            proxy_owners,
+            control_manager,
+            work_conn_manager,
+            plugin_config,
+            group_registry,
+        } = deps;
         log::debug!("开始处理外部连接: proxy={}", proxy_name_clone);
 
         // 负载均衡分组：round-robin 选取实际处理连接的成员
