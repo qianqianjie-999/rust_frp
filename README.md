@@ -36,9 +36,10 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | TLS 加密 | ✅ | 使用 rustls，无需 OpenSSL |
 | WebSocket | ✅ | 完整实现，支持 HTTP Upgrade |
 | UDP 代理 | ✅ | 完整实现 |
-| STCP (安全 TCP) | ⚠️ | 服务端中转可用，但**仅限同一客户端自身访问**；`secret_key` 访问密钥尚未生效，跨客户端访问被拒绝 |
-| XTCP (P2P TCP) | ⚠️ | NAT 穿透打洞 + STCP 回退可用，同样受上述限制 |
+| STCP (安全 TCP) | ✅ | `secret_key` HMAC-SHA256 签名校验（常量时间比较 + 120s 防重放），支持跨客户端访问 |
+| XTCP (P2P TCP) | ✅ | NAT 穿透打洞 + STCP 回退可用，鉴权规则与 STCP 一致 |
 | KCP 协议 | ✅ | 完整实现 |
+| QUIC 协议 | 🚧 | **未实现**（路线图项），配置字段 `quic_bind_port` 已预留但无效果 |
 | OIDC 认证 | ✅ | 支持 HS256 JWT 验证 |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
@@ -58,7 +59,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | Dashboard 凭据 | `web_server.user/password` 必须成对配置且非空，否则服务端拒绝启动；未配置则鉴权关闭并告警 | 用强密码，只监听 `127.0.0.1` 并前置 Nginx 提供 HTTPS |
 | 会话机制 | 随机会话令牌 + 服务端存储 + 8 小时过期 + `HttpOnly; SameSite=Strict` | 反向代理声明 `X-Forwarded-Proto: https` 时会自动附加 `Secure` |
 | 配置文件 | `frpc.toml` / `frps.toml` 已被 `.gitignore` 忽略，仅提供 `*.example.toml` | 不要把含 token/密码的配置提交进版本库 |
-| STCP/XTCP | `secret_key` 尚未实现校验，跨客户端访问被拒绝 | 需要跨客户端安全访问时暂请改用其他方案 |
+| STCP/XTCP 访问鉴权 | 已实现 `secret_key` 签名校验（fail-closed：代理未配 `secret_key` 时拒绝一切访问请求）；支持跨客户端访问 | 代理与访问者配置一致的强 `secret_key` |
 
 ---
 
@@ -948,8 +949,8 @@ process_work_conn          get_work_conn (访客到达时)
 
 ---
 
-**文档版本**：v2.1
-**更新日期**：2026-06-24
+**文档版本**：v2.3
+**更新日期**：2026-10-04
 
 ---
 
