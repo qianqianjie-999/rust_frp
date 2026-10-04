@@ -82,7 +82,16 @@
 //! remote_port = 6000
 //! ```
 
-use axum::{extract::State, routing::get, Json, Router};
+pub mod admin_client;
+
+use axum::{
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use rust_frp_auth::AuthManager;
 use rust_frp_config::ClientConfig;
 use rust_frp_core::{ControlConn, Message, NewWorkConnMsg, ProxyManager, VisitorManager};
@@ -1633,9 +1642,21 @@ async fn handle_stcp_visitor_conn(
     Ok(())
 }
 
-/// Web 服务器
+/// Web 服务器（frpc 管理 API）
+///
+/// 路由：
+/// - `GET  /health`   存活探针
+/// - `GET  /proxies`  代理配置列表
+/// - `GET  /visitors` 访客配置列表
+/// - `GET  /status`   代理/访客运行状态（`frpc status` 使用）
+/// - `POST /reload`   触发配置热重载（`frpc reload` 使用）
+///
+/// 配置了 `webServer.user` + `webServer.password` 时全部端点要求
+/// Basic 认证（常量时间比较）；未配置则保持开放（向后兼容）。
 pub struct WebServer {
     addr: SocketAddr,
+    /// Basic 认证凭据（user, password），None 表示不启用
+    auth: Option<(String, String)>,
     server: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -1644,6 +1665,8 @@ pub struct WebServer {
 struct WebServerState {
     proxy_manager: Arc<ClientProxyManager>,
     visitor_manager: Arc<ClientVisitorManager>,
+    /// reload 端点通过该 Notify 通知 Client 主循环执行 reload_config
+    reload_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WebServer {
@@ -1651,20 +1674,38 @@ impl WebServer {
         config: &rust_frp_config::WebServerConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = format!("{}:{}", config.addr, config.port).parse::<SocketAddr>()?;
-        Ok(Self { addr, server: None })
+        // user/password 必须成对配置才启用 Basic 认证；只配一个视为未配置
+        let auth = match (config.user.as_deref(), config.password.as_deref()) {
+            (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
+                Some((u.to_string(), p.to_string()))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            addr,
+            auth,
+            server: None,
+        })
     }
 
     pub async fn start(&mut self, client: &Client) -> Result<(), Box<dyn std::error::Error>> {
         let state = Arc::new(WebServerState {
             proxy_manager: client.proxy_manager.clone(),
             visitor_manager: client.visitor_manager.clone(),
+            reload_notify: client.reload_notify.clone(),
         });
 
+        let auth = self.auth.clone();
         let app = Router::new()
             .route("/health", get(health_handler))
             .route("/proxies", get(proxies_handler))
             .route("/visitors", get(visitors_handler))
-            .with_state(state);
+            .route("/status", get(status_handler))
+            .route("/reload", post(reload_handler))
+            .with_state(state)
+            .layer(middleware::from_fn(move |req, next| {
+                basic_auth_middleware(req, next, auth.clone())
+            }));
 
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
         let handle = tokio::spawn(async move {
@@ -1676,6 +1717,47 @@ impl WebServer {
 
         Ok(())
     }
+}
+
+/// Basic 认证中间件：未配置凭据直接放行；配置后校验（常量时间比较）
+async fn basic_auth_middleware(
+    req: Request,
+    next: Next,
+    expected: Option<(String, String)>,
+) -> Response {
+    let Some((user, password)) = expected else {
+        return next.run(req).await;
+    };
+
+    let authorized = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_basic_credentials)
+        .map(|(u, p)| {
+            rust_frp_auth::constant_time_compare(u.as_bytes(), user.as_bytes())
+                && rust_frp_auth::constant_time_compare(p.as_bytes(), password.as_bytes())
+        })
+        .unwrap_or(false);
+
+    if authorized {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [("WWW-Authenticate", "Basic realm=\"frpc admin\"")],
+        )
+            .into_response()
+    }
+}
+
+/// 解析 `Authorization: Basic <base64(user:password)>` 头
+fn parse_basic_credentials(value: &str) -> Option<(String, String)> {
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = base64::decode(encoded).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (user, password) = decoded.split_once(':')?;
+    Some((user.to_string(), password.to_string()))
 }
 
 async fn health_handler() -> Json<serde_json::Value> {
@@ -1697,6 +1779,55 @@ async fn visitors_handler(
 ) -> Json<Vec<rust_frp_config::VisitorConfig>> {
     let visitors = state.visitor_manager.visitors.read().await;
     Json(visitors.values().cloned().collect())
+}
+
+/// `GET /status`：代理/访客运行状态（对齐 frp 原版 `frpc status` 的语义）
+async fn status_handler(State(state): State<Arc<WebServerState>>) -> Json<serde_json::Value> {
+    let proxies = state.proxy_manager.proxies.read().await;
+    let proxy_list: Vec<serde_json::Value> = proxies
+        .values()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "type": p.r#type,
+                "status": "running",
+                "local_port": p.local_port,
+                "remote_port": p.remote_port,
+            })
+        })
+        .collect();
+    drop(proxies);
+
+    let visitors = state.visitor_manager.visitors.read().await;
+    let visitor_list: Vec<serde_json::Value> = visitors
+        .values()
+        .map(|v| {
+            serde_json::json!({
+                "name": v.name,
+                "type": v.r#type,
+                "server_name": v.server_name,
+                "status": "running",
+            })
+        })
+        .collect();
+    drop(visitors);
+
+    Json(serde_json::json!({
+        "proxies": proxy_list,
+        "visitors": visitor_list,
+    }))
+}
+
+/// `POST /reload`：通知 Client 主循环重读配置并重新注册代理/访客。
+///
+/// 通知是异步投递（Notify 许可位语义），端点返回时 reload 尚未完成，
+/// 与 frp 原版同步等待 reload 结束的语义略有差异。
+async fn reload_handler(State(state): State<Arc<WebServerState>>) -> Json<serde_json::Value> {
+    state.reload_notify.notify_one();
+    Json(serde_json::json!({
+        "msg": "reload signal sent",
+        "code": 200,
+    }))
 }
 
 /// 健康检查器
@@ -1855,6 +1986,8 @@ pub struct Client {
     work_conn_manager: Arc<WorkConnManager>,
     connector: Connector,
     web_server: Option<WebServer>,
+    /// 管理端 POST /reload 经由此通知主循环执行 reload_config
+    reload_notify: Arc<tokio::sync::Notify>,
     config_path: Option<String>,
     health_check_handles: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -1903,6 +2036,7 @@ impl Client {
             work_conn_manager,
             connector,
             web_server,
+            reload_notify: Arc::new(tokio::sync::Notify::new()),
             config_path,
             health_check_handles: Vec::new(),
         })
@@ -1920,10 +2054,57 @@ impl Client {
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
+        // 配置文件变更触发热重载（与管理端 /reload、SIGHUP 共用通知通道）
+        if let Some(watch_path) = self.config_path.clone() {
+            let reload_notify = Arc::clone(&self.reload_notify);
+            tokio::spawn(async move {
+                use notify::{Event, EventKind, RecursiveMode, Watcher};
+                let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1);
+                let mut watcher =
+                    match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                        if let Ok(event) = res {
+                            if matches!(event.kind, EventKind::Modify(_)) {
+                                let _ = watch_tx.blocking_send(());
+                            }
+                        }
+                    }) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            log::warn!("Failed to create file watcher: {}", e);
+                            return;
+                        }
+                    };
+
+                if let Err(e) = watcher.watch(
+                    std::path::Path::new(&watch_path),
+                    RecursiveMode::NonRecursive,
+                ) {
+                    log::warn!("Failed to watch config file {}: {}", watch_path, e);
+                    return;
+                }
+                log::info!("Watching config file for changes: {}", watch_path);
+
+                loop {
+                    if watch_rx.recv().await.is_none() {
+                        break;
+                    }
+                    // 500ms 防抖：编辑器保存常产生多次 Modify 事件
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    log::info!("Config file changed, triggering config reload...");
+                    reload_notify.notify_one();
+                }
+            });
+        }
 
         // 重连配置：首次断线立即重连（0ms），失败后 1s 起步指数退避，封顶 30s
         let mut reconnect_delay_ms: u64 = 0;
         let max_reconnect_delay_ms: u64 = 30_000;
+
+        // 热重载通知：管理端 POST /reload、SIGHUP、配置文件变更共用同一通道
+        let reload_notify = Arc::clone(&self.reload_notify);
+        let mut reload_requested = false;
 
         log::info!("Client started, entering main loop with auto-reconnect...");
 
@@ -2005,6 +2186,14 @@ impl Client {
                 } => {
                     // 连接断开
                 }
+                // 热重载（管理端 /reload、SIGHUP、配置文件变更）
+                _ = reload_notify.notified() => {
+                    reload_requested = true;
+                }
+                _ = sighup.recv() => {
+                    log::info!("Received SIGHUP, triggering config reload...");
+                    reload_requested = true;
+                }
                 // 信号处理
                 _ = sigint.recv() => {
                     log::info!("Received SIGINT, shutting down gracefully...");
@@ -2018,29 +2207,39 @@ impl Client {
                 }
             }
 
-            // 重连逻辑：登录失败与连接断开一致，均按退避重试（不退出进程），
-            // 避免服务端暂时不可达时 frpc 直接死亡（信号分支自行 break）
-            // jitter 与 frp 原版一致：在退避延迟上叠加 0~10% 随机量，
-            // 防止服务端恢复时所有客户端同时涌入（惊群）
-            let sleep_ms = if reconnect_delay_ms == 0 {
-                0
+            if reload_requested {
+                reload_requested = false;
+                log::info!("Reloading config...");
+                // reload_config 会重读配置并重新 add 代理/访客；随后走下方的
+                // clear 重连路径按新配置整体重新注册，保证已删除的代理被下线
+                if let Err(e) = self.reload_config().await {
+                    log::error!("Reload config failed: {}", e);
+                }
             } else {
-                let jitter = (reconnect_delay_ms as f64 * rand::random::<f64>() * 0.1) as u64;
-                reconnect_delay_ms + jitter
-            };
-            log::warn!(
-                "Connection lost, attempting to reconnect in {} ms...",
-                sleep_ms
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
+                // 重连逻辑：登录失败与连接断开一致，均按退避重试（不退出进程），
+                // 避免服务端暂时不可达时 frpc 直接死亡（信号分支自行 break）
+                // jitter 与 frp 原版一致：在退避延迟上叠加 0~10% 随机量，
+                // 防止服务端恢复时所有客户端同时涌入（惊群）
+                let sleep_ms = if reconnect_delay_ms == 0 {
+                    0
+                } else {
+                    let jitter = (reconnect_delay_ms as f64 * rand::random::<f64>() * 0.1) as u64;
+                    reconnect_delay_ms + jitter
+                };
+                log::warn!(
+                    "Connection lost, attempting to reconnect in {} ms...",
+                    sleep_ms
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
 
-            // 下次延迟：首次(0)后从 1s 起步翻倍，封顶 30s
-            // （修复原实现 0*2=0 导致退避永不生效的问题）
-            reconnect_delay_ms = if reconnect_delay_ms == 0 {
-                1_000
-            } else {
-                (reconnect_delay_ms * 2).min(max_reconnect_delay_ms)
-            };
+                // 下次延迟：首次(0)后从 1s 起步翻倍，封顶 30s
+                // （修复原实现 0*2=0 导致退避永不生效的问题）
+                reconnect_delay_ms = if reconnect_delay_ms == 0 {
+                    1_000
+                } else {
+                    (reconnect_delay_ms * 2).min(max_reconnect_delay_ms)
+                };
+            }
 
             // 重置代理管理器状态
             self.proxy_manager.clear().await;
@@ -2284,6 +2483,11 @@ impl Client {
         }
     }
 
+    /// 外部触发一次配置热重载（SIGHUP/配置文件监听与管理端 /reload 共用通道）
+    pub fn notify_reload(&self) {
+        self.reload_notify.notify_one();
+    }
+
     pub async fn reload_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(config_path) = &self.config_path {
             let new_config = rust_frp_config::ConfigLoader::load_client_config(config_path)?;
@@ -2495,5 +2699,202 @@ mod client_manager_tests {
         assert_eq!(shared.server_addr, cfg.server_addr);
         assert_eq!(shared.server_port, cfg.server_port);
         assert_eq!(Arc::strong_count(&cfg), 2);
+    }
+}
+
+#[cfg(test)]
+mod web_admin_tests {
+    use super::*;
+    use axum::body::Body;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<WebServerState> {
+        Arc::new(WebServerState {
+            proxy_manager: Arc::new(ClientProxyManager::new()),
+            visitor_manager: Arc::new(ClientVisitorManager::new()),
+            reload_notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    fn app_with_auth(auth: Option<(String, String)>) -> Router {
+        let state = test_state();
+        Router::new()
+            .route("/status", get(status_handler))
+            .route("/reload", post(reload_handler))
+            .with_state(state)
+            .layer(middleware::from_fn(move |req, next| {
+                let auth = auth.clone();
+                basic_auth_middleware(req, next, auth)
+            }))
+    }
+
+    fn auth_header(user: &str, pass: &str) -> String {
+        format!("Basic {}", base64::encode(format!("{user}:{pass}")))
+    }
+
+    #[tokio::test]
+    async fn test_admin_api_open_when_no_auth_configured() {
+        let app = app_with_auth(None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_admin_api_rejects_missing_or_wrong_credentials() {
+        let app = app_with_auth(Some(("admin".into(), "secret".into())));
+
+        // 无凭据 → 401
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // 密码错误 → 401
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header(header::AUTHORIZATION, auth_header("admin", "wrong"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // 用户名错误 → 401
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header(header::AUTHORIZATION, auth_header("nope", "secret"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn test_admin_api_accepts_correct_credentials() {
+        let app = app_with_auth(Some(("admin".into(), "secret".into())));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header(header::AUTHORIZATION, auth_header("admin", "secret"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_reload_handler_signals_waiter() {
+        let state = test_state();
+        let notify = state.reload_notify.clone();
+        let app = Router::new()
+            .route("/reload", post(reload_handler))
+            .with_state(state);
+
+        let waiter = tokio::spawn(async move { notify.notified().await });
+        tokio::task::yield_now().await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("reload notify should reach the waiter")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_status_handler_lists_proxies_and_visitors() {
+        let mut mgr = ClientProxyManager::new();
+        mgr.set_work_conn_manager(Arc::new(WorkConnManager::new()));
+        let state = Arc::new(WebServerState {
+            proxy_manager: Arc::new(mgr),
+            visitor_manager: Arc::new(ClientVisitorManager::new()),
+            reload_notify: Arc::new(tokio::sync::Notify::new()),
+        });
+        state
+            .proxy_manager
+            .add_proxy(rust_frp_config::ProxyConfig {
+                name: "ssh".to_string(),
+                r#type: "tcp".to_string(),
+                local_ip: "127.0.0.1".to_string(),
+                local_port: 0,
+                remote_port: Some(6000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/status", get(status_handler))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["proxies"][0]["name"], "ssh");
+        assert_eq!(json["proxies"][0]["status"], "running");
+        assert_eq!(json["proxies"][0]["remote_port"], 6000);
+        assert_eq!(json["visitors"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_parse_basic_credentials() {
+        let encoded = base64::encode("user:pass");
+        assert_eq!(
+            parse_basic_credentials(&format!("Basic {encoded}")),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+        assert_eq!(parse_basic_credentials("Bearer xyz"), None);
+        assert_eq!(parse_basic_credentials("Basic !!!not-base64"), None);
+        // 无冒号分隔的解码结果
+        assert_eq!(
+            parse_basic_credentials(&format!("Basic {}", base64::encode("nocolon"))),
+            None
+        );
     }
 }

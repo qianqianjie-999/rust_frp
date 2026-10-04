@@ -89,7 +89,7 @@ pub enum AuthError {
 ///
 /// - `true`: 两个切片相等
 /// - `false`: 长度不同或不相等
-fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
