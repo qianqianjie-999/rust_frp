@@ -716,6 +716,14 @@ pub struct ProxyConfig {
     ///
     /// 加入组时校验，与已有成员不匹配则拒绝注册（防止误入他人分组）。
     pub group_key: Option<String>,
+
+    /// 应用层加密：对该代理的工作连接流量启用 AES-256-GCM 加密
+    ///
+    /// 密钥由 token 派生（SHA-256），两端需配置一致；只加密不认证，
+    /// 防被动嗅探不防中间人（需要身份认证请叠加 TLS）。
+    /// 客户端未配置 token 时启用此选项会导致代理启动失败（fail-closed）。
+    #[serde(default)]
+    pub use_encryption: bool,
 }
 
 /// 访问者配置 - 定义如何访问其他客户端的 STCP/XTCP 服务
@@ -758,6 +766,10 @@ pub struct VisitorConfig {
 
     /// 传输层配置（可选）
     pub transport: Option<TransportConfig>,
+
+    /// 应用层加密：需与对端代理的 use_encryption 配置一致
+    #[serde(default)]
+    pub use_encryption: bool,
 }
 
 /// 健康检查配置 - 定义代理健康检查规则

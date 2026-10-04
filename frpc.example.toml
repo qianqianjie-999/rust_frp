@@ -53,6 +53,17 @@ local_port = 22
 remote_port = 9302
 bandwidth_limit = "1MB"
 
+# 应用层加密代理（use_encryption）：工作连接流量 AES-256-GCM 加密，
+# 密钥由 token 派生；适合未开 TLS 或 KCP 传输场景。只加密不认证，
+# 防被动嗅探不防中间人；已启用 TLS 时无需重复开启。
+[[proxies]]
+name = "tcp_encrypted"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 5432
+remote_port = 9303
+use_encryption = true
+
 # 带健康检查的 TCP 代理
 [[proxies]]
 name = "tcp_app"

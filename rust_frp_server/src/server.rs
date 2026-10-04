@@ -601,6 +601,33 @@ impl Server {
                     }
                 }
 
+                // 应用层加密（fail-closed）：客户端请求加密但服务端未配 token 时拒绝；
+                // 包装在验签后、入池/桥接前，池与 STCP 桥接路径自动获得加密能力
+                let conn: AnyConn = if work_msg.use_encryption {
+                    match auth_manager.encryption_key() {
+                        Some(key) => {
+                            Box::new(rust_frp_net::crypto::EncryptedStream::new(conn, key)?)
+                        }
+                        None => {
+                            log::error!(
+                                "Rejecting encrypted work conn for proxy {}: server has no token configured",
+                                work_msg.proxy_name
+                            );
+                            let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
+                                error: "Server cannot derive encryption key (no token)".to_string(),
+                                src_addr: String::new(),
+                                src_port: 0,
+                                dst_addr: String::new(),
+                                dst_port: 0,
+                            });
+                            write_message_with_timeout(&mut conn, &resp).await?;
+                            return Err("use_encryption requested but server has no token".into());
+                        }
+                    }
+                } else {
+                    conn
+                };
+
                 // 不再立即发送 StartWorkConn，连接放入池中等待访客取用
                 // 检查是否是 STCP 桥接工作连接（用 proxy_name 作为 bridge_id）
                 match stcp_bridge_manager
