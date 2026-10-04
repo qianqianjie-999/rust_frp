@@ -657,7 +657,7 @@ pub struct PortRange {
 /// # 字段说明
 ///
 /// - `name`: 代理唯一名称
-/// - `type`: 代理类型 (tcp/udp/http/https/websocket/stcp/xtcp)
+/// - `type`: 代理类型 (tcp/udp/http/https/websocket/stcp/xtcp/tcpmux/sudp)
 /// - `local_ip`: 本地服务 IP
 /// - `local_port`: 本地服务端口
 /// - `remote_port`: 远程映射端口（TCP/UDP/WebSocket 必需，stcp/xtcp 不需要）
@@ -677,8 +677,11 @@ pub struct ProxyConfig {
     /// - `udp`: UDP 代理
     /// - `http`: HTTP 代理
     /// - `https`: HTTPS 代理
+    /// - `websocket`: WebSocket 代理
     /// - `stcp`: 秘密 TCP（需要访问密钥）
     /// - `xtcp`: P2P TCP
+    /// - `tcpmux`: HTTP CONNECT 复用的 TCP 代理（按域名路由）
+    /// - `sudp`: 秘密 UDP（经 STCP 隧道承载 UDP，需要访问密钥）
     #[serde(rename = "type")]
     pub r#type: String,
 
@@ -812,6 +815,26 @@ pub struct ProxyConfig {
     /// 与 `use_encryption` 可叠加，顺序固定为「先压缩、后加密」。
     #[serde(default, alias = "useCompression")]
     pub use_compression: bool,
+
+    /// tcpmux 复用器类型（仅 `type = "tcpmux"` 使用）
+    ///
+    /// 目前仅支持 `"httpconnect"`（缺省即 httpconnect）。服务器据此在
+    /// `tcpmux_http_connect_port` 上解析 HTTP CONNECT 请求并按域名路由。
+    #[serde(alias = "multiplexer")]
+    pub multiplexer: Option<String>,
+
+    /// 按 HTTP 用户路由（仅 tcpmux，可选）
+    ///
+    /// 设置后仅当 CONNECT 请求的 `Proxy-Authorization` 用户名为该值时
+    /// 才匹配本代理，用于同一域名下按用户区分多个 tcpmux 代理。
+    #[serde(alias = "routeByHTTPUser")]
+    pub route_by_http_user: Option<String>,
+
+    /// 允许访问的客户端用户列表（stcp/xtcp/sudp 代理，可选）
+    ///
+    /// 为空表示不限；非空时仅列表中用户的访问者可以连接本代理。
+    #[serde(alias = "allowUsers")]
+    pub allow_users: Option<Vec<String>>,
 }
 
 /// 访问者配置 - 定义如何访问其他客户端的 STCP/XTCP 服务
@@ -1508,6 +1531,35 @@ impl ConfigLoader {
                     &format!("proxies[name={}].bandwidth_limit", proxy.name),
                 )?;
             }
+
+            // tcpmux：仅支持 httpconnect 复用器，且必须配置域名（服务器按域名路由）
+            if proxy.r#type == "tcpmux" {
+                if let Some(multiplexer) = proxy.multiplexer.as_deref() {
+                    if !multiplexer.is_empty() && multiplexer != "httpconnect" {
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "proxies[name={}].multiplexer [{}] is not supported (only \"httpconnect\")",
+                                proxy.name, multiplexer
+                            ),
+                        )));
+                    }
+                }
+                let has_domain = proxy
+                    .custom_domains
+                    .as_ref()
+                    .is_some_and(|domains| domains.iter().any(|d| !d.is_empty()))
+                    || proxy.subdomain.as_deref().is_some_and(|s| !s.is_empty());
+                if !has_domain {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "proxies[name={}] is a tcpmux proxy and requires custom_domains or subdomain",
+                            proxy.name
+                        ),
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -1570,6 +1622,51 @@ single = 8080
             ConfigLoader::parse_config::<ServerConfig>(json_str, ConfigKind::Server).unwrap();
         assert_eq!(config.bind_port, 9300);
         assert_eq!(config.allow_ports.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_tcpmux_and_sudp_proxy_fields() {
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[[proxies]]
+name = "mux"
+type = "tcpmux"
+custom_domains = ["mux.example.com"]
+multiplexer = "httpconnect"
+routeByHTTPUser = "alice"
+httpUser = "alice"
+httpPassword = "pw"
+allowUsers = ["alice", "bob"]
+useCompression = true
+
+[[visitors]]
+name = "visit-udp"
+type = "sudp"
+server_name = "udp-svc"
+bind_addr = "127.0.0.1"
+bind_port = 5353
+secret_key = "s3cret"
+useCompression = true
+"#;
+        let config: ClientConfig =
+            ConfigLoader::parse_config::<ClientConfig>(toml_str, ConfigKind::Client).unwrap();
+
+        let proxy = &config.proxies[0];
+        assert_eq!(proxy.r#type, "tcpmux");
+        assert_eq!(proxy.multiplexer.as_deref(), Some("httpconnect"));
+        assert_eq!(proxy.route_by_http_user.as_deref(), Some("alice"));
+        assert_eq!(
+            proxy.allow_users.as_deref(),
+            Some(["alice".to_string(), "bob".to_string()].as_slice())
+        );
+        assert!(proxy.use_compression);
+
+        let visitor = &config.visitors[0];
+        assert_eq!(visitor.r#type, "sudp");
+        assert_eq!(visitor.secret_key.as_deref(), Some("s3cret"));
+        assert!(visitor.use_compression);
     }
 
     #[test]

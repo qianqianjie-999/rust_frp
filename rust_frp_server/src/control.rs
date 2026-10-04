@@ -396,7 +396,7 @@ impl Control {
                         }
                         _ => {
                             log::warn!(
-                                "stcp/xtcp proxy {} has no secret_key configured; visitor access will be rejected",
+                                "stcp/xtcp/sudp proxy {} has no secret_key configured; visitor access will be rejected",
                                 proxy_name
                             );
                         }

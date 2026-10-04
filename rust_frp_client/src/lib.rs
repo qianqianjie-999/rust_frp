@@ -446,7 +446,9 @@ impl ClientProxyManager {
         config: &rust_frp_config::ProxyConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match config.r#type.as_str() {
-            "tcp" | "http" | "https" | "websocket" => {
+            // tcpmux 与 tcp 同构：客户端不绑定端口，服务器在 tcpmux 复用端口
+            // 上按域名路由后为每个 CONNECT 申请一条工作连接
+            "tcp" | "http" | "https" | "websocket" | "tcpmux" => {
                 let local_addr =
                     format!("{}:{}", config.local_ip, config.local_port).parse::<SocketAddr>()?;
                 log::info!(
@@ -1135,6 +1137,134 @@ fn derive_encryption_key(token: &str) -> Vec<u8> {
     hasher.finish().as_ref().to_vec()
 }
 
+/// 工作连接建立参数（收敛参数列表，避免长参数签名）
+struct WorkConnRequest<'a> {
+    proxy_name: &'a str,
+    run_id: &'a str,
+    work_conn_tls: bool,
+    /// `Some` 时经 tcp_mux 会话流建立（协议与直连工作端口一致）
+    mux_session: Option<&'a Arc<MuxSession>>,
+    use_encryption: bool,
+    use_compression: bool,
+}
+
+/// 打开工作连接并完成握手后的结果
+///
+/// 元组为 `(连接, 服务器观测到的访问者 IP, 访问者端口)`；后两项供
+/// PROXY protocol v1 头使用。
+type OpenedWorkConn = (Box<dyn rust_frp_net::FrpConn>, String, u16);
+
+/// 打开一条到服务端的工作连接并完成 `NewWorkConn`/`StartWorkConn` 握手
+///
+/// 返回的连接在需要时已按固定顺序包装：**先压缩（内层）、后加密（外层）**，
+/// 与服务器 [`rust_frp_server`] 及对端客户端保持一致。直连与 tcp_mux 两条
+/// 路径共用本函数（握手消息明文，包装在握手之后）。
+async fn open_work_conn(
+    config: &ClientConfig,
+    req: WorkConnRequest<'_>,
+) -> Result<OpenedWorkConn, Box<dyn std::error::Error + Send + Sync>> {
+    let WorkConnRequest {
+        proxy_name,
+        run_id,
+        work_conn_tls,
+        mux_session,
+        use_encryption,
+        use_compression,
+    } = req;
+
+    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if let Some(session) = mux_session {
+        // tcp_mux：工作连接 = 会话流（服务端分发循环经 process_work_conn 处理，
+        // 协议与直连工作端口完全一致）
+        let stream = session
+            .open_stream()
+            .await
+            .map_err(|e| format!("mux open work stream failed: {}", e))?;
+        log::info!("Mux work stream established for proxy: {}", proxy_name);
+        stream
+    } else {
+        // 直连工作端口路径
+        let work_addr = format!("{}:{}", config.server_addr, work_conn_port_of(config));
+        let tcp_conn = tokio::net::TcpStream::connect(&work_addr).await?;
+        log::info!(
+            "Connected to server work conn port: {} (proxy {})",
+            work_addr,
+            proxy_name
+        );
+
+        // 服务器协商要求 TLS 时，工作连接套 TLS（复用控制连接的客户端 TLS 配置）
+        if work_conn_tls {
+            let tls_config = build_client_tls_config(config)
+                .map_err(|e| format!("failed to build client TLS config: {}", e))?
+                .ok_or("server requires TLS work conn but client tls is disabled")?;
+            let tls_stream = tls_config
+                .connect(&config.server_addr, tcp_conn)
+                .await
+                .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
+            log::info!("Work conn TLS established for proxy: {}", proxy_name);
+            Box::new(tls_stream)
+        } else {
+            Box::new(tcp_conn)
+        }
+    };
+
+    // 生成 sign_key
+    let sign_key = config
+        .auth
+        .token
+        .as_ref()
+        .map(|token| generate_work_conn_sign_key(token, run_id))
+        .unwrap_or_default();
+
+    // 发送 NewWorkConn 消息
+    let new_work_conn_msg = NewWorkConnMsg {
+        run_id: run_id.to_string(),
+        proxy_name: proxy_name.to_string(),
+        timestamp: get_timestamp(),
+        sign_key,
+        use_encryption,
+        use_compression,
+    };
+    rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
+
+    // 等待 StartWorkConn 响应
+    let (src_addr, src_port) = match rust_frp_core::read_message(&mut work_conn).await? {
+        Message::StartWorkConn(start_msg) => {
+            if !start_msg.error.is_empty() {
+                return Err(format!("Server error: {}", start_msg.error).into());
+            }
+            log::info!("Work conn established for proxy: {}", proxy_name);
+            (start_msg.src_addr, start_msg.src_port)
+        }
+        _ => {
+            return Err("Unexpected response from server".into());
+        }
+    };
+
+    // 应用层压缩与加密：握手完成后按固定顺序包装 —— 先压缩（内层）、后加密（外层）
+    if use_compression {
+        work_conn = Box::new(rust_frp_net::compress::CompressedStream::new(work_conn));
+        log::info!(
+            "Work conn application-layer compression (snappy) enabled for proxy: {}",
+            proxy_name
+        );
+    }
+    if use_encryption {
+        let token = config
+            .auth
+            .token
+            .as_deref()
+            .ok_or("use_encryption requires a configured token")?;
+        let key = derive_encryption_key(token);
+        work_conn = Box::new(rust_frp_net::crypto::EncryptedStream::new(work_conn, &key)?);
+        log::info!(
+            "Work conn application-layer encryption (AES-256-GCM) enabled for proxy: {}",
+            proxy_name
+        );
+    }
+
+    Ok((work_conn, src_addr, src_port))
+}
+
 /// 建立工作连接（独立函数，供 ClientControl::run 调用）
 ///
 /// - 多路复用：tcp_mux 会话存在时直接打开会话流（无需新建 TCP，TLS 在会话层）
@@ -1165,89 +1295,23 @@ async fn establish_work_connection(
         .into());
     }
 
-    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if let Some(session) = mux_session {
-        // tcp_mux：工作连接 = 会话流（服务端分发循环经 process_work_conn 处理，
-        // 协议与直连工作端口完全一致）
-        let stream = session
-            .open_stream()
-            .await
-            .map_err(|e| format!("mux open work stream failed: {}", e))?;
-        log::info!("Mux work stream established for proxy: {}", proxy_name);
-        stream
-    } else {
-        // 直连工作端口路径
-        let work_port = work_conn_port_of(config);
-        let work_addr = format!("{}:{}", config.server_addr, work_port);
+    let (work_conn, src_addr, src_port) = open_work_conn(
+        config,
+        WorkConnRequest {
+            proxy_name,
+            run_id,
+            work_conn_tls,
+            mux_session,
+            use_encryption,
+            use_compression,
+        },
+    )
+    .await?;
 
-        let work_conn = tokio::net::TcpStream::connect(&work_addr).await?;
-        log::info!("Connected to server work conn port: {}", work_addr);
-
-        // 服务器协商要求 TLS 时，工作连接套 TLS（复用控制连接的客户端 TLS 配置）
-        if work_conn_tls {
-            let tls_config = build_client_tls_config(config)
-                .map_err(|e| format!("failed to build client TLS config: {}", e))?
-                .ok_or("server requires TLS work conn but client tls is disabled")?;
-            let tls_stream = tls_config
-                .connect(&config.server_addr, work_conn)
-                .await
-                .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
-            log::info!("Work conn TLS established for proxy: {}", proxy_name);
-            Box::new(tls_stream)
-        } else {
-            Box::new(work_conn)
-        }
-    };
-
-    // 生成 sign_key
-    let sign_key = config
-        .auth
-        .token
-        .as_ref()
-        .map(|token| generate_work_conn_sign_key(token, run_id))
-        .unwrap_or_default();
-
-    // 发送 NewWorkConn 消息
-    let new_work_conn_msg = NewWorkConnMsg {
-        run_id: run_id.to_string(),
-        proxy_name: proxy_name.to_string(),
-        timestamp: get_timestamp(),
-        sign_key,
-        use_encryption,
-        use_compression,
-    };
-    rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
-
-    // 等待 StartWorkConn 响应
-    let resp = rust_frp_core::read_message(&mut work_conn).await?;
-    let (src_addr, src_port) = match resp {
-        Message::StartWorkConn(start_msg) => {
-            if !start_msg.error.is_empty() {
-                return Err(format!("Server error: {}", start_msg.error).into());
-            }
-            log::info!("Work conn established for proxy: {}", proxy_name);
-            (start_msg.src_addr, start_msg.src_port)
-        }
-        _ => {
-            return Err("Unexpected response from server".into());
-        }
-    };
-
-    // 应用层压缩与加密：握手完成后按固定顺序包装 —— 先压缩（内层）、后加密（外层）
-    if use_compression {
-        work_conn = Box::new(rust_frp_net::compress::CompressedStream::new(work_conn));
-        log::info!(
-            "Work conn application-layer compression (snappy) enabled for proxy: {}",
-            proxy_name
-        );
-    }
-    if use_encryption {
-        let token = config.auth.token.as_deref().expect("token checked above");
-        let key = derive_encryption_key(token);
-        work_conn = Box::new(rust_frp_net::crypto::EncryptedStream::new(work_conn, &key)?);
-        log::info!(
-            "Work conn application-layer encryption (AES-256-GCM) enabled for proxy: {}",
-            proxy_name
-        );
+    // sudp 代理：工作连接上承载 UDP 包帧（不连接本地 TCP 服务）
+    if proxy_config.r#type == "sudp" {
+        let local_addr = format!("{}:{}", proxy_config.local_ip, proxy_config.local_port);
+        return serve_sudp_proxy(work_conn, proxy_name, local_addr).await;
     }
 
     // 连接到本地服务
@@ -1670,74 +1734,376 @@ async fn handle_stcp_visitor_conn(
         return Err(format!("Failed to send StcpVisitor: {}", e).into());
     }
 
-    // 工作连接端口与 TLS 协商（与 establish_work_connection 保持一致）
-    let work_port = work_conn_port_of(&config);
-    let work_addr = format!("{}:{}", config.server_addr, work_port);
-    let tcp_conn = tokio::net::TcpStream::connect(&work_addr).await?;
-    log::info!("STCP visitor work conn to: {}", work_addr);
-    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if work_conn_tls {
-        let tls_config = build_client_tls_config(&config)
-            .map_err(|e| format!("failed to build client TLS config: {}", e))?
-            .ok_or("server requires TLS work conn but client tls is disabled")?;
-        let tls_stream = tls_config
-            .connect(&config.server_addr, tcp_conn)
-            .await
-            .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
-        Box::new(tls_stream)
-    } else {
-        Box::new(tcp_conn)
-    };
-
-    let work_sign_key = config
-        .auth
-        .token
-        .as_ref()
-        .map(|token| generate_work_conn_sign_key(token, &run_id))
-        .unwrap_or_default();
-
-    let new_work_conn_msg = NewWorkConnMsg {
-        run_id: run_id.clone(),
-        proxy_name: proxy_name.clone(),
-        timestamp: get_timestamp(),
-        sign_key: work_sign_key,
-        use_encryption,
-        use_compression,
-    };
-    rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
-
-    let resp = rust_frp_core::read_message(&mut work_conn).await?;
-    match resp {
-        Message::StartWorkConn(start_msg) => {
-            if !start_msg.error.is_empty() {
-                return Err(format!("Server error: {}", start_msg.error).into());
-            }
-            log::info!("STCP visitor work conn established for {}", proxy_name);
-        }
-        _ => {
-            return Err("Unexpected response from server".into());
-        }
-    }
-
-    // 应用层压缩与加密：固定顺序「先压缩、后加密」，需与对端代理配置一致
-    if use_compression {
-        work_conn = Box::new(rust_frp_net::compress::CompressedStream::new(work_conn));
-        log::info!(
-            "STCP visitor work conn application-layer compression (snappy) enabled for {}",
-            proxy_name
-        );
-    }
-    if use_encryption {
-        let token = config.auth.token.as_deref().expect("token checked above");
-        let key = derive_encryption_key(token);
-        work_conn = Box::new(rust_frp_net::crypto::EncryptedStream::new(work_conn, &key)?);
-        log::info!(
-            "STCP visitor work conn application-layer encryption (AES-256-GCM) enabled for {}",
-            proxy_name
-        );
-    }
+    // 工作连接：与 establish_work_connection 共用同一建立与包装逻辑
+    let (work_conn, _, _) = open_work_conn(
+        &config,
+        WorkConnRequest {
+            proxy_name: &proxy_name,
+            run_id: &run_id,
+            work_conn_tls,
+            mux_session: None,
+            use_encryption,
+            use_compression,
+        },
+    )
+    .await?;
 
     rust_frp_util::bridge_streams(work_conn, local_conn).await?;
     Ok(())
+}
+
+// ============ SUDP：UDP over 隧道（对齐原版 frp 的 sudp 代理/访问者） ============
+//
+// 服务端不解析 UDP：它只按 STCP 语义把两端的工作连接配对桥接，UDP 报文由
+// 两个 frpc 用 `UdpPacketMsg` 帧在 TCP 隧道上承载。代理侧把每个访问者源
+// 地址映射成一个独立的本地 UDP 会话；访问者侧每个本地 UDP 源地址占用一条
+// 独立隧道，并在 60s 无消息（代理侧每 30s 心跳）后回收。
+
+/// 访问者隧道心跳间隔（代理侧发送，用于让访问者感知隧道存活）
+const SUDP_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// 访问者隧道空闲上限（连续两个心跳周期无消息即判定会话结束）
+const SUDP_TUNNEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// sudp 访问者会话表（会话任务自行摘除，避免陈旧会话常驻）
+type SudpSessions = Arc<Mutex<std::collections::HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
+
+/// 隧道写任务：从通道取消息写入已建立的工作连接
+///
+/// 返回发送端；写入失败时任务自行结束（后续发送返回错误，调用方据此回收会话）。
+fn spawn_tunnel_writer<W>(mut writer: W) -> mpsc::Sender<Message>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::channel::<Message>(1024);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let Err(e) = rust_frp_core::write_message(&mut writer, &msg).await {
+                log::debug!("sudp: tunnel writer closed: {:?}", e);
+                break;
+            }
+        }
+    });
+    tx
+}
+
+/// 代理侧心跳：周期性投递 Ping，供访问者侧判定隧道是否存活
+///
+/// 返回任务句柄，隧道读循环结束后由调用方 `abort`，避免半关闭场景下
+/// 心跳任务持有的发送端让写任务无法退出。
+fn spawn_sudp_heartbeat(out_tx: mpsc::Sender<Message>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(SUDP_HEARTBEAT_INTERVAL);
+        ticker.tick().await; // 跳过 interval 的立即首次 tick
+        loop {
+            ticker.tick().await;
+            let ping = Message::Ping(rust_frp_core::PingMsg {
+                timestamp: get_timestamp(),
+            });
+            if out_tx.send(ping).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// sudp 代理侧：把工作连接上的 UDP 包帧转发到本地 UDP 服务
+///
+/// 每个访问者源地址对应一个独立本地 UDP 会话（连接到 `local_addr` 的临时
+/// socket），保证本地服务回包能准确回到对应访问者。
+async fn serve_sudp_proxy(
+    work_conn: Box<dyn rust_frp_net::FrpConn>,
+    proxy_name: &str,
+    local_addr: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    log::info!(
+        "sudp proxy {} tunnel established, forwarding to local udp {}",
+        proxy_name,
+        local_addr
+    );
+
+    let (mut reader, writer) = tokio::io::split(work_conn);
+    let out_tx = spawn_tunnel_writer(writer);
+    let heartbeat = spawn_sudp_heartbeat(out_tx.clone());
+
+    let mut sessions: std::collections::HashMap<String, mpsc::Sender<Vec<u8>>> =
+        std::collections::HashMap::new();
+
+    loop {
+        let msg = match rust_frp_core::read_message(&mut reader).await {
+            Ok(msg) => msg,
+            Err(e) => {
+                log::debug!("sudp proxy {} tunnel closed: {:?}", proxy_name, e);
+                break;
+            }
+        };
+        let Message::UdpPacket(packet) = msg else {
+            continue;
+        };
+        let Some(client_addr) = packet.client_addr else {
+            continue;
+        };
+
+        let inbound = match sessions.get(&client_addr) {
+            Some(tx) => tx.clone(),
+            None => {
+                let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+                spawn_sudp_local_session(
+                    client_addr.clone(),
+                    local_addr.clone(),
+                    proxy_name.to_string(),
+                    rx,
+                    out_tx.clone(),
+                );
+                sessions.insert(client_addr.clone(), tx.clone());
+                tx
+            }
+        };
+        if inbound.send(packet.data).await.is_err() {
+            sessions.remove(&client_addr);
+        }
+    }
+
+    log::info!("sudp proxy {} tunnel ended", proxy_name);
+    heartbeat.abort();
+    Ok(())
+}
+
+/// 单个访问者对应的本地 UDP 会话：入站载荷 → 本地服务，回包 → 隧道
+fn spawn_sudp_local_session(
+    client_addr: String,
+    local_addr: String,
+    proxy_name: String,
+    mut inbound: mpsc::Receiver<Vec<u8>>,
+    out_tx: mpsc::Sender<Message>,
+) {
+    tokio::spawn(async move {
+        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => socket,
+            Err(e) => {
+                log::error!("sudp: bind local udp socket failed: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = socket.connect(&local_addr).await {
+            log::error!("sudp: connect local udp {} failed: {}", local_addr, e);
+            return;
+        }
+
+        let mut buf = vec![0u8; 65535];
+        loop {
+            tokio::select! {
+                payload = inbound.recv() => {
+                    let Some(data) = payload else { break };
+                    if let Err(e) = socket.send(&data).await {
+                        log::debug!("sudp: send to local {} failed: {}", local_addr, e);
+                        break;
+                    }
+                }
+                received = socket.recv(&mut buf) => {
+                    match received {
+                        Ok(n) => {
+                            let msg = Message::UdpPacket(rust_frp_core::UdpPacketMsg {
+                                proxy_name: proxy_name.clone(),
+                                data: buf[..n].to_vec(),
+                                client_addr: Some(client_addr.clone()),
+                            });
+                            if out_tx.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("sudp: recv from local {} failed: {}", local_addr, e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// sudp 访问者会话上下文（跨会话共享的不可变信息）
+#[derive(Clone)]
+struct SudpVisitorContext {
+    proxy_name: String,
+    run_id: String,
+    config: Arc<ClientConfig>,
+    work_conn_tls: bool,
+    secret_key: String,
+    use_encryption: bool,
+    use_compression: bool,
+    stcp_tx: mpsc::Sender<Message>,
+    socket: Arc<tokio::net::UdpSocket>,
+}
+
+/// sudp 访问者：监听本地 UDP 端口，按源地址建立独立隧道会话
+async fn start_sudp_visitor(
+    bind_addr: String,
+    proxy_name: String,
+    stcp_tx: mpsc::Sender<Message>,
+    run_id: String,
+    config: Arc<ClientConfig>,
+    work_conn_tls: bool,
+) {
+    let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
+        Ok(socket) => Arc::new(socket),
+        Err(e) => {
+            log::error!(
+                "Failed to bind sudp visitor {} on {}: {:?}",
+                proxy_name,
+                bind_addr,
+                e
+            );
+            return;
+        }
+    };
+    log::info!("sudp visitor for {} listening on {}", proxy_name, bind_addr);
+
+    let visitor_cfg = config.visitors.iter().find(|v| v.server_name == proxy_name);
+    let ctx = SudpVisitorContext {
+        secret_key: visitor_cfg
+            .and_then(|v| v.secret_key.clone())
+            .unwrap_or_default(),
+        use_encryption: visitor_cfg.map(|v| v.use_encryption).unwrap_or(false),
+        use_compression: visitor_cfg.map(|v| v.use_compression).unwrap_or(false),
+        proxy_name,
+        run_id,
+        config,
+        work_conn_tls,
+        stcp_tx,
+        socket: socket.clone(),
+    };
+
+    let sessions: SudpSessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let mut buf = vec![0u8; 65535];
+
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, src)) => {
+                let data = buf[..n].to_vec();
+                let existing = { sessions.lock().await.get(&src).cloned() };
+                let inbound = match existing {
+                    Some(tx) => tx,
+                    None => match sudp_open_session(&ctx, src, sessions.clone()).await {
+                        Ok(tx) => {
+                            sessions.lock().await.insert(src, tx.clone());
+                            tx
+                        }
+                        Err(e) => {
+                            log::warn!("sudp visitor session for {} failed: {}", src, e);
+                            continue;
+                        }
+                    },
+                };
+                if inbound.send(data).await.is_err() {
+                    sessions.lock().await.remove(&src);
+                }
+            }
+            Err(e) => {
+                log::error!("sudp visitor recv error: {:?}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// 打开一个 sudp 访问者隧道会话
+///
+/// 先向服务端登记访问请求（服务端据此创建桥接并通知代理侧建工作连接），
+/// 再建立工作连接。会话在读循环退出（隧道关闭或心跳超时）时自行从
+/// `sessions` 中摘除，避免陈旧会话常驻。
+async fn sudp_open_session(
+    ctx: &SudpVisitorContext,
+    src: SocketAddr,
+    sessions: SudpSessions,
+) -> Result<mpsc::Sender<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    // 与服务端代理 secret_key 一致的访问签名（服务端 fail-closed 校验）
+    let timestamp = get_timestamp();
+    let sign_key =
+        rust_frp_auth::generate_stcp_sign_key(&ctx.secret_key, &ctx.proxy_name, timestamp);
+    ctx.stcp_tx
+        .send(Message::StcpVisitor(rust_frp_core::StcpVisitorMsg {
+            proxy_name: ctx.proxy_name.clone(),
+            run_id: ctx.run_id.clone(),
+            timestamp,
+            sign_key,
+        }))
+        .await
+        .map_err(|e| format!("Failed to send StcpVisitor for sudp: {}", e))?;
+
+    let (work_conn, _, _) = open_work_conn(
+        &ctx.config,
+        WorkConnRequest {
+            proxy_name: &ctx.proxy_name,
+            run_id: &ctx.run_id,
+            work_conn_tls: ctx.work_conn_tls,
+            mux_session: None,
+            use_encryption: ctx.use_encryption,
+            use_compression: ctx.use_compression,
+        },
+    )
+    .await?;
+
+    log::info!(
+        "sudp visitor tunnel established for {} (client {})",
+        ctx.proxy_name,
+        src
+    );
+
+    let (mut reader, writer) = tokio::io::split(work_conn);
+    let out_tx = spawn_tunnel_writer(writer);
+
+    // 出站：本地 UDP 载荷 → UDP 包帧（会话与源地址一一对应，故回程目标固定为 src）
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(256);
+    {
+        let proxy_name = ctx.proxy_name.clone();
+        tokio::spawn(async move {
+            while let Some(data) = inbound_rx.recv().await {
+                let msg = Message::UdpPacket(rust_frp_core::UdpPacketMsg {
+                    proxy_name: proxy_name.clone(),
+                    data,
+                    client_addr: Some(src.to_string()),
+                });
+                if out_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // 入站：隧道 → 本地访问者；60s 无消息（含心跳）即判定会话结束
+    let socket = ctx.socket.clone();
+    let proxy_name = ctx.proxy_name.clone();
+    tokio::spawn(async move {
+        loop {
+            let received = tokio::time::timeout(
+                SUDP_TUNNEL_IDLE_TIMEOUT,
+                rust_frp_core::read_message(&mut reader),
+            )
+            .await;
+            match received {
+                Ok(Ok(Message::UdpPacket(packet))) => {
+                    if let Err(e) = socket.send_to(&packet.data, src).await {
+                        log::debug!("sudp visitor send_to {} failed: {}", src, e);
+                    }
+                }
+                // Ping 等控制消息不转发
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => {
+                    log::debug!("sudp visitor tunnel closed for {}: {:?}", proxy_name, e);
+                    break;
+                }
+                Err(_) => {
+                    log::debug!("sudp visitor tunnel idle timeout for {}", proxy_name);
+                    break;
+                }
+            }
+        }
+        sessions.lock().await.remove(&src);
+        log::info!("sudp visitor session for {} closed", src);
+    });
+
+    Ok(inbound_tx)
 }
 
 /// Web 服务器（frpc 管理 API）
@@ -2378,16 +2744,32 @@ impl Client {
                         let xtcp_registry = control.xtcp_registry();
                         drop(control);
                         for visitor in &self.config.visitors {
-                            if visitor.r#type == "stcp" || visitor.r#type == "xtcp" {
-                                let bind_addr = format!("{}:{}", visitor.bind_addr, visitor.bind_port);
-                                let proxy_name = visitor.server_name.clone();
-                                let stcp_tx = stcp_tx.clone();
-                                let cfg = Arc::clone(&self.config);
-                                let rid = run_id.clone();
-                                let reg = xtcp_registry.clone();
-                                tokio::spawn(async move {
-                                    start_stcp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg, work_conn_tls, reg).await;
-                                });
+                            match visitor.r#type.as_str() {
+                                "stcp" | "xtcp" => {
+                                    let bind_addr =
+                                        format!("{}:{}", visitor.bind_addr, visitor.bind_port);
+                                    let proxy_name = visitor.server_name.clone();
+                                    let stcp_tx = stcp_tx.clone();
+                                    let cfg = Arc::clone(&self.config);
+                                    let rid = run_id.clone();
+                                    let reg = xtcp_registry.clone();
+                                    tokio::spawn(async move {
+                                        start_stcp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg, work_conn_tls, reg).await;
+                                    });
+                                }
+                                // sudp visitor：监听本地 UDP，按源地址建独立隧道会话
+                                "sudp" => {
+                                    let bind_addr =
+                                        format!("{}:{}", visitor.bind_addr, visitor.bind_port);
+                                    let proxy_name = visitor.server_name.clone();
+                                    let stcp_tx = stcp_tx.clone();
+                                    let cfg = Arc::clone(&self.config);
+                                    let rid = run_id.clone();
+                                    tokio::spawn(async move {
+                                        start_sudp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg, work_conn_tls).await;
+                                    });
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -3279,6 +3661,134 @@ mod web_admin_tests {
         assert_eq!(resp.status(), 400);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), VALID_CONFIG);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod sudp_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    /// 测试用 FrpConn 适配器（内存双工流缺少 remote_addr，需包一层）
+    struct TestConn(tokio::io::DuplexStream);
+
+    impl AsyncRead for TestConn {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestConn {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    impl rust_frp_net::FrpConn for TestConn {
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            None
+        }
+    }
+
+    /// 本地 UDP 回声服务：回包带 `echo:` 前缀，便于区分会话
+    async fn spawn_udp_echo() -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let mut reply = b"echo:".to_vec();
+                reply.extend_from_slice(&buf[..n]);
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+        addr
+    }
+
+    /// 读取一条 UdpPacket 回包（心跳等控制消息跳过）
+    async fn read_udp_reply(peer: &mut tokio::io::DuplexStream) -> rust_frp_core::UdpPacketMsg {
+        loop {
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                rust_frp_core::read_message(peer),
+            )
+            .await
+            .expect("reply timeout")
+            .expect("reply read");
+            match received {
+                Message::UdpPacket(packet) => return packet,
+                _ => continue,
+            }
+        }
+    }
+
+    /// 代理侧：隧道 UDP 包帧 → 本地 UDP 服务 → 回包按 client_addr 送回
+    #[tokio::test]
+    async fn test_sudp_proxy_forwards_and_isolates_sessions() {
+        let local = spawn_udp_echo().await;
+        let (tunnel, mut peer) = tokio::io::duplex(64 * 1024);
+
+        tokio::spawn(serve_sudp_proxy(
+            Box::new(TestConn(tunnel)),
+            "sudp-test",
+            local.to_string(),
+        ));
+
+        // 两个不同访问者源地址：回包必须回到各自的 client_addr
+        for (client_addr, payload) in [("127.0.0.1:40001", "alpha"), ("127.0.0.1:40002", "beta")] {
+            let msg = Message::UdpPacket(rust_frp_core::UdpPacketMsg {
+                proxy_name: "sudp-test".to_string(),
+                data: payload.as_bytes().to_vec(),
+                client_addr: Some(client_addr.to_string()),
+            });
+            rust_frp_core::write_message(&mut peer, &msg).await.unwrap();
+
+            let reply = read_udp_reply(&mut peer).await;
+            assert_eq!(
+                reply.client_addr.as_deref(),
+                Some(client_addr),
+                "回包应回到发起会话的访问者地址"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&reply.data),
+                format!("echo:{}", payload)
+            );
+        }
+    }
+
+    /// 隧道写任务按消息帧写入（读侧能还原同一条消息）
+    #[tokio::test]
+    async fn test_tunnel_writer_frames_messages() {
+        let (tunnel, mut peer) = tokio::io::duplex(8 * 1024);
+        let out_tx = spawn_tunnel_writer(TestConn(tunnel));
+
+        let msg = Message::UdpPacket(rust_frp_core::UdpPacketMsg {
+            proxy_name: "p".to_string(),
+            data: vec![1, 2, 3],
+            client_addr: Some("127.0.0.1:1".to_string()),
+        });
+        out_tx.send(msg).await.unwrap();
+
+        match rust_frp_core::read_message(&mut peer).await.unwrap() {
+            Message::UdpPacket(packet) => assert_eq!(packet.data, vec![1, 2, 3]),
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }
 

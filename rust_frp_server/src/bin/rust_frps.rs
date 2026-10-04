@@ -112,6 +112,10 @@ async fn main() {
                 _ = sigterm.recv() => info!("Received SIGTERM"),
             }
             info!("Shutting down gracefully: no longer accepting new connections, draining...");
+            // 唤醒全部 accept 循环（控制连接监听 + tcpmux 复用器）：
+            // notify_waiters 立刻唤醒当前等待者，notify_one 留一个许可位，
+            // 保证正处于两次 poll 之间的循环也能在下轮立即退出
+            shutdown.notify_waiters();
             shutdown.notify_one();
         });
     } else {

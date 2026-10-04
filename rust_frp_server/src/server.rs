@@ -146,6 +146,7 @@ impl Server {
             work_conn_manager.clone(),
             config.allow_ports.clone(),
             config.max_ports_per_user,
+            config.tcpmux_http_connect_port,
         ));
         let visitor_manager = Arc::new(ServerVisitorManager::new());
         let metrics = Arc::new(MonitorMetrics::new());
@@ -267,6 +268,27 @@ impl Server {
             self.vhost_https_listener = Some(vhost_listener);
         } else {
             log::warn!("No TLS config available, HTTPS vhost disabled");
+        }
+
+        // 启动 tcpmux HTTP CONNECT 复用器（仅在显式配置 tcpmux_http_connect_port 时）
+        if let Some(tcpmux_port) = self.config.tcpmux_http_connect_port.filter(|p| *p > 0) {
+            let addr =
+                format!("{}:{}", self.config.bind_addr, tcpmux_port).parse::<SocketAddr>()?;
+            // 显式限定：本模块内 `TcpListener` 是 rust_frp_net 的类型
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            log::info!("tcpmux HTTP CONNECT listener started on {}", addr);
+            let deps = TcpMuxDeps {
+                router: self.proxy_manager.get_tcpmux_router(),
+                proxy_owners: self.proxy_owners.clone(),
+                control_manager: self.control_manager.clone(),
+                work_conn_manager: self.work_conn_manager.clone(),
+            };
+            // 监听器交由复用任务持有；关闭信号到达时随任务结束释放
+            tokio::spawn(run_tcpmux_listener(
+                listener,
+                deps,
+                self.shutdown_notify.clone(),
+            ));
         }
 
         // 启动工作连接监听器（如果配置了 work_conn_port）
@@ -1705,6 +1727,7 @@ mod graceful_shutdown_tests {
                 Arc::new(ControlManager::new()),
                 Arc::new(ServerWorkConnManager::new(1)),
                 Vec::new(),
+                None,
                 None,
             )),
             visitor_manager: Arc::new(ServerVisitorManager::new()),
