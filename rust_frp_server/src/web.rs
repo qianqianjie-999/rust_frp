@@ -533,7 +533,9 @@ impl WebServer {
         log::info!("Web server listening on http://{}", self.addr);
 
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            if let Err(e) = axum::serve(listener, app).await {
+                log::error!("Web server terminated with error: {}", e);
+            }
         });
 
         self.server = Some(handle);

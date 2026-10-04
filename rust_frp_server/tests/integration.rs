@@ -135,17 +135,11 @@ fn build_manager(
     max_ports_per_user: Option<usize>,
     allow_ports: Vec<PortRange>,
 ) -> ServerProxyManager {
-    let auth_config = rust_frp_config::AuthConfig {
-        method: "token".to_string(),
-        token: Some("test-token".to_string()),
-        oidc: None,
-    };
     ServerProxyManager::new(
         Arc::new(HttpVhostRouter::new()),
         Arc::new(RwLock::new(HashMap::new())),
         Arc::new(ControlManager::new()),
         Arc::new(ServerWorkConnManager::new(4)),
-        Arc::new(rust_frp_auth::AuthManager::new(&auth_config).unwrap()),
         allow_ports,
         max_ports_per_user,
     )

@@ -851,3 +851,104 @@ impl PluginFactory for TlsBridgePluginFactory {
         Ok(Box::new(TlsBridgePlugin::new(config)?))
     }
 }
+
+#[cfg(test)]
+mod static_file_auth_tests {
+    use super::*;
+    use rust_frp_config::PluginConfig;
+
+    fn plugin(user: Option<&str>, password: Option<&str>) -> StaticFilePlugin {
+        let cfg = PluginConfig {
+            local_path: Some("/tmp".to_string()),
+            http_user: user.map(|s| s.to_string()),
+            http_password: password.map(|s| s.to_string()),
+            ..Default::default()
+        };
+        StaticFilePlugin::new(&cfg).expect("plugin build failed")
+    }
+
+    /// 构造带 Authorization 头的请求行并执行校验
+    fn check(p: &StaticFilePlugin, headers: &[String]) -> bool {
+        let mut lines: Vec<&str> = vec!["GET /index.html HTTP/1.1", "Host: x"];
+        lines.extend(headers.iter().map(|s| s.as_str()));
+        p.check_basic_auth(&lines)
+    }
+
+    fn basic_header(user: &str, password: &str) -> String {
+        format!(
+            "Authorization: Basic {}",
+            base64::encode(format!("{}:{}", user, password))
+        )
+    }
+
+    /// 未配置 http_user → 匿名放行
+    #[test]
+    fn anonymous_when_no_user_configured() {
+        assert!(check(&plugin(None, None), &[]));
+    }
+
+    /// 配置了凭据但请求无 Authorization 头 → 拒绝
+    #[test]
+    fn missing_header_rejected() {
+        assert!(!check(&plugin(Some("u"), Some("p")), &[]));
+    }
+
+    /// 非 Basic scheme（如 Bearer）→ 拒绝
+    #[test]
+    fn wrong_scheme_rejected() {
+        assert!(!check(
+            &plugin(Some("u"), Some("p")),
+            &["Authorization: Bearer abc".to_string()]
+        ));
+    }
+
+    /// 非法 base64 → 拒绝
+    #[test]
+    fn invalid_base64_rejected() {
+        assert!(!check(
+            &plugin(Some("u"), Some("p")),
+            &["Authorization: Basic !!!bad!!!".to_string()]
+        ));
+    }
+
+    /// 解码后无冒号分隔 → 拒绝
+    #[test]
+    fn malformed_credentials_rejected() {
+        let h = format!("Authorization: Basic {}", base64::encode("nocolon"));
+        assert!(!check(&plugin(Some("u"), Some("p")), &[h]));
+    }
+
+    /// 错误用户名/错误密码 → 拒绝；正确凭据 → 放行
+    #[test]
+    fn credential_match() {
+        assert!(check(
+            &plugin(Some("u"), Some("p")),
+            &[basic_header("u", "p")]
+        ));
+        assert!(!check(
+            &plugin(Some("u"), Some("p")),
+            &[basic_header("x", "p")]
+        ));
+        assert!(!check(
+            &plugin(Some("u"), Some("p")),
+            &[basic_header("u", "x")]
+        ));
+    }
+
+    /// 头名与 scheme 大小写不敏感
+    #[test]
+    fn case_insensitive_header_and_scheme() {
+        let h = format!("authorization: basic {}", base64::encode("u:p"));
+        assert!(check(&plugin(Some("u"), Some("p")), &[h]));
+    }
+
+    /// 未配置 http_password 时要求空密码精确匹配（比"任意密码可过"更严格）
+    #[test]
+    fn empty_password_requires_empty() {
+        assert!(check(&plugin(Some("u"), None), &[basic_header("u", "")]));
+        assert!(!check(
+            &plugin(Some("u"), None),
+            &[basic_header("u", "anything")]
+        ));
+    }
+}
