@@ -40,6 +40,10 @@ pub struct Control {
     pool_count: u32,
     /// 工作连接是否启用 TLS（通过 LoginRespMsg 协商给客户端）
     work_conn_tls: bool,
+    /// 客户端在 LoginMsg 中声明的扩展元数据（供插件回调透传）
+    metas: std::collections::HashMap<String, String>,
+    /// 服务端 HTTP 插件管理器（登录 / 注册 / 心跳 / 关闭代理回调）
+    plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
 }
 
 /// 构造控制会话所需的依赖集合（收敛 15 个独立参数，避免参数顺序误用）
@@ -58,6 +62,7 @@ pub struct ControlDeps {
     pub stcp_bridge_manager: Arc<StcpBridgeManager>,
     pub work_conn_manager: Arc<ServerWorkConnManager>,
     pub work_conn_tls: bool,
+    pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
 }
 
 impl Control {
@@ -77,6 +82,7 @@ impl Control {
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
+            plugin_manager,
         } = deps;
         Self {
             conn,
@@ -96,7 +102,18 @@ impl Control {
             work_conn_manager,
             pool_count: 0, // 将在收到 LoginMsg 后由 run() 设置
             work_conn_tls,
+            metas: std::collections::HashMap::new(),
+            plugin_manager,
         }
+    }
+
+    /// 构造插件回调的 UserInfo（user / run_id / metas）
+    fn plugin_user_info(&self) -> serde_json::Value {
+        serde_json::json!({
+            "user": self.user,
+            "run_id": self.run_id,
+            "metas": self.metas,
+        })
     }
 
     /// 发送消息到客户端（通过消息通道，供外部 visitor handler 调用）
@@ -120,6 +137,12 @@ impl Control {
         );
         for proxy_name in &self.registered_proxies {
             log::info!("Removing proxy: {}", proxy_name);
+            // 服务端插件回调：CloseProxy（单向通知，失败只记日志，不阻断清理）
+            let close_content = serde_json::json!({
+                "user": self.plugin_user_info(),
+                "proxy_name": proxy_name,
+            });
+            self.plugin_manager.close_proxy(&close_content).await;
             if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
                 log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
             } else {
@@ -190,11 +213,54 @@ impl Control {
                         }
                         global_metrics().incr_login_successes();
 
-                        // 更新控制器的信息
-                        self.run_id = login_msg.run_id;
-                        self.user = login_msg.user;
-                        self.client_id = login_msg.client_id;
-                        self.pool_count = login_msg.pool_count;
+                        // 服务端插件回调：Login（可拒绝登录，或用 unchange=false 覆写内容）。
+                        // 安全：不向插件暴露客户端 token（仅传递业务字段）。
+                        let mut plugin_content = serde_json::json!({
+                            "user": login_msg.user,
+                            "run_id": login_msg.run_id,
+                            "client_id": login_msg.client_id,
+                            "hostname": login_msg.hostname,
+                            "os": login_msg.os,
+                            "arch": login_msg.arch,
+                            "version": login_msg.version,
+                            "timestamp": login_msg.timestamp,
+                            "pool_count": login_msg.pool_count,
+                            "metas": login_msg.metas,
+                        });
+                        if let Err(reason) = self.plugin_manager.login(&mut plugin_content).await {
+                            log::warn!(
+                                "Login for user [{}] rejected by http plugin: {}",
+                                plugin_content["user"].as_str().unwrap_or(""),
+                                reason
+                            );
+                            global_metrics().incr_login_failures();
+                            return Err(format!("login rejected by plugin: {}", reason).into());
+                        }
+
+                        // 更新控制器的信息（插件未覆写时与原值一致）
+                        self.run_id = plugin_content["run_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        self.user = plugin_content["user"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        self.client_id = plugin_content["client_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string();
+                        self.pool_count = plugin_content["pool_count"].as_u64().unwrap_or(0) as u32;
+                        self.metas = plugin_content["metas"]
+                            .as_object()
+                            .map(|o| {
+                                o.iter()
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
 
                         // 注册客户端信息到 ControlManager
                         self.control_manager
@@ -350,8 +416,17 @@ impl Control {
         ping_msg: rust_frp_core::PingMsg,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.last_heartbeat = Instant::now();
+
+        // 服务端插件回调：Ping（reject 时回带 error 的 Pong，客户端据此重连）
+        let mut plugin_content = serde_json::json!({
+            "user": self.plugin_user_info(),
+            "timestamp": ping_msg.timestamp,
+        });
+        let plugin_error = self.plugin_manager.ping(&mut plugin_content).await.err();
+
         let pong_msg = rust_frp_core::PongMsg {
             timestamp: ping_msg.timestamp,
+            error: plugin_error.unwrap_or_default(),
         };
         if let Err(e) = self.write_msg(&Message::Pong(pong_msg)).await {
             log::error!("Failed to send pong message: {:?}", e);
@@ -366,11 +441,52 @@ impl Control {
         &mut self,
         register_proxy_msg: rust_frp_core::RegisterProxyMsg,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let proxy = register_proxy_msg.proxy;
+        let mut proxy = register_proxy_msg.proxy;
         let proxy_name = proxy.name.clone();
         let proxy_type = proxy.r#type.clone();
         let proxy_remote_port = proxy.remote_port;
         let proxy_secret_key = proxy.secret_key.clone();
+
+        // 服务端插件回调：NewProxy（可拒绝注册，或用 unchange=false 覆写代理配置）。
+        // content 与原版对齐：user 字段 + 代理配置平铺。
+        let mut plugin_content = {
+            let mut map = serde_json::Map::new();
+            map.insert("user".to_string(), self.plugin_user_info());
+            if let Ok(serde_json::Value::Object(cfg)) = serde_json::to_value(&proxy) {
+                for (k, v) in cfg {
+                    map.insert(k, v);
+                }
+            }
+            serde_json::Value::Object(map)
+        };
+        if let Err(reason) = self.plugin_manager.new_proxy(&mut plugin_content).await {
+            log::warn!(
+                "New proxy [{}] rejected by http plugin: {}",
+                proxy_name,
+                reason
+            );
+            let resp = rust_frp_core::RegisterProxyRespMsg {
+                name: proxy_name.clone(),
+                error: format!("new proxy rejected by plugin: {}", reason),
+            };
+            if let Err(e) = self.write_msg(&Message::RegisterProxyResp(resp)).await {
+                log::error!("Failed to send register proxy rejection: {:?}", e);
+                self.cleanup_proxies().await;
+                return Err(e);
+            }
+            return Ok(());
+        }
+        // 插件覆写：仅在能完整反序列化为 ProxyConfig 时采用（默认内容即原配置，二者等价）
+        if let Some(obj) = plugin_content.as_object() {
+            let mut cfg_obj = obj.clone();
+            cfg_obj.remove("user");
+            if let Ok(new_cfg) = serde_json::from_value::<rust_frp_config::ProxyConfig>(
+                serde_json::Value::Object(cfg_obj),
+            ) {
+                proxy = new_cfg;
+            }
+        }
+
         let result = self
             .proxy_manager
             .add_proxy_for_user(proxy, &self.user)
@@ -853,6 +969,15 @@ impl ControlManager {
     pub async fn get_clients(&self) -> Vec<ClientInfo> {
         let clients = self.clients.read().await;
         clients.values().cloned().collect()
+    }
+
+    /// 按 run_id 查询用户名（供插件回调构造 UserInfo）
+    pub async fn get_user_by_run_id(&self, run_id: &str) -> Option<String> {
+        self.clients
+            .read()
+            .await
+            .get(run_id)
+            .map(|c| c.user.clone())
     }
 }
 

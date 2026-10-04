@@ -196,6 +196,76 @@ pub struct ServerConfig {
 
     /// 默认代理配置列表
     pub proxies: Vec<ProxyConfig>,
+
+    /// 服务端 HTTP 插件列表（对齐原版 frp `[[httpPlugins]]`）
+    ///
+    /// 每配置一个插件，frps 在登录 / 代理注册 / 关闭代理 / 心跳 / 工作连接 /
+    /// 用户连接等事件发生时，向该 HTTP 服务发起同步回调；回调可拒绝本次操作，
+    /// 或返回修改后的内容（例如登录 metadata、代理配置）。
+    ///
+    /// # 配置示例
+    ///
+    /// ```toml
+    /// [[http_plugins]]
+    /// name = "user-manager"
+    /// addr = "http://127.0.0.1:9000"
+    /// path = "/handler"
+    /// ops = ["Login", "NewProxy"]
+    /// ```
+    #[serde(default, alias = "httpPlugins")]
+    pub http_plugins: Vec<HttpPluginConfig>,
+}
+
+/// 服务端插件支持的全部回调操作名（大小写敏感，与原版一致）。
+pub const VALID_PLUGIN_OPS: &[&str] = &[
+    "Login",
+    "NewProxy",
+    "CloseProxy",
+    "Ping",
+    "NewWorkConn",
+    "NewUserConn",
+];
+
+/// 服务端 HTTP 插件配置项（对齐原版 frp `HTTPPluginOptions`）
+///
+/// # 回调协议
+///
+/// frps 向 `{addr}{path}?version=0.1.0&op={Op}` 发起 `POST`，请求体为
+/// `{"version":"0.1.0","op":"Login","content":{...}}`，并附带 `X-Frp-Reqid` 头。
+/// 插件须返回 `200` 与 JSON 响应体：
+///
+/// ```json
+/// { "reject": false, "reject_reason": "", "unchange": true, "content": null }
+/// ```
+///
+/// - `reject = true`：拒绝本次操作，`reject_reason` 作为错误信息回传客户端；
+/// - `unchange = false`：采用响应中的 `content` 覆写原始内容
+///   （仅 `Login` / `NewProxy` / `Ping` / `NewWorkConn` 支持，`CloseProxy` 忽略）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpPluginConfig {
+    /// 插件名称（用于日志与错误信息）
+    pub name: String,
+
+    /// 插件 HTTP 服务地址，如 `http://127.0.0.1:9000`
+    ///
+    /// 未带 scheme 时按 `http://` 处理（对齐原版行为）。
+    pub addr: String,
+
+    /// 回调路径，如 `/handler`
+    #[serde(default)]
+    pub path: String,
+
+    /// 订阅的操作集合
+    ///
+    /// 合法值：`Login` / `NewProxy` / `CloseProxy` / `Ping` / `NewWorkConn` /
+    /// `NewUserConn`（大小写敏感，与原版一致）。
+    pub ops: Vec<String>,
+
+    /// 当 `addr` 为 `https://` 时是否校验服务端证书
+    ///
+    /// 默认 `false`（不校验），与原版 `tlsVerify` 零值语义一致。
+    #[serde(default, alias = "tlsVerify")]
+    pub tls_verify: bool,
 }
 
 impl Default for ServerConfig {
@@ -217,6 +287,7 @@ impl Default for ServerConfig {
             custom_404_page: None,
             includes: None,
             proxies: Vec::new(),
+            http_plugins: Vec::new(),
         }
     }
 }
@@ -1456,6 +1527,44 @@ impl ConfigLoader {
             }
         }
 
+        // 服务端 HTTP 插件：name/addr/ops 必须有效，op 必须是已知回调类型。
+        // 非法配置直接拒绝启动，避免「配了插件却静默不回调」。
+        for (i, plugin) in config.http_plugins.iter().enumerate() {
+            if plugin.name.trim().is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("http_plugins[{i}].name must be non-empty"),
+                )));
+            }
+            if plugin.addr.trim().is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("http_plugins[{i}].addr must be non-empty"),
+                )));
+            }
+            if plugin.ops.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "http_plugins[{i}] ({}) subscribes to no operation; \
+                         ops must list at least one of {VALID_PLUGIN_OPS:?}",
+                        plugin.name
+                    ),
+                )));
+            }
+            for op in &plugin.ops {
+                if !VALID_PLUGIN_OPS.contains(&op.as_str()) {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "http_plugins[{i}] ({}) has unknown op {:?}; valid ops are {VALID_PLUGIN_OPS:?}",
+                            plugin.name, op
+                        ),
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1944,6 +2053,60 @@ mod upstream_compat_tests {
         ));
         std::fs::write(&path, content).expect("write temp config");
         path
+    }
+
+    /// 服务端 [[httpPlugins]]（原版 camelCase 数组表）必须可解析并落到 http_plugins。
+    #[test]
+    fn test_upstream_http_plugins_config_parses() {
+        let path = write_temp_config(
+            "frps_plugins",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[[httpPlugins]]
+name = "user-manager"
+addr = "http://127.0.0.1:9000"
+path = "/handler"
+ops = ["Login", "NewProxy"]
+tlsVerify = false
+"#,
+        );
+        let config = ConfigLoader::load_server_config(&path).expect("httpPlugins must parse");
+        assert_eq!(config.http_plugins.len(), 1);
+        let plugin = &config.http_plugins[0];
+        assert_eq!(plugin.name, "user-manager");
+        assert_eq!(plugin.addr, "http://127.0.0.1:9000");
+        assert_eq!(plugin.path, "/handler");
+        assert_eq!(
+            plugin.ops,
+            vec!["Login".to_string(), "NewProxy".to_string()]
+        );
+        assert!(!plugin.tls_verify);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 未知 op 的插件必须被拒绝（避免「配了插件却静默不回调」）。
+    #[test]
+    fn test_http_plugins_unknown_op_rejected() {
+        let path = write_temp_config(
+            "frps_bad_plugin",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[[http_plugins]]
+name = "bad"
+addr = "http://127.0.0.1:9000"
+ops = ["Login", "NotAnOp"]
+"#,
+        );
+        let err = ConfigLoader::load_server_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown op"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 原版 frp 0.71 风格的客户端配置（camelCase + transport.useEncryption 嵌套）

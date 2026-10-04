@@ -225,6 +225,8 @@ mod fields {
     ];
 
     pub const PORT_RANGE: &[&str] = &["start", "end", "single"];
+
+    pub const HTTP_PLUGIN: &[&str] = &["name", "addr", "path", "ops", "tls_verify", "tlsVerify"];
 }
 
 fn section_fields(section: &str) -> &'static [&'static str] {
@@ -241,6 +243,7 @@ fn section_fields(section: &str) -> &'static [&'static str] {
         "health_check" => fields::HEALTH_CHECK,
         "plugin" => fields::PLUGIN,
         "port_range" => fields::PORT_RANGE,
+        "http_plugin" => fields::HTTP_PLUGIN,
         _ => &[],
     }
 }
@@ -256,6 +259,7 @@ fn child_section(section: &str, key: &str) -> Option<&'static str> {
             "proxies" => Some("proxy"),
             "visitors" => Some("visitor"),
             "allow_ports" | "allowPorts" => Some("port_range"),
+            "http_plugins" | "httpPlugins" => Some("http_plugin"),
             _ => None,
         },
         "auth" => (key == "oidc").then_some("oidc"),

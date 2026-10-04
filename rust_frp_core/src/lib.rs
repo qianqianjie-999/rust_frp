@@ -433,10 +433,14 @@ pub struct PingMsg {
 /// # 字段说明
 ///
 /// - `timestamp`: 对应 Ping 消息的时间戳
+/// - `error`: 服务端插件拒绝心跳时填充的错误信息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PongMsg {
     /// 时间戳（毫秒），回显 Ping 中的时间戳
     pub timestamp: i64,
+    /// 错误信息（服务端插件拒绝心跳时填写，客户端据此重连；正常为空）
+    #[serde(default)]
+    pub error: String,
 }
 
 /// 断开连接消息 - 通知对方关闭连接

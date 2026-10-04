@@ -78,6 +78,9 @@ use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+/// 服务端 HTTP 插件机制（frps 控制面回调），与本地插件（数据面）互补。
+pub mod server_plugin;
+
 /// Combined trait for AsyncRead + AsyncWrite
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}

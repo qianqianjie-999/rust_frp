@@ -781,6 +781,8 @@ pub struct ClientControl {
     stcp_visitor_tx: tokio::sync::mpsc::Sender<Message>,
     stcp_visitor_rx: tokio::sync::mpsc::Receiver<Message>,
     last_pong_time: std::time::Instant,
+    /// 服务端通过 HTTP 插件拒绝了心跳（Pong 带 error），需要重连
+    plugin_rejected_heartbeat: bool,
     /// 工作连接是否使用 TLS（来自服务器 LoginRespMsg.work_conn_tls 协商）
     work_conn_tls: bool,
     /// yamux 多路复用会话（tcp_mux 开启时存在）
@@ -834,6 +836,7 @@ impl ClientControl {
             stcp_visitor_tx: stcp_tx,
             stcp_visitor_rx: stcp_rx,
             last_pong_time: std::time::Instant::now(),
+            plugin_rejected_heartbeat: false,
             work_conn_tls,
             mux_session,
             xtcp_registry: Arc::new(XtcpRegistry::default()),
@@ -886,6 +889,12 @@ impl ClientControl {
                             msg_count += 1;
                             log::debug!("成功读取消息, 计数: {}", msg_count);
                             self.handle_message(msg).await;
+                            if self.plugin_rejected_heartbeat {
+                                log::warn!(
+                                    "Server rejected heartbeat via plugin, reconnecting..."
+                                );
+                                break;
+                            }
                         }
                         Ok(Err(e)) => {
                             log::error!("Failed to read message from connection: {:?}", e);
@@ -929,6 +938,14 @@ impl ClientControl {
         match msg {
             Message::Pong(pong_msg) => {
                 self.last_pong_time = std::time::Instant::now();
+                if !pong_msg.error.is_empty() {
+                    // 服务端 HTTP 插件拒绝了本次心跳：本会话不再被认可，触发重连
+                    log::error!(
+                        "Server rejected heartbeat via plugin: {}; reconnecting",
+                        pong_msg.error
+                    );
+                    self.plugin_rejected_heartbeat = true;
+                }
                 log::debug!("收到 Pong 消息: timestamp={}", pong_msg.timestamp);
             }
             Message::ReqWorkConn(req_work_conn_msg) => {

@@ -35,6 +35,22 @@ allow_ports = [
     { start = 10000, end = 20000 },
 ]
 
+# --- 服务端 HTTP 插件（可选，默认不启用） ---
+# frps 在登录 / 代理注册 / 关闭代理 / 心跳 / 工作连接 / 用户连接等事件时，
+# POST 到插件地址：{addr}{path}?version=0.1.0&op={Op}，请求体为
+# {"version":"0.1.0","op":"Op","content":{...}}，并带 X-Frp-Reqid 头。
+# 插件返回 {"reject":bool,"reject_reason":"","unchange":bool,"content":{...}}：
+#   reject = true  → 拒绝该操作（reject_reason 回传客户端）
+#   unchange = false → 用 content 覆写（Login 可注入 metas，NewProxy 可改配置）
+# ops 合法值：Login / NewProxy / CloseProxy / Ping / NewWorkConn / NewUserConn
+# https 地址默认不校验证书；需要校验证书时设置 tls_verify = true。
+#
+# [[http_plugins]]
+# name = "user-manager"
+# addr = "http://127.0.0.1:9000"
+# path = "/handler"
+# ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewWorkConn", "NewUserConn"]
+
 # --- Web Dashboard（默认禁用：port = 0） ---
 # user / password 必须成对配置且非空，否则服务端会拒绝启动。
 # 生产环境建议只监听 127.0.0.1，并前置 Nginx 提供 HTTPS。
