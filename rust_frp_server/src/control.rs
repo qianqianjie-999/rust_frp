@@ -313,7 +313,7 @@ impl Control {
                                 version: client_version,
                                 hostname: client_hostname,
                                 client_ip,
-                                wire_protocol: "v1".to_string(),
+                                wire_protocol: self.conn.wire_protocol().as_str().to_string(),
                             })
                             .await;
 

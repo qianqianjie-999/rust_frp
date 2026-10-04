@@ -744,6 +744,71 @@ pub async fn write_message<T: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// 控制连接使用的线协议版本（决定控制消息的帧格式）
+///
+/// - [`WireProtocol::V1`]：`[4B 大端长度][JSON]`（默认，兼容 v1 客户端/服务端）；
+/// - [`WireProtocol::V2`]：wire v2 帧 `[2B 类型][2B 标志][4B 长度][JSON]`，
+///   通常叠加在方向性 AEAD 流（`rust_frp_net::wire_v2`）之上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireProtocol {
+    /// v1：4 字节长度前缀 + JSON
+    V1,
+    /// v2：wire v2 帧
+    V2,
+}
+
+impl WireProtocol {
+    /// 配置名 / 管理端上报名（`"v1"` / `"v2"`）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WireProtocol::V1 => "v1",
+            WireProtocol::V2 => "v2",
+        }
+    }
+}
+
+/// 从连接读取一条 wire v2 消息帧
+///
+/// # 协议格式
+///
+/// ```text
+/// [2B 类型=16][2B 标志=0][4B 载荷长度][JSON 消息]
+/// ```
+pub async fn read_v2_message<T: AsyncRead + Unpin>(
+    conn: &mut T,
+    max_size: usize,
+) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
+    let frame = rust_frp_net::wire_v2::read_frame(conn).await?;
+    if frame.type_id != rust_frp_net::wire_v2::FRAME_TYPE_MESSAGE {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unexpected wire v2 frame type {}", frame.type_id),
+        )));
+    }
+    if frame.payload.len() > max_size {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "message size too large: {} bytes (max: {})",
+                frame.payload.len(),
+                max_size
+            ),
+        )));
+    }
+    let msg: Message = serde_json::from_slice(&frame.payload)?;
+    Ok(msg)
+}
+
+/// 向连接写入一条 wire v2 消息帧
+pub async fn write_v2_message<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    msg: &Message,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let frame = rust_frp_net::wire_v2::Frame::json(rust_frp_net::wire_v2::FRAME_TYPE_MESSAGE, msg)?;
+    rust_frp_net::wire_v2::write_frame(conn, &frame).await?;
+    Ok(())
+}
+
 /// 控制连接 - 用于客户端与服务器之间的控制平面通信
 ///
 /// # 使用场景
@@ -754,6 +819,11 @@ pub async fn write_message<T: AsyncWrite + Unpin>(
 /// 3. 心跳保活（Ping/Pong）
 /// 4. 工作连接协调（ReqWorkConn/NewWorkConn）
 ///
+/// # 线协议
+///
+/// 默认 v1（`[4B 长度][JSON]`）；用 [`ControlConn::new_v2`] 构造时改用 wire v2
+/// 帧格式（配合 `rust_frp_net::wire_v2` 的方向性 AEAD 流）。
+///
 /// # 生命周期
 ///
 /// ```text
@@ -762,23 +832,54 @@ pub async fn write_message<T: AsyncWrite + Unpin>(
 pub struct ControlConn {
     /// 底层连接（使用 trait object 支持多种传输）
     conn: Box<dyn FrpConn>,
+    /// 控制消息帧格式版本
+    wire: WireProtocol,
 }
 
 impl ControlConn {
-    /// 创建新的控制连接
+    /// 创建新的控制连接（v1 帧格式）
     ///
     /// # 参数
     ///
     /// - `conn`: 实现了 FrpConn trait 的连接对象
     pub fn new(conn: Box<dyn FrpConn>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            wire: WireProtocol::V1,
+        }
+    }
+
+    /// 创建使用 wire v2 帧格式的控制连接
+    ///
+    /// 通常传入的是已完成 [`rust_frp_net::wire_v2::client_handshake`] /
+    /// [`rust_frp_net::wire_v2::server_handshake`] 的方向性 AEAD 流。
+    pub fn new_v2(conn: Box<dyn FrpConn>) -> Self {
+        Self {
+            conn,
+            wire: WireProtocol::V2,
+        }
+    }
+
+    /// 当前控制连接的线协议版本
+    pub fn wire_protocol(&self) -> WireProtocol {
+        self.wire
+    }
+
+    /// 取出底层连接（放弃控制帧语义）
+    ///
+    /// 用于「首条消息已用于分派、后续按原始流处理」的场景（如 QUIC 流分派到工作连接）。
+    pub fn into_inner(self) -> Box<dyn FrpConn> {
+        self.conn
     }
 
     /// 异步读取消息
     pub async fn read_message(
         &mut self,
     ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
-        read_message(&mut self.conn).await
+        match self.wire {
+            WireProtocol::V1 => read_message(&mut self.conn).await,
+            WireProtocol::V2 => read_v2_message(&mut self.conn, MAX_MESSAGE_SIZE).await,
+        }
     }
 
     /// 异步读取消息，使用调用方指定的长度上限
@@ -789,7 +890,10 @@ impl ControlConn {
         &mut self,
         max_size: usize,
     ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
-        read_message_with_limit(&mut self.conn, max_size).await
+        match self.wire {
+            WireProtocol::V1 => read_message_with_limit(&mut self.conn, max_size).await,
+            WireProtocol::V2 => read_v2_message(&mut self.conn, max_size).await,
+        }
     }
 
     /// 异步发送消息
@@ -797,7 +901,10 @@ impl ControlConn {
         &mut self,
         msg: &Message,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        write_message(&mut self.conn, msg).await
+        match self.wire {
+            WireProtocol::V1 => write_message(&mut self.conn, msg).await,
+            WireProtocol::V2 => write_v2_message(&mut self.conn, msg).await,
+        }
     }
 
     /// 发送原始字节数据
@@ -1198,11 +1305,124 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_v2_message_frame_roundtrip() {
+        let msg = Message::Ping(PingMsg { timestamp: 42 });
+        let mut wire = Vec::new();
+        write_v2_message(&mut wire, &msg).await.unwrap();
+        // v2 帧头：类型 = 16（MESSAGE），标志 = 0
+        assert_eq!(
+            u16::from_be_bytes([wire[0], wire[1]]),
+            rust_frp_net::wire_v2::FRAME_TYPE_MESSAGE
+        );
+        assert_eq!(u16::from_be_bytes([wire[2], wire[3]]), 0);
+        let decoded = read_v2_message(&mut wire.as_slice(), MAX_MESSAGE_SIZE)
+            .await
+            .unwrap();
+        assert!(matches!(decoded, Message::Ping(ref p) if p.timestamp == 42));
+    }
+
+    #[tokio::test]
+    async fn test_read_v2_message_rejects_non_message_frame() {
+        // 用 ClientHello 帧类型伪造，必须被拒绝
+        let frame = rust_frp_net::wire_v2::Frame {
+            type_id: rust_frp_net::wire_v2::FRAME_TYPE_CLIENT_HELLO,
+            flags: 0,
+            payload: b"{}".to_vec(),
+        };
+        let mut wire = Vec::new();
+        rust_frp_net::wire_v2::write_frame(&mut wire, &frame)
+            .await
+            .unwrap();
+        assert!(read_v2_message(&mut wire.as_slice(), MAX_MESSAGE_SIZE)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_v2_message_enforces_size_limit() {
+        let msg = Message::Ping(PingMsg { timestamp: 1 });
+        let mut wire = Vec::new();
+        write_v2_message(&mut wire, &msg).await.unwrap();
+        // 上限收紧到 1 字节 → 必须拒绝
+        assert!(read_v2_message(&mut wire.as_slice(), 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_control_conn_dispatches_by_wire_protocol() {
+        // 本地 FrpConn 适配器（包一层 duplex 流）
+        struct DuplexConn(tokio::io::DuplexStream);
+        impl AsyncRead for DuplexConn {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for DuplexConn {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+            }
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+            }
+        }
+        impl FrpConn for DuplexConn {
+            fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+                None
+            }
+        }
+
+        // v1 构造器 → v1 协议
+        let (_a, b) = tokio::io::duplex(64);
+        assert_eq!(
+            ControlConn::new(Box::new(DuplexConn(b))).wire_protocol(),
+            WireProtocol::V1
+        );
+
+        // v2 构造器 → v2 帧格式收发
+        let (mut a, b) = tokio::io::duplex(4096);
+        let mut v2 = ControlConn::new_v2(Box::new(DuplexConn(b)));
+        assert_eq!(v2.wire_protocol(), WireProtocol::V2);
+
+        v2.write_message(&Message::Ping(PingMsg { timestamp: 7 }))
+            .await
+            .unwrap();
+        let decoded = read_v2_message(&mut a, MAX_MESSAGE_SIZE).await.unwrap();
+        assert!(matches!(decoded, Message::Ping(ref p) if p.timestamp == 7));
+
+        write_v2_message(
+            &mut a,
+            &Message::Pong(PongMsg {
+                timestamp: 9,
+                error: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let got = v2.read_message().await.unwrap();
+        assert!(matches!(got, Message::Pong(ref p) if p.timestamp == 9));
+    }
+
     #[test]
     fn test_max_message_size_constant() {
         assert_eq!(MAX_MESSAGE_SIZE, 10 * 1024 * 1024);
     }
-
     #[test]
     fn test_preauth_limit_constant() {
         // 预认证首帧上限：64KB（P0-2 回归锚点，断言常量本身就是测试目的）

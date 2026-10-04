@@ -13,6 +13,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **KCP 协议**：基于 UDP 的低延迟可靠传输协议，适合弱网和跨国场景
 - **QUIC 协议**：基于 quinn 的 QUIC (TLS 1.3) 传输，单 UDP 连接多路复用承载控制连接与全部工作连接，适合弱网/移动网络
 - **WebSocket / WSS 传输**：`protocol = "websocket"`（明文）或 `"wss"`（TLS 叠加 WebSocket，路径 `/~!frp`），在只放行 HTTP 的网关/反代后仍可建立隧道
+- **wire protocol v2**：`transport.wire_protocol = "v2"` 可选启用——魔数标识 + 帧化能力协商 + HKDF 方向性 AEAD 控制通道（默认 v1，向后兼容）
 - **TLS 加密**：使用 rustls 实现，未配置证书时服务端在运行时生成自签名证书（内存中、不落盘不入库），也支持自定义证书；控制连接和数据连接均默认启用加密；客户端支持跳过证书验证模式，方便使用自签名证书
 - **HMAC 签名验证**：工作连接使用 HMAC-SHA256 签名，防止连接伪造
 - **PROXY Protocol**：可选启用，透传真实访问者 IP 给本地 nginx/haproxy，方便日志记录和访问控制
@@ -46,6 +47,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | KCP 协议 | ✅ | 完整实现 |
 | QUIC 协议 | ✅ | 基于 quinn 完整实现；TLS 1.3 强制（无明文模式），单 UDP 端口承载控制+工作连接，客户端 fail-closed 校验 |
 | WebSocket / WSS 传输 | ✅ | `protocol = "websocket"` 明文 / `"wss"` TLS+WS；服务端在控制口按 `GET ` 前缀自动嗅探升级（TLS 场景在握手后嗅探），客户端 wss 为强制 TLS 且 fail-closed |
+| wire protocol v2 | ✅ | `transport.wire_protocol = "v2"`：魔数 `FRP\x00\x02\r\n` + 帧化 ClientHello/ServerHello 能力协商 + HKDF 方向性 AEAD（aes-256-gcm）加密控制通道；服务端自动嗅探，默认 v1 兼容。**scope**：仅控制连接（工作连接仍 v1） |
 | 应用层加密 | ✅ | `use_encryption`：工作连接 AES-256-GCM 加密（**仅加密不认证**，密钥派生自 token；无 token 时 fail-closed） |
 | 应用层压缩 | ✅ | `use_compression`：工作连接 snappy 压缩（**需两端配置一致**；与 `use_encryption` 可叠加，顺序为先压缩后加密） |
 | tcpmux 代理 | ✅ | HTTP CONNECT 复用：服务器在 `tcpmux_http_connect_port` 单端口按域名（+ 可选 `route_by_http_user` / `http_user` / `http_password`）路由，多个 tcpmux 代理共享同一端口 |
@@ -65,7 +67,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
 > **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 81%。尚未支持的主要项：
-> wire protocol v2、客户端插件 `virtual_net`
+> 客户端插件 `virtual_net`
 > （另：`http_proxy` 仅支持 `CONNECT` 隧道，普通 HTTP 转发未实现）、服务端 tracer、
 > `auth.additionalScopes`、SSH 隧道网关、`--strict_config`、Store 配置源等。
 > 逐项源码级对照与本项目更严格的安全默认值，见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md)。
@@ -151,6 +153,27 @@ rust_frp/
 | 移动网络 | 连接迁移特性，WiFi↔4G 切网不断连 |
 | 弱网高丢包 | 基于 UDP 的拥塞控制，比 TCP 更抗丢包 |
 | 多路复用 | 单 UDP 连接承载控制连接与全部工作连接，无队头阻塞 |
+
+### wire protocol v2 ✅
+
+在 v1（`[4B 长度][JSON]` 明文控制通道）之外，新增可选的 v2 线协议用于加固控制面：
+
+| 特性 | 说明 |
+|------|------|
+| 魔数标识 | 连接建立后先发 8 字节魔数 `FRP\x00\x02\r\n`；服务端自动嗅探，**无需在服务端配置** |
+| 帧化握手 | 帧格式 `[2B 类型][2B 标志][4B 长度][载荷]`；ClientHello / ServerHello 完成能力协商（消息编解码器、AEAD 算法、32B 随机数） |
+| 方向性 AEAD | 控制通道读写分别使用不同密钥：`HKDF-SHA256(ikm = SHA-256(token), salt = SHA-256(转录), info = "frp wire v2 control aead <算法> <方向>")`，根本排除双向复用同一 `(key, nonce)` |
+| 算法 | `aes-256-gcm`；`xchacha20-poly1305` 为路线图项，协商时不会被选中 |
+| 兼容性 | 默认 `v1`；v1 客户端/服务端行为零变更（服务端嗅探非魔数时把字节原样回放） |
+
+```toml
+# frpc.toml
+[transport]
+wire_protocol = "v2"   # "v1"（默认）或 "v2"
+```
+
+> 要求 `auth.method = "token"`（v2 的 AEAD 基础密钥派生自 `SHA-256(token)`）；
+> 当前作用于**控制连接**，工作连接仍沿用 v1 帧格式。
 
 ### OIDC 认证 ✅
 
