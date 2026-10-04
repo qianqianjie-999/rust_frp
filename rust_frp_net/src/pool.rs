@@ -489,4 +489,118 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(conn.is_expired(Duration::from_millis(5), Duration::from_secs(3600)));
     }
+
+    // 辅助：在本机起一个 TCP 服务，返回地址（连接在该服务关闭前保持健康）
+    async fn spawn_tcp_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // 持续接受连接并保持打开（回显服务），避免对端关闭导致连接不健康
+            loop {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 512];
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        loop {
+                            match sock.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if sock.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_conn_pool_put_get_roundtrip_reuses_connection() {
+        let addr = spawn_tcp_server().await;
+        let config = PoolConfig {
+            max_size: 2,
+            ..PoolConfig::default()
+        };
+        let pool = ConnPool::new(addr, config);
+
+        // 首次获取：新建连接
+        let conn = pool.get().await.unwrap();
+        let stats = pool.get_stats().await;
+        assert_eq!(stats.total_created, 1);
+        assert_eq!(stats.total_reused, 0);
+
+        // 归还后再次获取：应复用同一连接
+        pool.put(conn).await;
+        assert_eq!(pool.get_stats().await.current_idle, 1);
+
+        let conn = pool.get().await.unwrap();
+        let stats = pool.get_stats().await;
+        assert_eq!(stats.total_reused, 1);
+        assert_eq!(stats.current_in_use, 1);
+        assert_eq!(conn.use_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_conn_pool_put_when_full_closes_connection() {
+        let addr = spawn_tcp_server().await;
+        let config = PoolConfig {
+            max_size: 1,
+            ..PoolConfig::default()
+        };
+        let pool = ConnPool::new(addr, config);
+
+        // 同时持有两条连接（get 内部信号量许可即取即放，不会阻塞）
+        let c1 = pool.get().await.unwrap();
+        let c2 = pool.get().await.unwrap();
+        assert_eq!(pool.get_stats().await.total_created, 2);
+
+        // 归还第一条：入池（max_size=1 恰好放满）
+        pool.put(c1).await;
+        assert_eq!(pool.get_stats().await.current_idle, 1);
+
+        // 池已满，归还第二条应被关闭而不是入池
+        pool.put(c2).await;
+
+        let stats = pool.get_stats().await;
+        assert_eq!(stats.current_idle, 1);
+        assert_eq!(stats.total_closed, 1);
+        assert_eq!(stats.current_in_use, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pool_manager_get_or_create_is_singleton_per_addr() {
+        let addr = spawn_tcp_server().await;
+        let manager = PoolManager::new(PoolConfig::default());
+
+        let p1 = manager.get_or_create_pool(addr).await;
+        let p2 = manager.get_or_create_pool(addr).await;
+        assert!(
+            Arc::ptr_eq(&p1, &p2),
+            "same addr should reuse the same pool"
+        );
+
+        // get_pool 能查到，remove_pool 后查不到
+        assert!(manager.get_pool(addr).await.is_some());
+        manager.remove_pool(addr).await;
+        assert!(manager.get_pool(addr).await.is_none());
+    }
+
+    #[test]
+    fn test_pooled_conn_mark_used_counts() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let addr = spawn_tcp_server().await;
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let mut conn = PooledConn::new(stream);
+            assert_eq!(conn.use_count, 0);
+            conn.mark_used();
+            conn.mark_used();
+            assert_eq!(conn.use_count, 2);
+            assert!(!conn.is_expired(Duration::from_secs(60), Duration::from_secs(3600)));
+        });
+    }
 }

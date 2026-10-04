@@ -532,8 +532,7 @@ impl VisitorManager for ClientVisitorManager {
 
 /// 构建客户端 TLS 配置（供控制连接与工作连接复用）
 ///
-/// - 配置了 `trusted_ca_file` → 使用 CA 证书验证（推荐）
-/// - `trusted_ca_file` 已配置 → 用该 CA 验证服务器证书
+/// - 配置了 `trusted_ca_file` → 用该 CA 验证服务器证书（推荐）
 /// - `trusted_ca_file` 未配置且 `skip_verify = true` → 跳过证书验证（仅加密，不认证）
 /// - `trusted_ca_file` 未配置且 `skip_verify = false`（默认）→ **报错拒绝启动**（fail-closed），
 ///   避免在用户不知情时静默退化为"只加密不认证"
@@ -577,12 +576,14 @@ fn work_conn_port_of(config: &rust_frp_config::ClientConfig) -> u16 {
 
 /// 客户端连接器
 pub struct Connector {
-    config: rust_frp_config::ClientConfig,
+    config: Arc<rust_frp_config::ClientConfig>,
     conn_manager: ConnManager,
 }
 
 impl Connector {
-    pub fn new(config: rust_frp_config::ClientConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        config: Arc<rust_frp_config::ClientConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let tls_config = build_client_tls_config(&config)?;
 
         let conn_manager = ConnManager::new(tls_config, config.transport.pool_count as usize);
@@ -684,7 +685,7 @@ pub struct ClientControl {
     visitor_manager: Arc<ClientVisitorManager>,
     auth_manager: Arc<AuthManager>,
     work_conn_manager: Arc<WorkConnManager>,
-    config: ClientConfig,
+    config: Arc<ClientConfig>,
     udp_sockets: RwLock<std::collections::HashMap<String, Arc<tokio::net::UdpSocket>>>,
     udp_resp_tx: tokio::sync::mpsc::Sender<Message>,
     udp_resp_rx: tokio::sync::mpsc::Receiver<Message>,
@@ -702,20 +703,32 @@ pub struct ClientControl {
     xtcp_registry: Arc<XtcpRegistry>,
 }
 
+/// 登录成功后构造控制会话所需的依赖集合（收敛 9 个独立参数，避免参数顺序误用）
+pub struct ClientControlDeps {
+    pub conn: ControlConn,
+    pub run_id: String,
+    pub proxy_manager: Arc<ClientProxyManager>,
+    pub visitor_manager: Arc<ClientVisitorManager>,
+    pub auth_manager: Arc<AuthManager>,
+    pub work_conn_manager: Arc<WorkConnManager>,
+    pub config: Arc<ClientConfig>,
+    pub work_conn_tls: bool,
+    pub mux_session: Option<Arc<MuxSession>>,
+}
+
 impl ClientControl {
-    // 参数收敛为上下文结构体属结构性重构，另行立项（评审 P2 备注）
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        conn: ControlConn,
-        run_id: String,
-        proxy_manager: Arc<ClientProxyManager>,
-        visitor_manager: Arc<ClientVisitorManager>,
-        auth_manager: Arc<AuthManager>,
-        work_conn_manager: Arc<WorkConnManager>,
-        config: ClientConfig,
-        work_conn_tls: bool,
-        mux_session: Option<Arc<MuxSession>>,
-    ) -> Self {
+    pub fn new(deps: ClientControlDeps) -> Self {
+        let ClientControlDeps {
+            conn,
+            run_id,
+            proxy_manager,
+            visitor_manager,
+            auth_manager,
+            work_conn_manager,
+            config,
+            work_conn_tls,
+            mux_session,
+        } = deps;
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(256);
         let (stcp_tx, stcp_rx) = tokio::sync::mpsc::channel::<Message>(100);
         Self {
@@ -841,7 +854,7 @@ impl ClientControl {
                 );
                 let proxy_name = req_work_conn_msg.proxy_name.clone();
                 let run_id = self.run_id.clone();
-                let config = self.config.clone();
+                let config = Arc::clone(&self.config);
                 let work_conn_tls = self.work_conn_tls;
                 let mux_session = self.mux_session.clone();
 
@@ -1399,7 +1412,7 @@ async fn start_stcp_visitor(
     proxy_name: String,
     stcp_tx: tokio::sync::mpsc::Sender<Message>,
     run_id: String,
-    config: ClientConfig,
+    config: Arc<ClientConfig>,
     work_conn_tls: bool,
     xtcp_registry: Arc<XtcpRegistry>,
 ) {
@@ -1428,7 +1441,7 @@ async fn start_stcp_visitor(
                 let pn = proxy_name.clone();
                 let tx = stcp_tx.clone();
                 let rid = run_id.clone();
-                let cfg = config.clone();
+                let cfg = Arc::clone(&config);
                 let wct = work_conn_tls;
                 let reg = xtcp_registry.clone();
                 tokio::spawn(async move {
@@ -1454,7 +1467,7 @@ async fn handle_stcp_visitor_conn(
     proxy_name: String,
     stcp_tx: tokio::sync::mpsc::Sender<Message>,
     run_id: String,
-    config: ClientConfig,
+    config: Arc<ClientConfig>,
     work_conn_tls: bool,
     xtcp_registry: Arc<XtcpRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1778,7 +1791,7 @@ impl HealthChecker {
 
 /// 客户端服务
 pub struct Client {
-    config: ClientConfig,
+    config: Arc<ClientConfig>,
     control: Option<Mutex<ClientControl>>,
     proxy_manager: Arc<ClientProxyManager>,
     visitor_manager: Arc<ClientVisitorManager>,
@@ -1814,7 +1827,11 @@ impl Client {
         let proxy_manager = Arc::new(proxy_manager_instance);
 
         let visitor_manager = Arc::new(ClientVisitorManager::new());
-        let connector = Connector::new(config.clone())?;
+
+        // 配置整体以 Arc 共享：控制连接、工作连接、STCP visitor 等热路径
+        // 只克隆指针而非深拷贝整个 ClientConfig
+        let config = Arc::new(config);
+        let connector = Connector::new(Arc::clone(&config))?;
 
         let mut web_server = None;
         if config.web_server.port > 0 {
@@ -1908,7 +1925,7 @@ impl Client {
                                 let bind_addr = format!("{}:{}", visitor.bind_addr, visitor.bind_port);
                                 let proxy_name = visitor.server_name.clone();
                                 let stcp_tx = stcp_tx.clone();
-                                let cfg = self.config.clone();
+                                let cfg = Arc::clone(&self.config);
                                 let rid = run_id.clone();
                                 let reg = xtcp_registry.clone();
                                 tokio::spawn(async move {
@@ -2160,22 +2177,21 @@ impl Client {
                 }
 
                 // 创建客户端控制（work_conn_tls 来自服务器协商）
-                let run_id = login_resp_msg.run_id.clone();
                 let work_conn_tls = login_resp_msg.work_conn_tls;
                 if work_conn_tls {
                     log::info!("Server negotiated TLS for work connections");
                 }
-                let control = ClientControl::new(
+                let control = ClientControl::new(ClientControlDeps {
                     conn,
-                    login_resp_msg.run_id,
-                    self.proxy_manager.clone(),
-                    self.visitor_manager.clone(),
-                    self.auth_manager.clone(),
-                    self.work_conn_manager.clone(),
-                    self.config.clone(),
+                    run_id: login_resp_msg.run_id,
+                    proxy_manager: Arc::clone(&self.proxy_manager),
+                    visitor_manager: Arc::clone(&self.visitor_manager),
+                    auth_manager: Arc::clone(&self.auth_manager),
+                    work_conn_manager: Arc::clone(&self.work_conn_manager),
+                    config: Arc::clone(&self.config),
                     work_conn_tls,
                     mux_session,
-                );
+                });
                 self.control = Some(Mutex::new(control));
 
                 log::info!("login to server success, run_id: {}", run_id);
@@ -2215,11 +2231,10 @@ impl Client {
     pub async fn reload_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(config_path) = &self.config_path {
             let new_config = rust_frp_config::ConfigLoader::load_client_config(config_path)?;
-            self.config = new_config;
+            self.config = Arc::new(new_config);
 
             // 重新启动所有代理
-            let proxies = self.config.proxies.clone();
-            for proxy in &proxies {
+            for proxy in &self.config.proxies {
                 self.proxy_manager
                     .add_proxy(proxy.clone())
                     .await
@@ -2227,16 +2242,16 @@ impl Client {
             }
 
             // 重新启动所有访问者
-            let visitors = self.config.visitors.clone();
-            for visitor in &visitors {
+            for visitor in &self.config.visitors {
                 self.visitor_manager
                     .add_visitor(visitor.clone())
                     .await
                     .map_err(|e| e.to_string())?;
             }
 
-            // 重新启动健康检查
+            // 重新启动健康检查（start_health_checks 需要 &mut self，先取出列表）
             self.stop_health_checks().await;
+            let proxies = self.config.proxies.clone();
             self.start_health_checks(&proxies).await;
 
             log::info!("config reloaded successfully");
@@ -2309,5 +2324,120 @@ mod tls_config_tests {
             "{}",
             err
         );
+    }
+}
+
+#[cfg(test)]
+mod client_manager_tests {
+    use super::*;
+    use rust_frp_config::{ClientConfig, ProxyConfig, VisitorConfig};
+
+    fn proxy(name: &str, r#type: &str) -> ProxyConfig {
+        ProxyConfig {
+            name: name.to_string(),
+            r#type: r#type.to_string(),
+            ..ProxyConfig::default()
+        }
+    }
+
+    fn visitor(name: &str) -> VisitorConfig {
+        VisitorConfig {
+            name: name.to_string(),
+            r#type: "stcp".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
+            bind_port: 0,
+            ..VisitorConfig::default()
+        }
+    }
+
+    // 注册为不支持的代理类型：只写入注册表、不启动本地监听，避免端口占用
+    #[tokio::test]
+    async fn test_proxy_manager_add_status_remove_clear() {
+        use rust_frp_core::ProxyManager;
+        let mgr = ClientProxyManager::new();
+
+        mgr.add_proxy(proxy("web", "unsupported-for-test"))
+            .await
+            .unwrap();
+        assert_eq!(
+            mgr.get_proxy_status("web").await.unwrap(),
+            Some("running".to_string())
+        );
+        assert_eq!(mgr.get_proxy_status("missing").await.unwrap(), None);
+
+        mgr.remove_proxy("web").await.unwrap();
+        assert_eq!(mgr.get_proxy_status("web").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_manager_clear() {
+        use rust_frp_core::ProxyManager;
+        let mgr = ClientProxyManager::new();
+        mgr.add_proxy(proxy("a", "unsupported-for-test"))
+            .await
+            .unwrap();
+        mgr.add_proxy(proxy("b", "unsupported-for-test"))
+            .await
+            .unwrap();
+        mgr.clear().await;
+        assert_eq!(mgr.get_proxy_status("a").await.unwrap(), None);
+        assert_eq!(mgr.get_proxy_status("b").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_visitor_manager_add_remove_clear() {
+        use rust_frp_core::VisitorManager;
+        let mgr = ClientVisitorManager::new();
+
+        mgr.add_visitor(visitor("v1")).await.unwrap();
+        mgr.add_visitor(visitor("v2")).await.unwrap();
+        assert_eq!(mgr.visitors.read().await.len(), 2);
+
+        mgr.remove_visitor("v1").await.unwrap();
+        assert_eq!(mgr.visitors.read().await.len(), 1);
+        assert!(mgr.visitors.read().await.contains_key("v2"));
+
+        mgr.clear().await;
+        assert!(mgr.visitors.read().await.is_empty());
+    }
+
+    #[test]
+    fn test_work_conn_port_of_default_and_override() {
+        let mut cfg = ClientConfig {
+            server_port: 7100,
+            work_conn_port: None,
+            ..ClientConfig::default()
+        };
+        assert_eq!(work_conn_port_of(&cfg), 8100);
+
+        cfg.work_conn_port = Some(7400);
+        assert_eq!(work_conn_port_of(&cfg), 7400);
+    }
+
+    #[tokio::test]
+    async fn test_health_checker_without_config_exits_immediately() {
+        // 未配置 health_check 时检查任务应立即返回而不是空转
+        let checker = HealthChecker::new(proxy("no-hc", "tcp"));
+        let handle = checker.start();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("health checker should exit immediately without health_check config")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_arc_config_sharing_is_cheap_and_consistent() {
+        // 热路径共享 Arc<ClientConfig>：克隆是 O(1) 指针拷贝，指向同一份配置
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            ..ClientConfig::default()
+        };
+        let cfg = Arc::new(cfg);
+
+        let shared = Arc::clone(&cfg);
+        assert_eq!(shared.server_addr, cfg.server_addr);
+        assert_eq!(shared.server_port, cfg.server_port);
+        assert_eq!(Arc::strong_count(&cfg), 2);
     }
 }

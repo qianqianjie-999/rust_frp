@@ -894,9 +894,18 @@ impl StcpBridgeManager {
                 Ok(None)
             } else if state.conn2.is_none() {
                 state.conn2 = Some(conn);
-                let mut state = bridges.remove(bridge_id).unwrap();
-                let c1 = state.conn1.take().unwrap();
-                let c2 = state.conn2.take().unwrap();
+                // 不变量：bridge 存在于 map 且 conn1/conn2 均已就位（上方分支保证）
+                let mut state = bridges
+                    .remove(bridge_id)
+                    .expect("bridge state must exist (checked above)");
+                let c1 = state
+                    .conn1
+                    .take()
+                    .expect("conn1 must be set before bridging");
+                let c2 = state
+                    .conn2
+                    .take()
+                    .expect("conn2 must be set before bridging");
                 Ok(Some((c1, c2)))
             } else {
                 Ok(None)

@@ -207,14 +207,12 @@ impl Server {
         let addr =
             format!("{}:{}", self.config.bind_addr, vhost_http_port).parse::<SocketAddr>()?;
         let vhost_listener = HttpVhostListener::bind(&addr).await?;
-        self.vhost_http_listener = Some(vhost_listener);
-
-        // 启动 HTTP 虚拟主机连接处理任务
+        // 启动 HTTP 虚拟主机连接处理任务（先借用局部监听器，再存入字段，避免回读后 unwrap）
         let http_vhost_router = self.proxy_manager.get_http_vhost_router();
-        let vhost_listener = self.vhost_http_listener.as_ref().unwrap();
         let metrics = self.metrics.clone();
-        self.start_http_vhost_handler(vhost_listener, http_vhost_router, metrics)
+        self.start_http_vhost_handler(&vhost_listener, http_vhost_router, metrics)
             .await?;
+        self.vhost_http_listener = Some(vhost_listener);
 
         // 启动 HTTPS 虚拟主机监听器
         let tls_config = self.conn_manager.get_tls_config();
@@ -224,15 +222,14 @@ impl Server {
             let addr =
                 format!("{}:{}", self.config.bind_addr, vhost_https_port).parse::<SocketAddr>()?;
             let vhost_listener = HttpsVhostListener::bind(&addr, tls_cfg.clone()).await?;
-            self.vhost_https_listener = Some(vhost_listener);
             log::info!("HTTPS vhost listener started on {}", addr);
 
-            // 启动 HTTPS 虚拟主机连接处理任务
+            // 启动 HTTPS 虚拟主机连接处理任务（先借用局部监听器，再存入字段，避免回读后 unwrap）
             let http_vhost_router = self.proxy_manager.get_http_vhost_router();
-            let vhost_listener = self.vhost_https_listener.as_ref().unwrap();
             let metrics = self.metrics.clone();
-            self.start_https_vhost_handler(vhost_listener, http_vhost_router, metrics)
+            self.start_https_vhost_handler(&vhost_listener, http_vhost_router, metrics)
                 .await?;
+            self.vhost_https_listener = Some(vhost_listener);
         } else {
             log::warn!("No TLS config available, HTTPS vhost disabled");
         }
