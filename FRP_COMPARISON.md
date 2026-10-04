@@ -12,14 +12,14 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~217 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 功能点覆盖率 | **约 93%**（44 项能力点中 42 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计、优雅关闭、tcpmux、sudp、服务端 HTTP 插件、完整 OIDC 实联、QUIC 传输已于 2026-10-04 落地） | 100%（基线） | — |
+| 功能点覆盖率 | **约 95%**（44 项能力点中 43 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计、优雅关闭、tcpmux、sudp、服务端 HTTP 插件、完整 OIDC 实联、QUIC 传输、tokenSource 动态令牌已于 2026-10-04 落地） | 100%（基线） | — |
 | 配置字段兼容 | ✅ 双向兼容（alias） | camelCase | 原版配置可直接复用（2026-10-04 起） |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify/reload/status | reload/status/stop/verify/… | reload/status/verify 已补齐 |
 | 安全默认值 | ✅ 更保守（见第九节） | 一般 | **rust 更严** |
 | 运行时依赖 | rustls/ring + quinn（无 OpenSSL、无 C 依赖） | golib/quic-go/kcp-go | 均为单二进制 |
 
-**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型全覆盖、TLS/KCP/QUIC/WebSocket 传输、应用层加密与压缩、STCP/XTCP 真打洞、负载均衡、限速、连接池、tcpmux/sudp、服务端 HTTP 插件回调、OIDC 真实验签），**剩余缺口集中在「少数企业特性」**——http2http/http2https、virtual_net、tokenSource、SSH 隧道网关、wss 等。**它现在是一个「内核达标、周边基本补齐」的实现，P1 能力缺口已全部清零**。
+**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型全覆盖、TLS/KCP/QUIC/WebSocket 传输、应用层加密与压缩、STCP/XTCP 真打洞、负载均衡、限速、连接池、tcpmux/sudp、服务端 HTTP 插件回调、OIDC 真实验签），**剩余缺口集中在「少数企业特性」**——http2http/http2https、virtual_net、SSH 隧道网关、wss 等。**它现在是一个「内核达标、周边基本补齐」的实现，P1 能力缺口已全部清零**。
 
 ---
 
@@ -31,10 +31,10 @@
 | 传输与协议 | 8/8 | 100% | — |
 | 插件体系 | 7/8 | 88% | http2http、http2https、virtual_net |
 | 配置兼容 | 4/5 | 80% | 严格未知字段校验（现为 WARN 告警模式，见 P0-2） |
-| 认证与安全 | 5/7 | 71% | tokenSource、SSH 隧道；OIDC 未实现 `additionalScopes` |
+| 认证与安全 | 6/7 | 86% | SSH 隧道；OIDC 未实现 `additionalScopes` |
 | 管理 API | 4/4 | 100% | — |
 | CLI 运维 | 3/3 | 100% | — |
-| **合计** | **42/44** | **93%** | — |
+| **合计** | **43/44** | **95%** | — |
 
 > 计分口径：一项能力「等价或更强」记 1 分；缺失 / 仅占位 / 显著弱化记 0 分。
 
@@ -99,7 +99,7 @@
 | token 认证 | ✅ | ✅ | 双方常量时间比较 |
 | 工作连接签名 | ✅ HMAC-SHA256 + run_id | ✅ `GetAuthKey(token,ts)` | 等价（rust fail-closed：配了 token 就强制验签） |
 | OIDC 认证 | ✅ | ✅ 完整 | rust 已实现 Discovery + JWKS + RS256/ES256 验签（含 `kid` 选钥与轮转）与客户端 `client_credentials` 取令牌；仅 `additionalScopes` 未做 |
-| tokenSource（file/exec 动态取 token） | ❌ | ✅ | 原版可避免明文写 token |
+| tokenSource（file/exec 动态取 token） | ✅ | ✅ | 2026-10-04 落地：`type = "file"` 读文件 / `type = "exec"` 执行命令取 stdout；与静态 `token` 互斥，客户端启动/重载时解析（仅存内存） |
 | auth additionalScopes | ⚠️ 部分 | ✅ HeartBeats / NewWorkConns | — |
 | SSH 隧道网关 | ❌ | ✅ `SSHTunnelGateway`（forwarded-tcpip） | 原版独有 |
 | FeatureGate / --allow-unsafe | ❌ | ✅ | 原版独有 |
@@ -207,13 +207,13 @@
 | 12 | ~~流量统计 / 客户端详情 API~~ | ✅ 已实现（2026-10-04）：桥接结束累加双向字节，服务端 `/api/proxies` + Prometheus、客户端 `frpc status` 暴露 |
 
 ### P2 — 增强项（原版有、非必需）
-vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧道网关、tokenSource、端口保留（断线 24h）、PROXY protocol v2（rust 仅 v1）、服务端带宽限制模式、legacy INI 配置、wire protocol v2。
+vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧道网关、端口保留（断线 24h）、PROXY protocol v2（rust 仅 v1）、服务端带宽限制模式、legacy INI 配置、wire protocol v2。
 
 ---
 
 ## 十一、结论与建议
 
-**定位判断**：rust_frp 的**数据面（data plane）已达标**——TCP/UDP/HTTP/HTTPS/STCP/XTCP/tcpmux/sudp 转发、TLS/KCP/QUIC/WebSocket 传输、AES-256-GCM 应用层加密、snappy 压缩、STUN 真打洞、负载均衡、健康检查、限速、连接池、配置热重载全部可用。**控制面**（CLI、配置管理 API、服务端 HTTP 插件回调、流量统计、优雅关闭、OIDC 真实验签）已基本补齐，**P1 能力缺口全部清零**，剩余短板仅为 **wire protocol v2 与少数生态特性（virtual_net、SSH 隧道网关、wss、tokenSource）**。
+**定位判断**：rust_frp 的**数据面（data plane）已达标**——TCP/UDP/HTTP/HTTPS/STCP/XTCP/tcpmux/sudp 转发、TLS/KCP/QUIC/WebSocket 传输、AES-256-GCM 应用层加密、snappy 压缩、STUN 真打洞、负载均衡、健康检查、限速、连接池、配置热重载全部可用。**控制面**（CLI、配置管理 API、服务端 HTTP 插件回调、流量统计、优雅关闭、OIDC 真实验签）已基本补齐，**P1 能力缺口全部清零**，剩余短板仅为 **wire protocol v2 与少数生态特性（virtual_net、SSH 隧道网关、wss）**。
 
 **建议路线（按投入产出排序）**：
 1. ~~**配置兼容层**（P0-1/2）~~ ✅ 已落地（2026-10-04）：serde `alias` 双向兼容 + 未知字段 WARN 告警，新增 `rust_frp_config::compat` 模块与原版风格配置回归测试。
@@ -224,6 +224,7 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 6. ~~**tcpmux / sudp**（P1-8/9）~~ ✅ 已落地（2026-10-04）：代理类型 9/9 全覆盖，tcpmux 支持域名 + HTTP 用户路由，sudp 为 UDP over STCP 隧道。
 7. ~~**服务端插件机制**（P1-10）~~ ✅ 已落地（2026-10-04）：六类 HTTP 回调钩子，支持 reject / 覆写，扩展性问题已解决。
 8. ~~**QUIC 传输**（P1-5）~~ ✅ 已落地（2026-10-04）：quinn 0.11 + rustls-ring，TLS 1.3 强制、单 UDP 端口多路复用控制+工作连接、按流首帧分派、客户端 fail-closed 校验。**至此 P1 能力缺口（「功能对不齐」项）已全部清零。**
+9. ~~**tokenSource 动态取 token**（认证增强）~~ ✅ 已落地（2026-10-04）：`auth.tokenSource` 支持 `type = "file"`（读文件）/`type = "exec"`（执行命令取 stdout 取 token），与静态 `token` 互斥，客户端启动与配置重载时解析（结果仅存内存）。认证与安全覆盖 5/7 → 6/7。
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关——这些是原版的「生态扩展」，除非有明确场景，否则投入产出比低。
 
@@ -236,4 +237,5 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 - 2026-10-04（tcpmux/sudp 轮）：上述「应用层压缩 / tcpmux / sudp」三行均已更新为 ✅（tcpmux/sudp 本轮落地）。
 - 2026-10-04（服务端插件轮）：新增「服务端 HTTP 插件 ✅」一行；插件体系覆盖 7/8，合计覆盖率 86% → **88%（39/44）**。
 - 2026-10-04（OIDC 实联轮）：OIDC 由「仅本地 HS256」升级为「Discovery + JWKS + RS256/ES256 验签 + 客户端 `client_credentials` 取令牌」，认证与安全覆盖 4/7 → 5/7，合计覆盖率 **88% → 91%（40/44）**；同时修复 `compat` 已知键集漏 `http_plugins` 的回归（该漏项会让服务端插件配置被整体误报为未知字段）。
+- 2026-10-04（tokenSource 轮）：新增 `auth.tokenSource`（`file`/`exec` 动态取 token，与静态 `token` 互斥），**认证与安全覆盖 5/7 → 6/7**，合计覆盖率 **93% → 95%（43/44）**；README 状态表新增 tokenSource 行、功能清单与场景章节，`frpc.example.toml` 补 tokenSource 示例。
 - 2026-10-04（QUIC 轮）：QUIC 由「仅配置占位」升级为「quinn 0.11 完整实现」，传输与协议覆盖 7/8 → **8/8**，合计覆盖率 **91% → 93%（42/44）**；README 状态表 QUIC 行 🚧 → ✅，新增 QUIC 场景/协议章节、`quic_bind_port` 端口表与 `[transport.quic]` 示例。同时清理死依赖：`rustls 0.23` 改 `rustls-ring` backend、移除 `aws-lc-rs` C 依赖（`cargo tree -i aws-lc-rs` 已无匹配），「无 C 依赖」成为字面事实。

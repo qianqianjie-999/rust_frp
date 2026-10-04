@@ -1099,6 +1099,7 @@ mod tests {
             method: "token".to_string(),
             token: Some("my_token".to_string()),
             oidc: None,
+            token_source: None,
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_ok());
@@ -1110,6 +1111,7 @@ mod tests {
             method: "token".to_string(),
             token: None,
             oidc: None,
+            token_source: None,
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_err());
@@ -1121,6 +1123,7 @@ mod tests {
             method: "unknown".to_string(),
             token: Some("token".to_string()),
             oidc: None,
+            token_source: None,
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_err());
@@ -1132,6 +1135,7 @@ mod tests {
             method: "token".to_string(),
             token: Some("my_token".to_string()),
             oidc: None,
+            token_source: None,
         };
         let manager = AuthManager::new(&config).unwrap();
         assert!(manager.encryption_key().is_some());
@@ -1144,6 +1148,7 @@ mod tests {
             method: "token".to_string(),
             token: Some("my_token".to_string()),
             oidc: None,
+            token_source: None,
         };
         let manager = AuthManager::new(&config).unwrap();
         assert!(manager.verify_login("user", "my_token").await.is_ok());
@@ -1156,6 +1161,7 @@ mod tests {
             method: "token".to_string(),
             token: Some("my_token".to_string()),
             oidc: None,
+            token_source: None,
         };
         let manager = AuthManager::new(&config).unwrap();
         let key1 = manager
@@ -1606,6 +1612,7 @@ ifGHE5azp2Lav/Kni6rRwBQ=
             method: "oidc".to_string(),
             token: None,
             oidc: Some(oidc_cfg("https://issuer.example.com", "frp-server")),
+            token_source: None,
         };
         assert!(AuthManager::new(&ok).is_ok());
 
@@ -1613,6 +1620,7 @@ ifGHE5azp2Lav/Kni6rRwBQ=
             method: "oidc".to_string(),
             token: None,
             oidc: None,
+            token_source: None,
         };
         assert!(AuthManager::new(&missing).is_err());
     }
