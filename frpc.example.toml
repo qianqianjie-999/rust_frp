@@ -51,6 +51,14 @@ token = "CHANGE_ME_RANDOM_LONG_TOKEN"
 # --- 传输配置 ---
 [transport]
 protocol = "tcp"
+# ── 可选：改用 WebSocket / WSS（仅放行 HTTP 的网关、企业代理后推荐）──
+# 把上面一行改为 protocol = "websocket"（明文 WebSocket）或 protocol = "wss"
+# （TLS + WebSocket）。服务端无需任何额外配置：它在控制端口按 `GET /~!frp`
+# 前缀自动识别 WebSocket 升级（TLS 场景在握手完成后于解密流上嗅探）。
+#   * "websocket"：是否叠加 TLS 仍由 [transport.tls] 决定（enable = true 即叠加）
+#   * "wss"：强制 TLS，和 quic 一样必须声明信任来源，否则启动即报错：
+#       - 推荐：transport.tls.trusted_ca_file = "/etc/frp/certs/ca.crt"
+#       - 或：  transport.tls.skip_verify = true（只加密不认证，仅限测试/自签名环境）
 # ── 可选：改用 QUIC（弱网推荐）──
 # 把上面一行改为 protocol = "quic" 即启用。QUIC 强制 TLS 1.3、无明文模式，
 # 因此必须显式声明信任来源，否则启动即报错（与 TLS 一致的 fail-closed）：

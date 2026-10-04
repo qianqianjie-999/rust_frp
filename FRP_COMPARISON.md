@@ -15,7 +15,7 @@
 
 - 数字由 95% 下调至 **≈68%**，**不代表功能退化**，而是度量更细、更严格；
 - 旧版把「代理类型 9/9、传输 8/8、管理 API 4/4、CLI 3/3」记满，本次核对后确认
-  其中 **wss、wire v2、frps 大半 API、frpc stop/nathole/子命令、Store、vnet、
+  其中 **wire v2、frps 大半 API、frpc stop/nathole/子命令、Store、vnet、
   additionalScopes、SSH 隧道、tracer** 等均未落地，属实打实的缺口。
 
 > 一句话：**数据面已基本对齐，控制面/运维面仍偏瘦。**这与旧版结论方向一致，但差距幅度此前被低估。
@@ -29,7 +29,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~322 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 能力覆盖率 | **≈ 68%（50/73）** ｜ 数据面 **88%（23/26）**、控制/运维面 **57%（27/47）** | 100%（基线） | 见第二节 |
+| 能力覆盖率 | **≈ 70%（51/73）** ｜ 数据面 **92%（24/26）**、控制/运维面 **57%（27/47）** | 100%（基线） | 见第二节 |
 | 配置字段兼容 | ⚠️ 双向 alias 兼容，但**约 25+ 个原版字段未支持**（解析成功 + WARN） | camelCase + 严格模式 | 原版配置**可加载**但部分字段不生效 |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify / reload / status | reload / status / stop / verify / nathole / 每类代理 | rust 明显偏少 |
@@ -48,7 +48,7 @@
 | 分类 | 覆盖 | 覆盖率 | 主要缺口 |
 |------|:----:|:------:|----------|
 | 代理类型 | **8/8** | 100% | —（rust 另多 1 种 `websocket` 代理类型） |
-| 传输协议 | **4/5** | 80% | `wss`（rust 有 websocket+TLS，但未暴露为一键协议名） |
+| 传输协议 | **5/5** | 100% | —（`wss` 已落地，见 五、传输与协议对照） |
 | 内部线协议 | **1/2** | 50% | wire protocol v2（魔数分帧 + AEAD + 能力协商） |
 | 数据面能力 | **10/11** | 91% | PROXY protocol v2（rust 仅 v1 布尔开关） |
 | 客户端插件 | **7/10** | 70% | `http2http`、`http2https`、`virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 仍仅支持 CONNECT） |
@@ -58,13 +58,13 @@
 | frpc 管理 API | **3/5** | 60% | `/api/stop`、Store 源代理 CRUD |
 | CLI | **4/8** | 50% | `stop`、`nathole`、每类代理/访客子命令、`--config_dir` |
 | 配置体系 | **4/6** | 67% | Store 配置源、FeatureGates |
-| **合计** | **50/73** | **≈68%** | — |
+| **合计** | **51/73** | **≈70%** | — |
 
 **分组小结**：
 
 | 分组 | 覆盖 | 说明 |
 |------|:----:|------|
-| 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **23/26（88%）** | 转发链路基本对齐 |
+| 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **24/26（92%）** | 转发链路基本对齐 |
 | 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **27/47（57%）** | 运维丰富度差距明显 |
 
 > 计分口径：一项能力「确实可用且与原版等价（或更强）」记 1 分；缺失 / 仅占位 / 显著弱化 / 未强制记 0 分。
@@ -111,7 +111,7 @@
 | kcp | ✅ | ✅ | rust 自研 `kcp_stream.rs`；原版用 `xtaci/kcp-go` |
 | quic | ✅ | ✅ | rust 基于 quinn 0.11（TLS 1.3 强制），单 UDP 连接多路复用控制+工作连接 |
 | websocket | ✅ | ✅ | rust 有 `WebSocketConn` / `accept_websocket` |
-| **wss** | ❌ | ✅ | rust 未暴露 `wss` 一键协议（需自行在 websocket 上叠加 TLS） |
+| **wss** | ✅ | ✅ | rust：TLS 之上叠加 WebSocket（路径 `/~!frp`），服务端在 TLS 握手后嗅探升级；fail-closed 要求信任来源 |
 | **wire protocol v2** | ❌ | ✅ | 原版 `pkg/proto/wire`（能力协商 + AEAD aes-256-gcm/xchacha20） |
 | tcp_mux | ✅ | ✅ | rust `mux.rs`（魔数 `0x5A`）；原版 wire v1 内置 |
 | TLS 默认加密 | ✅（默认 on） | ✅（默认 on） | 双方无证书时均**运行时自签** |
@@ -288,7 +288,7 @@
 | 11 | ~~优雅关闭~~ | ✅ 已落地 |
 | 12 | ~~流量统计~~ | ✅ 已落地 |
 | 13 | ~~`http_proxy`/`socks5` 插件级认证未强制~~ | ✅ 已落地（http_proxy → 407；socks5 → RFC 1929）。**残留**：`http_proxy` 仅支持 CONNECT |
-| 14 | **`wss` 传输** | ❌ websocket+TLS 未暴露为 `wss` 协议名 |
+| 14 | ~~`wss` 传输~~ | ✅ 已落地（TLS + WebSocket，`/~!frp` 路径，双端嗅探升级；3 个 e2e 测试） |
 | 15 | **frpc `stop` / `nathole` / 每类代理子命令 / `--config_dir`** | ❌ CLI 面偏瘦 |
 | 16 | **frps API 补齐**（serverinfo / 按类型名称查询 / clients / v2 套件 / DELETE offline） | ❌ 运维 API 偏瘦 |
 | 17 | **wire protocol v2** | ❌ 线协议仍为 v1 等价实现 |
@@ -304,20 +304,20 @@ PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start
 ## 十三、结论与建议路线
 
 **定位判断**：rust_frp 的**数据面已基本对齐**——TCP/UDP/HTTP/HTTPS/STCP/XTCP/tcpmux/sudp
-转发、TLS/KCP/QUIC/WebSocket 传输、AES-256-GCM 应用层加密、snappy 压缩、STUN 真打洞、
+转发、TLS/KCP/QUIC/WebSocket/WSS 传输、AES-256-GCM 应用层加密、snappy 压缩、STUN 真打洞、
 负载均衡、健康检查、限速、连接池、配置热重载、优雅关闭全部可用。
 **控制面/运维面覆盖约 57%**，缺口以「运维丰富度」和「少数生态特性」为主，
 **且已无阻塞使用的硬缺口**（P0 全部落地、P1 核心项落地）。
 
 **建议路线（按投入产出排序）**：
-1. **`wss` 传输** —— 复用已有 websocket+TLS 代码，仅需暴露协议名与握手分支。
+1. ~~**`wss` 传输**~~ —— ✅ 已完成（复用 websocket+TLS 代码 + 服务端嗅探升级）。
 2. **frps API 补齐**（serverinfo、按类型/名称查询、clients、DELETE offline）—— 前端与脚本运维需要。
 3. **frpc CLI 补齐**（`stop`、`--config_dir`）—— 运维便捷性。
 4. **`http2http` / `http2https` 插件** —— 引入 `h2`，自包含在插件 crate。
 5. **`http_proxy` 普通 HTTP 转发** —— 补齐与原版的最后一处插件语义差异。
 6. **wire protocol v2** —— 最大项，改线格式、回归风险高，建议放最后。
 
-> ✅ 已完成：`http_proxy` / `socks5` 插件级认证（原建议路线第 1 项）。
+> ✅ 已完成：`http_proxy` / `socks5` 插件级认证；`wss` 传输（原建议路线第 1 项）。
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关、FeatureGates——
 属原版「生态扩展」，除非有明确场景，否则投入产出比低。

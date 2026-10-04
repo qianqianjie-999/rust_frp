@@ -662,6 +662,18 @@ fn work_conn_port_of(config: &rust_frp_config::ClientConfig) -> u16 {
     config.work_conn_port.unwrap_or(config.server_port + 1000)
 }
 
+/// 解析服务器地址为 `SocketAddr`（支持 IP 字面量与域名）
+async fn resolve_server_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    if let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("failed to resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address resolved for {host}:{port}"))
+}
+
 /// 由 `transport.quic` 构造 QUIC 传输参数（未配置时用与原版 frp 一致的默认值）
 fn quic_options(config: &rust_frp_config::ClientConfig) -> rust_frp_net::QuicOptions {
     let q = config.transport.quic.as_ref();
@@ -716,16 +728,6 @@ impl Connector {
         let addr = format!("{}:{}", self.config.server_addr, self.config.server_port)
             .parse::<SocketAddr>()?;
         Ok(self.conn_manager.connect_kcp(&addr).await?)
-    }
-
-    pub async fn connect_websocket(
-        &mut self,
-        url: &str,
-    ) -> Result<
-        rust_frp_net::WebSocketConn<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-        Box<dyn std::error::Error>,
-    > {
-        Ok(self.conn_manager.connect_websocket(url).await?)
     }
 
     /// 建立到服务端的 QUIC 连接（控制连接与工作连接复用同一 QUIC 连接）
@@ -3089,15 +3091,47 @@ impl Client {
                 log::info!("QUIC control stream established");
                 (ControlConn::new(control_stream), Some(session))
             }
-            "websocket" => {
-                let scheme = if use_tls { "wss" } else { "ws" };
+            "websocket" | "wss" => {
+                // WebSocket 传输：TCP →（wss 时叠加 TLS）→ WebSocket 升级（路径 /~!frp）
+                let host = self.config.server_addr.clone();
                 let port = self.config.server_port;
-                let url = format!("{}://{}:{}/ws", scheme, self.config.server_addr, port);
-                let ws_conn = self
-                    .connector
-                    .connect_websocket(&url)
+                let addr = resolve_server_addr(&host, port).await?;
+                let tcp = tokio::net::TcpStream::connect(addr)
                     .await
-                    .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+                    .map_err(|e| format!("WebSocket TCP connect to {host}:{port} failed: {e}"))?;
+
+                let ws_conn: rust_frp_net::WebSocketConn<rust_frp_net::AnyConn> =
+                    if protocol == "wss" {
+                        // wss 语义即为「TLS + WebSocket」：TLS 强制开启
+                        let tls_config = build_client_tls_config(&self.config)
+                            .map_err(|e| format!("failed to build client TLS config: {e}"))?
+                            .ok_or(
+                                "protocol = \"wss\" requires TLS: configure [transport.tls] with \
+                                 trusted_ca_file (pin server CA) or skip_verify = true",
+                            )?;
+                        let tls_stream = tls_config
+                            .connect(&host, tcp)
+                            .await
+                            .map_err(|e| format!("wss TLS handshake failed: {e}"))?;
+                        let url = format!("wss://{host}:{port}{}", rust_frp_net::FRP_WS_PATH);
+                        rust_frp_net::client_websocket_stream(
+                            Box::new(tls_stream) as rust_frp_net::AnyConn,
+                            &url,
+                            addr,
+                        )
+                        .await
+                        .map_err(|e| format!("wss WebSocket handshake failed: {e}"))?
+                    } else {
+                        let url = format!("ws://{host}:{port}{}", rust_frp_net::FRP_WS_PATH);
+                        rust_frp_net::client_websocket_stream(
+                            Box::new(tcp) as rust_frp_net::AnyConn,
+                            &url,
+                            addr,
+                        )
+                        .await
+                        .map_err(|e| format!("WebSocket handshake failed: {e}"))?
+                    };
+                log::info!("WebSocket control connection established ({protocol})");
                 (ControlConn::new(Box::new(ws_conn)), None)
             }
             _ if self.config.transport.tcp_mux => {
