@@ -77,6 +77,9 @@ pub(crate) struct ServerManagers {
 /// 服务器服务
 // 个别监听器字段（vhost_* / work_conn_listener）仅在对应功能启用时读取
 #[allow(dead_code)]
+/// 优雅关闭排空轮询间隔
+const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub struct Server {
     config: ServerConfig,
     pub(crate) control_manager: Arc<ControlManager>,
@@ -106,6 +109,8 @@ pub struct Server {
     reload_rx: Option<tokio::sync::mpsc::Receiver<()>>,
     /// 重载信号发送器（供 WebServer API 使用）
     pub(crate) reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    /// 优雅关闭通知（控制连接 accept 循环据此退出并按超时排空存量连接）
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Server {
@@ -200,6 +205,7 @@ impl Server {
             config_path,
             reload_rx: None,
             reload_tx: None,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -1088,7 +1094,9 @@ impl Server {
     }
 
     async fn handle_tcp_connections(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(listener) = &self.tcp_listener {
+        // 监听器 take 出来：优雅关闭时随局部变量 drop 而关闭套接字，
+        // 立即停止接收新连接（不再依赖进程退出强制回收）
+        if let Some(listener) = self.tcp_listener.take() {
             let tls_config = if let Some(ref tls) = self.config.transport.tls {
                 if tls.enable {
                     if let (Some(ref cert_file), Some(ref key_file)) =
@@ -1107,6 +1115,7 @@ impl Server {
 
             let mut reload_rx = self.reload_rx.take();
             let config_path = self.config_path.clone();
+            let shutdown = self.shutdown_notify.clone();
 
             loop {
                 if let Some(ref mut rx) = reload_rx {
@@ -1154,9 +1163,21 @@ impl Server {
                                 log::error!("Reload config failed: {}", e);
                             }
                         }
+                        // 优雅关闭：退出 accept 循环，监听器随作用域结束关闭
+                        _ = shutdown.notified() => {
+                            log::info!("Shutdown signal received, accept loop stopped");
+                            return Ok(());
+                        }
                     }
                 } else {
-                    let (conn, addr) = listener.accept().await?;
+                    let (conn, addr) = tokio::select! {
+                        result = listener.accept() => result?,
+                        // 优雅关闭：退出 accept 循环
+                        _ = shutdown.notified() => {
+                            log::info!("Shutdown signal received, accept loop stopped");
+                            return Ok(());
+                        }
+                    };
                     log::info!("new connection from: {:?}", addr);
                     self.metrics.increment_connections();
                     // 全局连接上限（P1-4）：超过即直接拒绝，不做排队
@@ -1539,6 +1560,34 @@ impl Server {
         Ok(())
     }
 
+    /// 优雅关闭句柄：通知后控制连接 accept 循环停止接收新连接
+    pub fn shutdown_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.shutdown_notify.clone()
+    }
+
+    /// 等待存量连接排空（优雅关闭第二步）。
+    ///
+    /// 每 [`DRAIN_POLL_INTERVAL`] 采样一次当前连接数：归零返回 `true`；
+    /// 超过 `timeout` 仍有余量则打印 WARN 并返回 `false`（调用方决定是否
+    /// 强制退出）。注意仅统计控制连接（工作连接随客户端断开自然回收）。
+    pub async fn wait_for_drain(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let current = self.metrics.current_connections();
+            if current == 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                log::warn!(
+                    "Graceful shutdown drain timeout: {} connection(s) still active",
+                    current
+                );
+                return false;
+            }
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+        }
+    }
+
     pub fn set_reload_rx(&mut self, rx: tokio::sync::mpsc::Receiver<()>) {
         self.reload_rx = Some(rx);
     }
@@ -1589,6 +1638,94 @@ impl Clone for Server {
             config_path: self.config_path.clone(),
             reload_rx: None,
             reload_tx: self.reload_tx.clone(),
+            shutdown_notify: self.shutdown_notify.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod graceful_shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_wait_for_drain_returns_immediately_when_idle() {
+        let metrics = Arc::new(MonitorMetrics::new());
+        let server = drain_test_server(metrics);
+        let start = std::time::Instant::now();
+        assert!(
+            server
+                .wait_for_drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_drain_waits_until_connections_close() {
+        let metrics = Arc::new(MonitorMetrics::new());
+        metrics.increment_connections();
+        let server = drain_test_server(metrics.clone());
+
+        // 150ms 后连接关闭 → 排空应成功（轮询 100ms 粒度）
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            metrics.decrement_connections();
+        });
+
+        assert!(
+            server
+                .wait_for_drain(std::time::Duration::from_secs(5))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_drain_times_out_with_active_connections() {
+        let metrics = Arc::new(MonitorMetrics::new());
+        metrics.increment_connections();
+        let server = drain_test_server(metrics);
+
+        assert!(
+            !server
+                .wait_for_drain(std::time::Duration::from_millis(250))
+                .await
+        );
+    }
+
+    /// 构造一个仅用于排空测试的最小 Server（不绑定任何端口）
+    fn drain_test_server(metrics: Arc<MonitorMetrics>) -> Server {
+        let mut config = rust_frp_config::ServerConfig::default();
+        // token 认证必须配置 token，测试用固定值
+        config.auth.token = Some("test-token".to_string());
+        Server {
+            control_manager: Arc::new(ControlManager::new()),
+            proxy_manager: Arc::new(ServerProxyManager::new(
+                Arc::new(HttpVhostRouter::new()),
+                Arc::new(RwLock::new(std::collections::HashMap::new())),
+                Arc::new(ControlManager::new()),
+                Arc::new(ServerWorkConnManager::new(1)),
+                Vec::new(),
+                None,
+            )),
+            visitor_manager: Arc::new(ServerVisitorManager::new()),
+            auth_manager: Arc::new(AuthManager::new(&config.auth).expect("default auth is valid")),
+            conn_manager: ConnManager::new(None, 1),
+            tcp_listener: None,
+            udp_listener: None,
+            vhost_http_listener: None,
+            vhost_https_listener: None,
+            work_conn_listener: None,
+            web_server: None,
+            metrics,
+            work_conn_manager: Arc::new(ServerWorkConnManager::new(1)),
+            proxy_owners: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            stcp_bridge_manager: Arc::new(StcpBridgeManager::new()),
+            xtcp_visitors: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            config_path: None,
+            reload_rx: None,
+            reload_tx: None,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            config,
         }
     }
 }
