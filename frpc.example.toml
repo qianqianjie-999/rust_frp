@@ -28,9 +28,11 @@ pool_count = 10
 # 启用 TLS
 [transport.tls]
 enable = true
-# ⚠️ 强烈建议配置 trusted_ca_file：不配置时客户端**不校验服务端证书**，
-#    TLS 只提供加密、不提供身份认证，无法防范中间人攻击。
+# 证书校验为 fail-closed 设计：既不配 trusted_ca_file 又不显式开 skip_verify 时，客户端拒绝启动。
+# ⚠️ 生产环境：配置 trusted_ca_file（推荐），用 CA 证书验证服务端身份，防中间人攻击。
 # trusted_ca_file = "/etc/frp/certs/ca.crt"
+# ⚠️ 仅限自签名测试环境：显式跳过证书验证（只加密、不认证，打印 WARN）。
+# skip_verify = true
 
 # --- 代理定义 ---
 
