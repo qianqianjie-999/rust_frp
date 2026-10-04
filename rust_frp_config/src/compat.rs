@@ -128,10 +128,6 @@ mod fields {
         "use_compression",
         "useCompression",
         "quic",
-        "bandwidth_limit_mode",
-        "bandwidthLimitMode",
-        "proxy_protocol_version",
-        "proxyProtocolVersion",
     ];
 
     pub const TLS: &[&str] = &[

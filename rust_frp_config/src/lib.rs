@@ -112,8 +112,9 @@ pub struct ServerConfig {
     pub bind_port: u16,
 
     /// KCP 协议绑定端口（可选，UDP）
-    // 路线图配置项：字段先随配置 schema 固化，协议实现后接通
-    #[allow(dead_code)]
+    ///
+    /// 配置后服务端在该端口上起 KCP endpoint；客户端 `transport.protocol = "kcp"` 即可接入。
+    /// 注意：KCP 为明文 UDP，与 `tls_only` 互斥（配置校验会拒绝）。
     #[serde(alias = "kcpBindPort")]
     pub kcp_bind_port: Option<u16>,
 
@@ -658,20 +659,6 @@ pub struct TransportConfig {
     /// QUIC 传输参数（`protocol = "quic"` 时生效，兼容原版 `transport.quic`）
     #[serde(default)]
     pub quic: Option<QuicConfig>,
-
-    /// 带宽限制模式（兼容原版 `transport.bandwidthLimitMode`，"client"/"server"）
-    ///
-    // 路线图配置项：仅 client 模式实际生效，server 模式未实现。
-    #[serde(default, alias = "bandwidthLimitMode")]
-    #[allow(dead_code)]
-    pub bandwidth_limit_mode: Option<String>,
-
-    /// PROXY protocol 版本（兼容原版 `transport.proxyProtocolVersion`，"v1"/"v2"）
-    ///
-    // 路线图配置项：本实现仅支持 v1（proxy_protocol 布尔开关），v2 未实现。
-    #[serde(default, alias = "proxyProtocolVersion")]
-    #[allow(dead_code)]
-    pub proxy_protocol_version: Option<String>,
 }
 
 impl Default for TransportConfig {
@@ -686,8 +673,6 @@ impl Default for TransportConfig {
             use_encryption: false,
             use_compression: false,
             quic: None,
-            bandwidth_limit_mode: None,
-            proxy_protocol_version: None,
         }
     }
 }

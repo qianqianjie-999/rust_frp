@@ -54,11 +54,17 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
-| PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP |
-| 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容），不支持的字段 WARN 提示 |
-| frpc CLI 子命令 | ✅ | `frpc verify`（校验配置）/ `frpc reload`（热重载）/ `frpc status`（代理状态），后两者走 frpc 管理端口（Basic Auth 保护） |
+| PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP（**仅 v1**；原版 v2 未实现） |
+| 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容）；**约 25+ 个原版字段暂未支持**，解析成功但会 WARN 提示（清单见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md) 第十节） |
+| frpc CLI 子命令 | ✅ | `frpc verify`（校验配置）/ `frpc reload`（热重载）/ `frpc status`（代理状态），后两者走 frpc 管理端口（Basic Auth 保护）；**尚未支持**原版的 `stop` / `nathole` / 每类代理子命令 / `--config_dir` |
 | 流量统计 | ✅ | 桥接结束累加双向字节：服务端 `/api/proxies`（`traffic_in/out`）+ Prometheus per-proxy 指标；客户端 `frpc status`（`traffic_down/up`） |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
+
+> **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 57%。尚未支持的主要项：
+> `wss` 传输、wire protocol v2、客户端插件 `http2http` / `http2https` / `virtual_net`、服务端 tracer、
+> `auth.additionalScopes`、SSH 隧道网关、frps 的 `serverinfo` / `clients` / `v2` API 套件、
+> `frpc stop` / `nathole` / 每类代理子命令、Store 配置源等。
+> 逐项源码级对照与本项目更严格的安全默认值，见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md)。
 
 ---
 
@@ -73,6 +79,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 会话机制 | 随机会话令牌 + 服务端存储 + 8 小时过期 + `HttpOnly; SameSite=Strict` | 反向代理声明 `X-Forwarded-Proto: https` 时会自动附加 `Secure` |
 | 配置文件 | `frpc.toml` / `frps.toml` 已被 `.gitignore` 忽略，仅提供 `*.example.toml` | 不要把含 token/密码的配置提交进版本库 |
 | STCP/XTCP 访问鉴权 | 已实现 `secret_key` 签名校验（fail-closed：代理未配 `secret_key` 时拒绝一切访问请求）；支持跨客户端访问 | 代理与访问者配置一致的强 `secret_key` |
+| 插件认证 | `http_proxy` / `socks5` 插件配置中的用户名密码**当前不生效**（字段已解析但未在转发流程校验） | 如需访问控制，改用代理级 `http_user` / `http_password`，或服务端 `[[http_plugins]]` 回调 |
 
 ---
 
@@ -86,7 +93,7 @@ rust_frp/
 │                             metrics 监控 / secrets STCP-XTCP 密钥 / visitor / error
 ├── rust_frp_client/        # 客户端：工作连接建立、PROXY protocol、本地服务桥接
 ├── rust_frp_config/        # 配置：TOML/YAML/JSON 解析、验证、环境变量
-├── rust_frp_net/           # 网络：TCP/TLS/WebSocket、连接池 (rustls)
+├── rust_frp_net/           # 网络：TCP/TLS/WebSocket/KCP/QUIC、连接池 (rustls)
 ├── rust_frp_auth/          # 认证：Token 认证、HMAC 签名、OIDC 认证
 ├── rust_frp_util/          # 工具：流桥接、重试、时间戳、随机 ID、令牌桶限速
 ├── rust_frp_plugin/        # 插件：HTTP/SOCKS5/TLS/StaticFile/UnixSocket 插件
@@ -1224,13 +1231,14 @@ process_work_conn          get_work_conn (访客到达时)
 
 ## 总结
 
-本文档详细记录了 rust_frp 项目各功能的需求和实现状态。
+本文档记录 rust_frp 的功能与实现状态。
 
-**全部功能已实现** ✅
+**核心功能（数据面 + 主要控制面）已实现并通过测试**；与原版 frp 的完整对齐情况、
+未支持项清单与差距幅度见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md)。
 
 ---
 
-**文档版本**：v2.3
+**文档版本**：v2.4
 **更新日期**：2026-10-04
 
 ---

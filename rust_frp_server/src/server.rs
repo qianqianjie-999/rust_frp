@@ -75,9 +75,6 @@ pub(crate) struct ServerManagers {
     pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
 }
 
-/// 服务器服务
-// 个别监听器字段（vhost_* / work_conn_listener）仅在对应功能启用时读取
-#[allow(dead_code)]
 /// 优雅关闭排空轮询间隔
 const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -91,6 +88,7 @@ fn quic_options(config: &ServerConfig) -> QuicOptions {
     )
 }
 
+/// 服务器服务
 pub struct Server {
     config: ServerConfig,
     pub(crate) control_manager: Arc<ControlManager>,
