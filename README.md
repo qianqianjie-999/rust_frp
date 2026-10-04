@@ -52,6 +52,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP |
 | 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容），不支持的字段 WARN 提示 |
 | frpc CLI 子命令 | ✅ | `frpc verify`（校验配置）/ `frpc reload`（热重载）/ `frpc status`（代理状态），后两者走 frpc 管理端口（Basic Auth 保护） |
+| 流量统计 | ✅ | 桥接结束累加双向字节：服务端 `/api/proxies`（`traffic_in/out`）+ Prometheus per-proxy 指标；客户端 `frpc status`（`traffic_down/up`） |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
 ---

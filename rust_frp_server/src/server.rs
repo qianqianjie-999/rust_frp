@@ -653,8 +653,13 @@ impl Server {
                         );
                         let proxy_name = work_msg.proxy_name.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = rust_frp_util::bridge_streams(c1, c2).await {
-                                log::error!("STCP bridge error for {}: {:?}", proxy_name, e);
+                            match rust_frp_util::bridge_streams_counted(c1, c2).await {
+                                Ok((to_a, to_b)) => {
+                                    global_metrics().record_traffic(&proxy_name, to_a, to_b);
+                                }
+                                Err(e) => {
+                                    log::error!("STCP bridge error for {}: {:?}", proxy_name, e)
+                                }
                             }
                         });
                         return Ok(());
@@ -911,8 +916,11 @@ impl Server {
                     }
                 }
                 // 桥接剩余数据
-                if let Err(e) = rust_frp_util::bridge_streams(conn, work_conn).await {
-                    log::error!("HTTP bridge error: {:?}", e);
+                match rust_frp_util::bridge_streams_counted(conn, work_conn).await {
+                    Ok((to_work, to_visitor)) => {
+                        global_metrics().record_traffic(&proxy_name, to_work, to_visitor);
+                    }
+                    Err(e) => log::error!("HTTP bridge error: {:?}", e),
                 }
             }
             Err(e) => {
@@ -1038,8 +1046,11 @@ impl Server {
                     }
                 }
                 // 使用 bridge_streams 桥接 TLS 流和 TCP 流
-                if let Err(e) = rust_frp_util::bridge_streams(conn, work_conn_clone).await {
-                    log::error!("HTTPS bridge error: {:?}", e);
+                match rust_frp_util::bridge_streams_counted(conn, work_conn_clone).await {
+                    Ok((to_work, to_visitor)) => {
+                        global_metrics().record_traffic(&proxy_name, to_work, to_visitor);
+                    }
+                    Err(e) => log::error!("HTTPS bridge error: {:?}", e),
                 }
             }
             Err(e) => {

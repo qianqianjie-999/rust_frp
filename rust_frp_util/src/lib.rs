@@ -162,9 +162,27 @@ mod tests {
 /// 桥接任意两个双向流，实现双向数据转发
 /// 支持 TcpStream、TLS stream 等任何实现 AsyncRead + AsyncWrite 的类型
 pub async fn bridge_streams<S1, S2>(
+    stream1: S1,
+    stream2: S2,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    bridge_streams_counted(stream1, stream2).await.map(|_| ())
+}
+
+/// 桥接两个双向流，并返回双向传输的字节数。
+///
+/// 返回 `(stream1 -> stream2, stream2 -> stream1)`，用于流量统计
+/// （调用方在桥接结束后把计数累加进指标）。
+///
+/// 注意：字节数在桥接过程结束才返回——若桥接被取消（任务 abort），
+/// 调用方拿不到计数，这是有意的取舍（避免在热路径上共享原子计数开销）。
+pub async fn bridge_streams_counted<S1, S2>(
     mut stream1: S1,
     mut stream2: S2,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>>
 where
     S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -182,7 +200,7 @@ where
                 n2
             );
             log::info!("Bridge streams closed");
-            Ok(())
+            Ok((n1, n2))
         }
         Err(e) => Err(e.into()),
     }
@@ -201,3 +219,68 @@ pub use rate_limiter::{parse_bandwidth_limit, RateLimitedReader, RateLimitedWrit
 pub use retry::{
     retry, retry_with_default, ConnectionError, RetryConfig, RetryResult, RetryableError,
 };
+
+#[cfg(test)]
+mod bridge_stream_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 建立一条本地 TCP 连接，返回 (服务端侧, 客户端侧)
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn test_bridge_streams_counted_reports_both_directions() {
+        let (s1, mut c1) = tcp_pair().await;
+        let (s2, mut c2) = tcp_pair().await;
+
+        // 桥接两条连接的服务端侧：c1 <-> s1 <-> bridge <-> s2 <-> c2
+        let handle = tokio::spawn(async move { bridge_streams_counted(s1, s2).await });
+
+        c1.write_all(b"hello").await.unwrap();
+        let mut got = [0u8; 5];
+        c2.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello");
+
+        c2.write_all(b"world!!").await.unwrap();
+        let mut got2 = [0u8; 7];
+        c1.read_exact(&mut got2).await.unwrap();
+        assert_eq!(&got2, b"world!!");
+
+        c1.shutdown().await.unwrap();
+        c2.shutdown().await.unwrap();
+
+        let (c1_to_c2, c2_to_c1) = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(c1_to_c2, 5);
+        assert_eq!(c2_to_c1, 7);
+    }
+
+    #[tokio::test]
+    async fn test_bridge_streams_delegates_and_forwards() {
+        let (s1, mut c1) = tcp_pair().await;
+        let (s2, mut c2) = tcp_pair().await;
+        let handle = tokio::spawn(async move { bridge_streams(s1, s2).await });
+
+        c1.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        c2.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
+
+        c1.shutdown().await.unwrap();
+        c2.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}

@@ -12,14 +12,14 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~217 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 功能点覆盖率 | **约 77%**（44 项能力点中 34 项等价或更强；配置兼容层、CLI 子命令、配置管理 API、应用层压缩已于 2026-10-04 落地） | 100%（基线） | — |
+| 功能点覆盖率 | **约 80%**（44 项能力点中 35 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计已于 2026-10-04 落地） | 100%（基线） | — |
 | 配置字段兼容 | ✅ 双向兼容（alias） | camelCase | 原版配置可直接复用（2026-10-04 起） |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify/reload/status | reload/status/stop/verify/… | reload/status/verify 已补齐 |
 | 安全默认值 | ✅ 更保守（见第九节） | 一般 | **rust 更严** |
 | 运行时依赖 | rustls/ring（无 OpenSSL） | golib/quic-go/kcp-go | 均为单二进制 |
 
-**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型主体、TLS/KCP/WebSocket 传输、应用层加密、STCP/XTCP 真打洞、负载均衡、限速、连接池），但**「周边工程化能力」缺口明显**——QUIC、完整 OIDC、tcpmux/sudp、服务端插件、优雅关闭、流量统计 API 等 10 项未落地或仅占位。**它现在是一个「内核达标、周边偏瘦」的实现**。
+**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型主体、TLS/KCP/WebSocket 传输、应用层加密、STCP/XTCP 真打洞、负载均衡、限速、连接池），但**「周边工程化能力」缺口明显**——QUIC、完整 OIDC、tcpmux/sudp、服务端插件、优雅关闭等 9 项未落地或仅占位。**它现在是一个「内核达标、周边偏瘦」的实现**。
 
 ---
 
@@ -32,9 +32,9 @@
 | 插件体系 | 6/8 | 75% | http2http、http2https、virtual_net、服务端插件 |
 | 配置兼容 | 4/5 | 80% | 严格未知字段校验（现为 WARN 告警模式，见 P0-2） |
 | 认证与安全 | 4/7 | 57% | 完整 OIDC、tokenSource、SSH 隧道 |
-| 管理 API | 3/4 | 75% | 流量/详情统计 |
+| 管理 API | 4/4 | 100% | — |
 | CLI 运维 | 3/3 | 100% | — |
-| **合计** | **34/44** | **77%** | — |
+| **合计** | **35/44** | **80%** | — |
 
 > 计分口径：一项能力「等价或更强」记 1 分；缺失 / 仅占位 / 显著弱化记 0 分。
 
@@ -147,7 +147,7 @@
 | `/metrics`（Prometheus） | ✅（默认关） | ✅（默认关） |
 | 服务器信息 | ❌ | ✅ `/api/serverinfo` |
 | 代理列表 | ✅ `/api/proxies` | ✅ `/api/proxies`、`/api/proxy/{type}`、`/api/v2/proxies` |
-| **代理详情 / 流量统计** | ❌ | ✅ `/api/traffic/{name}`、`/api/v2/proxies/{name}/traffic` |
+| **代理详情 / 流量统计** | ✅ `/api/proxies` 含 `traffic_in/out`、Prometheus per-proxy 字节指标、`frpc status` 含 `traffic_down/up` | ✅ `/api/traffic/{name}`、`/api/v2/proxies/{name}/traffic` |
 | 客户端列表 / 详情 | ⚠️ `/api/controllers`（简版） | ✅ `/api/clients`、`/api/v2/clients/{key}` |
 | 离线代理清理 | ❌ | ✅ `DELETE /api/proxies?status=offline` |
 | **运行时增删代理（CRUD）** | ✅ `PUT /config`（校验+原子落盘+自动重载，未配认证时 403 禁用） | ✅ 通过 frpc `PUT /api/config` |
@@ -204,7 +204,7 @@
 | 9 | sudp 代理 | 完全缺失 |
 | 10 | 服务端插件机制 | 无（含 HTTP 回调插件） |
 | 11 | 优雅关闭 | SIGINT 直接 `exit(0)`，无连接排水 |
-| 12 | 流量统计 / 客户端详情 API | 缺失 |
+| 12 | ~~流量统计 / 客户端详情 API~~ | ✅ 已实现（2026-10-04）：桥接结束累加双向字节，服务端 `/api/proxies` + Prometheus、客户端 `frpc status` 暴露 |
 
 ### P2 — 增强项（原版有、非必需）
 vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧道网关、tokenSource、端口保留（断线 24h）、PROXY protocol v2（rust 仅 v1）、服务端带宽限制模式、legacy INI 配置、wire protocol v2。

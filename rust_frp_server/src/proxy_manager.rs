@@ -674,8 +674,12 @@ impl ServerProxyManager {
                     "Got work conn for proxy {}, bridging with visitor",
                     target_name
                 );
-                if let Err(e) = rust_frp_util::bridge_streams(visitor_conn, work_conn).await {
-                    log::error!("Bridge error for proxy {}: {:?}", target_name, e);
+                match rust_frp_util::bridge_streams_counted(visitor_conn, work_conn).await {
+                    Ok((to_work, to_visitor)) => {
+                        // 流量统计：入方向 = 访问者→工作连接，出方向 = 工作连接→访问者
+                        global_metrics().record_traffic(&target_name, to_work, to_visitor);
+                    }
+                    Err(e) => log::error!("Bridge error for proxy {}: {:?}", target_name, e),
                 }
             }
             Err(e) => {
@@ -747,12 +751,17 @@ impl ServerProxyManager {
                     proxy_name_clone
                 );
                 let ws_conn = WebSocketConn::new(ws_stream, visitor_addr);
-                if let Err(e) = rust_frp_util::bridge_streams(ws_conn, work_conn).await {
-                    log::error!(
-                        "WebSocket bridge error for proxy {}: {:?}",
-                        proxy_name_clone,
-                        e
-                    );
+                match rust_frp_util::bridge_streams_counted(ws_conn, work_conn).await {
+                    Ok((to_work, to_visitor)) => {
+                        global_metrics().record_traffic(&proxy_name_clone, to_work, to_visitor);
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "WebSocket bridge error for proxy {}: {:?}",
+                            proxy_name_clone,
+                            e
+                        );
+                    }
                 }
             }
             Err(e) => {
