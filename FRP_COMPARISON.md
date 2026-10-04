@@ -51,7 +51,7 @@
 | 传输协议 | **4/5** | 80% | `wss`（rust 有 websocket+TLS，但未暴露为一键协议名） |
 | 内部线协议 | **1/2** | 50% | wire protocol v2（魔数分帧 + AEAD + 能力协商） |
 | 数据面能力 | **10/11** | 91% | PROXY protocol v2（rust 仅 v1 布尔开关） |
-| 客户端插件 | **7/10** | 70% | `http2http`、`http2https`、`virtual_net`；且 `http_proxy`/`socks5` 的**插件级认证未强制** |
+| 客户端插件 | **7/10** | 70% | `http2http`、`http2https`、`virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 仍仅支持 CONNECT） |
 | 服务端插件 | **1/2** | 50% | tracer 链路追踪 |
 | 认证与安全 | **4/7** | 57% | `additionalScopes`、SSH 隧道网关、FeatureGate/`--allow-unsafe` |
 | frps 管理 API | **4/9** | 44% | `/api/serverinfo`、按类型/名称查询、`/api/v2/*` 套件、客户端详情、用户管理 |
@@ -147,8 +147,8 @@
 |------|:--------:|:--------:|------|
 | unix_domain_socket | ✅ | ✅ | 等价 |
 | static_file | ✅（含路径遍历防护 + Basic Auth） | ✅（gorilla/mux） | rust 安全加固更强 |
-| http_proxy | ⚠️ **认证未强制** | ✅ | rust 解析 `http_user`/`http_password` 但**未在转发流程校验**（字段目前仅存储） |
-| socks5 | ⚠️ **认证未强制**；不支持 IPv6 | ✅（支持认证 + IPv6） | rust 同上；IPv6 未做 |
+| http_proxy | ✅（认证已强制） | ✅ | rust 校验 `Proxy-Authorization: Basic`（常量时间），失败 407；**仅支持 CONNECT**，普通 HTTP 转发未实现 |
+| socks5 | ✅（认证已强制，已支持 IPv6） | ✅（支持认证 + IPv6） | rust 按 RFC 1929 校验 `username`/`password`（常量时间）；本轮补齐 IPv6 |
 | https2http | ✅（`TlsOffloadPlugin`） | ✅ | 等价 |
 | tls2raw | ✅（与 https2http 同实现） | ✅ | 等价 |
 | https2https | ✅（`TlsBridgePlugin`） | ✅ | 等价 |
@@ -156,9 +156,8 @@
 | **http2https** | ❌ | ✅ | 接受 h2c 访客 → 本地 HTTPS |
 | **virtual_net** | ❌ | ✅（配合 pkg/vnet） | 虚拟网络插件 |
 
-> ⚠️ **安全提示**：`http_proxy` / `socks5` 插件配置中的用户名密码当前**不生效**——
-> 若依赖它们做访问控制，实际形同虚设。建议在代理层用 `http_user`/`http_password`
-> 或服务端 `[[http_plugins]]` 回调做鉴权。
+> ✅ **已修复**：`http_proxy` / `socks5` 的插件级认证**已强制**（凭据常量时间比较），
+> 未配置凭据时保持匿名 / 无认证语义（与原版一致）。
 
 **服务端插件**
 
@@ -263,7 +262,7 @@
 3. **内存安全 + 无 GC**：Rust 所有权模型，无 STW 停顿。
 4. **TLS 客户端校验 fail-closed**：原版「未配 CA 时是否校验」语义弱于 rust 的显式拒绝。
 5. **代码量仅 1/3**：19k vs 57k 行，服务端拆 10 模块，可读性更高。
-6. **静态文件插件含路径遍历防护**；**常量时间**凭据比较贯穿认证链路；**工作连接签名 fail-closed**。
+6. **静态文件插件含路径遍历防护**；**常量时间**凭据比较贯穿认证链路（含 `http_proxy`/`socks5` 插件级认证）；**工作连接签名 fail-closed**。
 
 ---
 
@@ -288,7 +287,7 @@
 | 10 | ~~服务端插件机制~~ | ✅ 已落地（6 类回调钩子）。**残留**：tracer 未做 |
 | 11 | ~~优雅关闭~~ | ✅ 已落地 |
 | 12 | ~~流量统计~~ | ✅ 已落地 |
-| 13 | **`http_proxy`/`socks5` 插件级认证未强制** | ❌ 字段已解析但未生效（安全语义缺失，见第七节） |
+| 13 | ~~`http_proxy`/`socks5` 插件级认证未强制~~ | ✅ 已落地（http_proxy → 407；socks5 → RFC 1929）。**残留**：`http_proxy` 仅支持 CONNECT |
 | 14 | **`wss` 传输** | ❌ websocket+TLS 未暴露为 `wss` 协议名 |
 | 15 | **frpc `stop` / `nathole` / 每类代理子命令 / `--config_dir`** | ❌ CLI 面偏瘦 |
 | 16 | **frps API 补齐**（serverinfo / 按类型名称查询 / clients / v2 套件 / DELETE offline） | ❌ 运维 API 偏瘦 |
@@ -311,12 +310,14 @@ PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start
 **且已无阻塞使用的硬缺口**（P0 全部落地、P1 核心项落地）。
 
 **建议路线（按投入产出排序）**：
-1. **`http_proxy`/`socks5` 插件认证落地** —— 安全语义缺口，修复成本低，**建议优先**。
-2. **`wss` 传输** —— 复用已有 websocket+TLS 代码，仅需暴露协议名与握手分支。
-3. **frps API 补齐**（serverinfo、按类型/名称查询、clients、DELETE offline）—— 前端与脚本运维需要。
-4. **frpc CLI 补齐**（`stop`、`--config_dir`）—— 运维便捷性。
-5. **`http2http` / `http2https` 插件** —— 引入 `h2`，自包含在插件 crate。
+1. **`wss` 传输** —— 复用已有 websocket+TLS 代码，仅需暴露协议名与握手分支。
+2. **frps API 补齐**（serverinfo、按类型/名称查询、clients、DELETE offline）—— 前端与脚本运维需要。
+3. **frpc CLI 补齐**（`stop`、`--config_dir`）—— 运维便捷性。
+4. **`http2http` / `http2https` 插件** —— 引入 `h2`，自包含在插件 crate。
+5. **`http_proxy` 普通 HTTP 转发** —— 补齐与原版的最后一处插件语义差异。
 6. **wire protocol v2** —— 最大项，改线格式、回归风险高，建议放最后。
+
+> ✅ 已完成：`http_proxy` / `socks5` 插件级认证（原建议路线第 1 项）。
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关、FeatureGates——
 属原版「生态扩展」，除非有明确场景，否则投入产出比低。

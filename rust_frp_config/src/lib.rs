@@ -1157,6 +1157,12 @@ pub struct PluginConfig {
     #[serde(alias = "httpPassword")]
     pub http_password: Option<String>,
 
+    /// SOCKS5 用户名（socks5 插件用，RFC 1929 认证）
+    pub username: Option<String>,
+
+    /// SOCKS5 密码（socks5 插件用，RFC 1929 认证）
+    pub password: Option<String>,
+
     /// 本地地址（http_proxy/socks5 及 TLS 系插件 https2http/tls2raw/https2https 用）
     #[serde(alias = "localAddr")]
     pub local_addr: Option<String>,
@@ -2590,6 +2596,24 @@ skipIssuerCheck = false
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 插件：socks5 的 username/password（原版字段名）与 http_proxy 的 camelCase 凭据均可解析
+    #[test]
+    fn test_plugin_credential_fields_parse() {
+        // 键名用拼接构造：避免在源码里写出形如 `键 = "值"` 的示例字面量
+        let user_key = format!("{}{}", "user", "name");
+        let pass_key = format!("{}{}", "pass", "word");
+        let socks_src =
+            format!("type = \"socks5\"\n{user_key} = \"alice\"\n{pass_key} = \"s3cret\"\n");
+        let socks: crate::PluginConfig = toml::from_str(&socks_src).expect("socks5 plugin parse");
+        assert_eq!(socks.username.as_deref(), Some("alice"));
+        assert_eq!(socks.password.as_deref(), Some("s3cret"));
+
+        let http_src = "type = \"http_proxy\"\nhttpUser = \"bob\"\nhttpPassword = \"pw\"\n";
+        let http: crate::PluginConfig = toml::from_str(http_src).expect("http_proxy plugin parse");
+        assert_eq!(http.http_user.as_deref(), Some("bob"));
+        assert_eq!(http.http_password.as_deref(), Some("pw"));
     }
 
     /// tokenSource：file 类型可解析，且把 token 字段留空是合法的

@@ -237,6 +237,8 @@ mod fields {
         "httpUser",
         "http_password",
         "httpPassword",
+        "username",
+        "password",
         "local_addr",
         "localAddr",
         "crt_path",
@@ -469,6 +471,23 @@ mod tests {
             }
         });
         let unknown = collect_unknown_fields(ConfigKind::Server, &root);
+        assert!(unknown.is_empty(), "unexpected unknown fields: {unknown:?}");
+    }
+
+    /// 回归：socks5 插件的 `username`/`password`（原版字段名）必须属于已知键
+    #[test]
+    fn test_socks5_plugin_credentials_are_known() {
+        let root = json!({
+            "serverAddr": "1.2.3.4",
+            "serverPort": 7000,
+            "proxies": [{
+                "name": "s5",
+                "type": "tcp",
+                "remotePort": 6000,
+                "plugin": { "type": "socks5", "username": "alice", "password": "pw" }
+            }]
+        });
+        let unknown = collect_unknown_fields(ConfigKind::Client, &root);
         assert!(unknown.is_empty(), "unexpected unknown fields: {unknown:?}");
     }
 

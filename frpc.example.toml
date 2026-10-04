@@ -172,3 +172,18 @@ server_name = "sudp_dns"          # 与对方客户端的 proxy name 一致
 secret_key = "CHANGE_ME_SHARED_SECRET"
 bind_addr = "127.0.0.1"
 bind_port = 5353                  # 本地 UDP 端口：dig @127.0.0.1 -p 5353 example.com
+
+
+# =============================================================================
+# 客户端插件（[proxies.plugin]）：由 frpc 在本地处理访问者连接，不占用工作连接。
+# 示例：socks5 代理；配置 username/password 后按 RFC 1929 强制认证（未配置则无认证）。
+# http_proxy 插件改用 http_user/http_password，校验 Proxy-Authorization，失败返回 407。
+# =============================================================================
+# [[proxies]]
+# name = "local-socks5"
+# type = "tcp"
+# remote_port = 6001
+# [proxies.plugin]
+# type = "socks5"
+# username = "alice"
+# password = "CHANGE_ME_SOCKS5"
