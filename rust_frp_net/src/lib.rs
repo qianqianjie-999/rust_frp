@@ -936,6 +936,14 @@ pub mod pool;
 pub mod compress;
 pub mod crypto;
 
+/// wire protocol v2：魔数 + 帧化握手 + 能力协商 + 方向性 AEAD 控制通道
+pub mod wire_v2;
+pub use wire_v2::{
+    check_magic, client_handshake, server_handshake, write_magic, BootstrapInfo, ClientHello,
+    CryptoContext, Frame, ServerHello, WireError, FRAME_TYPE_CLIENT_HELLO, FRAME_TYPE_MESSAGE,
+    FRAME_TYPE_SERVER_HELLO, MAGIC_V2,
+};
+
 /// 极简 HTTP/1.1 客户端（OIDC 拉取 issuer/JWKS/token、插件回调共用）
 pub mod http;
 

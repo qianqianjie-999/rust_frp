@@ -665,6 +665,23 @@ pub struct TransportConfig {
     /// QUIC 传输参数（`protocol = "quic"` 时生效，兼容原版 `transport.quic`）
     #[serde(default)]
     pub quic: Option<QuicConfig>,
+
+    /// 线协议版本（**客户端生效**，对齐原版 frp `transport.wireProtocol`）
+    ///
+    /// - `"v1"`（默认）：`[4B 长度][JSON]` 明文控制通道；
+    /// - `"v2"`：魔数 `FRP\x00\x02\r\n` + ClientHello/ServerHello 能力协商 +
+    ///   方向性 AEAD（AES-256-GCM，密钥由 HKDF 从 token 派生）加密控制通道。
+    ///
+    /// # 说明
+    ///
+    /// - 服务端自动嗅探魔数，**无需**配置此项（配置后会被忽略）；
+    /// - `v2` 依赖 token 派生的基础密钥，因此要求 `auth.method = "token"`；
+    /// - 当前作用于控制连接，工作连接仍沿用 v1 帧格式。
+    ///
+    /// 注意：此处**不加**字段级 `#[serde(default)]`——否则会以 `String::default()`
+    /// （空串）覆盖容器级 `#[serde(default)]`，使缺省值为空串而非 `"v1"`。
+    #[serde(alias = "wireProtocol")]
+    pub wire_protocol: String,
 }
 
 impl Default for TransportConfig {
@@ -679,6 +696,7 @@ impl Default for TransportConfig {
             use_encryption: false,
             use_compression: false,
             quic: None,
+            wire_protocol: "v1".to_string(),
         }
     }
 }
@@ -1869,6 +1887,26 @@ impl ConfigLoader {
             )));
         }
 
+        // 线协议版本：v1（默认，明文帧）/ v2（魔数 + 能力协商 + 方向性 AEAD）。
+        // v2 的基础密钥由 token 派生（SHA-256(token)），因此要求 token 认证。
+        const VALID_WIRE_PROTOCOLS: &[&str] = &["v1", "v2"];
+        if !VALID_WIRE_PROTOCOLS.contains(&config.transport.wire_protocol.as_str()) {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "transport.wire_protocol {:?} is not supported (expected one of {:?})",
+                    config.transport.wire_protocol, VALID_WIRE_PROTOCOLS
+                ),
+            )));
+        }
+        if config.transport.wire_protocol == "v2" && config.auth.method != "token" {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "transport.wire_protocol = \"v2\" requires auth.method = \"token\": \
+                 the v2 control channel derives its AEAD keys from SHA-256(token)",
+            )));
+        }
+
         // QUIC / WSS 强制 TLS：QUIC 无明文模式；WSS 语义即为「TLS + WebSocket」。
         // 与 TLS 一致地 fail-closed 要求显式信任来源（pin CA 或显式 skip_verify）。
         if matches!(config.transport.protocol.as_str(), "quic" | "wss") {
@@ -2904,4 +2942,76 @@ pub(crate) fn compat_test_counter() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod wire_protocol_tests {
+    use super::*;
+
+    fn base_client_toml(extra_auth: &str, wire: &str) -> String {
+        format!(
+            r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+{extra_auth}
+[transport]
+wireProtocol = "{wire}"
+"#
+        )
+    }
+
+    #[test]
+    fn test_wire_protocol_default_is_v1() {
+        let cfg = ClientConfig::default();
+        assert_eq!(cfg.transport.wire_protocol, "v1");
+    }
+
+    #[test]
+    fn test_wire_protocol_camel_case_alias_and_v2_token_ok() {
+        let toml = base_client_toml(
+            r#"
+[auth]
+method = "token"
+token = "t"
+"#,
+            "v2",
+        );
+        let cfg = ConfigLoader::validate_client_config_content(&toml)
+            .expect("v2 with token auth must validate");
+        assert_eq!(cfg.transport.wire_protocol, "v2");
+    }
+
+    #[test]
+    fn test_wire_protocol_rejects_unknown_value() {
+        let toml = base_client_toml(
+            r#"
+[auth]
+method = "token"
+token = "t"
+"#,
+            "v3",
+        );
+        let err = ConfigLoader::validate_client_config_content(&toml)
+            .expect_err("unknown wire_protocol must be rejected");
+        assert!(err.to_string().contains("wire_protocol"), "{err}");
+    }
+
+    #[test]
+    fn test_wire_protocol_v2_requires_token_auth() {
+        // v2 的基础密钥 = SHA-256(token)，OIDC 无静态 token → 必须拒绝
+        let toml = base_client_toml(
+            r#"
+[auth]
+method = "oidc"
+
+[auth.oidc]
+client_id = "cid"
+token_endpoint_url = "https://idp.example.com/token"
+"#,
+            "v2",
+        );
+        let err = ConfigLoader::validate_client_config_content(&toml)
+            .expect_err("v2 with oidc auth must be rejected");
+        assert!(err.to_string().contains("requires auth.method"), "{err}");
+    }
 }

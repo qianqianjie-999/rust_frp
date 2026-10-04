@@ -120,6 +120,9 @@ pub enum ClientError {
 type WorkConnSenderMap =
     RwLock<std::collections::HashMap<String, mpsc::Sender<(tokio::net::TcpStream, Vec<u8>)>>>;
 
+/// 类型擦除的控制连接传输（TCP / TLS / WebSocket / KCP / mux 流统一类型）
+type ControlIo = Box<dyn rust_frp_net::FrpConn>;
+
 /// 工作连接管理器
 pub struct WorkConnManager {
     // proxy_name -> sender for incoming connections (with initial data)
@@ -3096,14 +3099,14 @@ impl Client {
             .map(|t| t.enable)
             .unwrap_or(true);
 
-        let (mut conn, session): (ControlConn, Option<Arc<dyn Session>>) = match protocol {
+        let (raw_conn, session): (ControlIo, Option<Arc<dyn Session>>) = match protocol {
             "kcp" => {
                 let kcp_conn = self
                     .connector
                     .connect_kcp()
                     .await
                     .map_err(|e| format!("KCP connection failed: {}", e))?;
-                (ControlConn::new(Box::new(kcp_conn)), None)
+                (Box::new(kcp_conn), None)
             }
             "quic" => {
                 // QUIC：单个 QUIC 连接内多路复用，控制连接 = 首条双向流，
@@ -3118,7 +3121,7 @@ impl Client {
                     .await
                     .map_err(|e| format!("QUIC open control stream failed: {}", e))?;
                 log::info!("QUIC control stream established");
-                (ControlConn::new(control_stream), Some(session))
+                (control_stream, Some(session))
             }
             "websocket" | "wss" => {
                 // WebSocket 传输：TCP →（wss 时叠加 TLS）→ WebSocket 升级（路径 /~!frp）
@@ -3161,7 +3164,7 @@ impl Client {
                         .map_err(|e| format!("WebSocket handshake failed: {e}"))?
                     };
                 log::info!("WebSocket control connection established ({protocol})");
-                (ControlConn::new(Box::new(ws_conn)), None)
+                (Box::new(ws_conn), None)
             }
             _ if self.config.transport.tcp_mux => {
                 // tcp_mux：TCP → magic 字节 → (TLS) → yamux 会话 → 首条流为控制流
@@ -3194,7 +3197,7 @@ impl Client {
                     .open_stream()
                     .await
                     .map_err(|e| format!("mux open control stream failed: {}", e))?;
-                (ControlConn::new(control_stream), Some(session))
+                (control_stream, Some(session))
             }
             _ => {
                 // 默认使用 TCP (可能带 TLS)
@@ -3204,16 +3207,38 @@ impl Client {
                         .connect_tls(&self.config.server_addr)
                         .await
                         .map_err(|e| format!("TLS connection failed: {}", e))?;
-                    (ControlConn::new(Box::new(tls_conn)), None)
+                    (Box::new(tls_conn), None)
                 } else {
                     let tcp_conn = self
                         .connector
                         .connect()
                         .await
                         .map_err(|e| format!("TCP connection failed: {}", e))?;
-                    (ControlConn::new(Box::new(tcp_conn)), None)
+                    (Box::new(tcp_conn), None)
                 }
             }
+        };
+
+        // wire protocol v2：写魔数 → ClientHello/ServerHello 能力协商 →
+        // 以方向性 AEAD（HKDF 从 SHA-256(token) 派生）包装控制通道；
+        // 之后的 Login 及全部控制消息均在加密通道内以 v2 帧承载。
+        let mut conn: ControlConn = if self.config.transport.wire_protocol == "v2" {
+            let base_key = self.auth_manager.encryption_key().ok_or(
+                "transport.wire_protocol = \"v2\" requires a token: the v2 control \
+                 channel derives its AEAD keys from SHA-256(token)",
+            )?;
+            let bootstrap = rust_frp_net::wire_v2::BootstrapInfo {
+                transport: protocol.to_string(),
+                tls: matches!(protocol, "wss" | "quic") || use_tls,
+                tcp_mux: self.config.transport.tcp_mux,
+            };
+            let encrypted = rust_frp_net::wire_v2::client_handshake(raw_conn, base_key, bootstrap)
+                .await
+                .map_err(|e| format!("wire v2 handshake failed: {e}"))?;
+            log::info!("wire protocol v2 negotiated with server");
+            ControlConn::new_v2(Box::new(encrypted))
+        } else {
+            ControlConn::new(raw_conn)
         };
 
         // 生成运行 ID

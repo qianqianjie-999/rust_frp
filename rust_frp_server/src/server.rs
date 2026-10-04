@@ -1463,8 +1463,9 @@ impl Server {
             let ws_conn =
                 rust_frp_net::accept_websocket_stream(conn, peer.unwrap_or_else(placeholder_addr))
                     .await?;
+            let control = Self::negotiate_control_conn(Box::new(ws_conn), &auth_manager).await?;
             Self::spawn_control(
-                ControlConn::new(Box::new(ws_conn)),
+                control,
                 ServerManagers {
                     control_manager,
                     proxy_manager,
@@ -1507,7 +1508,7 @@ impl Server {
         // 工作连接 TLS 协商标志：与控制连接共用同一 TLS 配置
         let work_conn_tls = tls_config.is_some();
         let peer = conn.peer_addr().ok().unwrap_or_else(placeholder_addr);
-        let conn = if let Some(tls_config) = tls_config {
+        let conn: AnyConn = if let Some(tls_config) = tls_config {
             // 处理 TLS 连接
             let tls_stream =
                 match tokio::time::timeout(LOGIN_READ_TIMEOUT, tls_config.accept(conn)).await {
@@ -1536,19 +1537,20 @@ impl Server {
                     peer,
                 )
                 .await?;
-                ControlConn::new(Box::new(ws_conn))
+                Box::new(ws_conn)
             } else {
-                ControlConn::new(Box::new(rust_frp_net::PrefixedStream::new(
-                    prefix, tls_stream,
-                )))
+                Box::new(rust_frp_net::PrefixedStream::new(prefix, tls_stream))
             }
         } else {
             // 处理普通 TCP 连接
-            ControlConn::new(Box::new(conn))
+            Box::new(conn)
         };
 
+        // wire protocol v2 协商（非 v2 时原样回放嗅探字节，保持 v1 路径零变更）
+        let control = Self::negotiate_control_conn(conn, &auth_manager).await?;
+
         Self::spawn_control(
-            conn,
+            control,
             ServerManagers {
                 control_manager,
                 proxy_manager,
@@ -1565,6 +1567,50 @@ impl Server {
         );
 
         Ok(())
+    }
+
+    /// 控制连接线协议协商（wire protocol v2）
+    ///
+    /// 嗅探对方前 [`MAGIC_V2`](rust_frp_net::wire_v2::MAGIC_V2) 长度的字节：
+    /// - 命中魔数 → 完成 ClientHello/ServerHello 能力协商，返回以方向性 AEAD
+    ///   （HKDF 从 `SHA-256(token)` 派生）包装的连接 + [`WireProtocol::V2`]；
+    /// - 未命中 → 通过 [`rust_frp_net::PrefixedStream`] 把嗅探字节原样回放，
+    ///   返回 [`WireProtocol::V1`]，v1 解析路径零变更。
+    ///
+    /// 嗅探带超时，避免未认证连接长期占用任务（延续 P0-1 约束）。
+    async fn negotiate_control_conn(
+        conn: AnyConn,
+        auth_manager: &AuthManager,
+    ) -> Result<ControlConn, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = conn;
+        let sniffed = tokio::time::timeout(
+            LOGIN_READ_TIMEOUT,
+            rust_frp_net::wire_v2::check_magic(&mut conn),
+        )
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            "wire protocol sniff timed out".into()
+        })?
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("wire protocol sniff failed: {e}").into()
+        })?;
+        let (prefix, is_v2) = sniffed;
+
+        if !is_v2 {
+            return Ok(ControlConn::new(Box::new(
+                rust_frp_net::PrefixedStream::new(prefix, conn),
+            )));
+        }
+
+        let base_key = auth_manager.encryption_key().ok_or(
+            "wire protocol v2 requires a token on the server: \
+             the v2 control channel derives its AEAD keys from SHA-256(token)",
+        )?;
+        let encrypted = rust_frp_net::wire_v2::server_handshake(conn, base_key)
+            .await
+            .map_err(|e| format!("wire v2 handshake failed: {e}"))?;
+        log::info!("wire protocol v2 negotiated with client");
+        Ok(ControlConn::new_v2(Box::new(encrypted)))
     }
 
     /// 启动控制连接处理任务（登录注册 + 控制循环 + 退出清理）
@@ -1697,8 +1743,9 @@ impl Server {
         let cm = control_manager.clone();
         let wcm = work_conn_manager.clone();
         let pm = plugin_manager.clone();
+        let control = Self::negotiate_control_conn(control_stream, &auth_manager).await?;
         let control_handle = Self::spawn_control(
-            ControlConn::new(control_stream),
+            control,
             ServerManagers {
                 control_manager,
                 proxy_manager,
@@ -1761,7 +1808,7 @@ impl Server {
             plugin_manager,
             ..
         } = managers;
-        let conn = ControlConn::new(Box::new(kcp_conn));
+        let conn = Self::negotiate_control_conn(Box::new(kcp_conn), &auth_manager).await?;
 
         let (login_tx, mut login_rx) = mpsc::channel::<String>(1);
         let (msg_tx, msg_rx) = mpsc::channel::<Message>(100);
@@ -1838,16 +1885,17 @@ impl Server {
     /// QUIC 在单条连接上复用多条流，服务端无法像 TCP 那样按端口区分控制/工作
     /// 连接，因此读取首条消息后分派（`Login` → 控制，`NewWorkConn` → 工作连接）。
     async fn handle_quic_stream(
-        mut stream: rust_frp_net::QuicConn,
+        stream: rust_frp_net::QuicConn,
         managers: ServerManagers,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // wire protocol v2 协商（非 v2 时原样回放嗅探字节，保持 v1 路径零变更）
+        let mut conn =
+            Self::negotiate_control_conn(Box::new(stream), &managers.auth_manager).await?;
+
         // 安全：首帧读取受认证前超时与大小上限约束（P0-1 / P0-2）
         let msg = match tokio::time::timeout(
             LOGIN_READ_TIMEOUT,
-            rust_frp_core::read_message_with_limit(
-                &mut stream,
-                rust_frp_core::MAX_PREAUTH_MESSAGE_SIZE,
-            ),
+            conn.read_message_with_limit(rust_frp_core::MAX_PREAUTH_MESSAGE_SIZE),
         )
         .await
         {
@@ -1861,14 +1909,15 @@ impl Server {
             }
         };
 
-        let conn: AnyConn = Box::new(stream);
         match msg {
             Message::Login(login) => {
                 // QUIC 自带 TLS 1.3：工作连接复用同连接的新流，无需再协商 work_conn_tls
-                Self::spawn_control(ControlConn::new(conn), managers, false, Some(login));
+                Self::spawn_control(conn, managers, false, Some(login));
                 Ok(())
             }
             m @ Message::NewWorkConn(_) => {
+                // 分派到工作连接路径：放弃控制帧语义，按原始流处理
+                let raw: AnyConn = conn.into_inner();
                 let ServerManagers {
                     control_manager,
                     work_conn_manager,
@@ -1878,7 +1927,7 @@ impl Server {
                     ..
                 } = managers;
                 Self::process_work_conn_msg(
-                    conn,
+                    raw,
                     m,
                     control_manager,
                     work_conn_manager,

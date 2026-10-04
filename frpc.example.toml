@@ -73,6 +73,13 @@ tcp_mux = true
 pool_count = 10
 # 全局带宽限制（代理级 bandwidth_limit 优先）
 # bandwidth_limit = "10MB"
+# ── 可选：线协议版本（对齐原版 transport.wireProtocol）──
+# 默认 "v1"（[4B 长度][JSON] 明文控制通道）。改为 "v2" 后启用：
+#   魔数 FRP\x00\x02\r\n → 帧化 ClientHello/ServerHello 能力协商
+#   → 以 HKDF 从 SHA-256(token) 派生的方向性 AEAD（aes-256-gcm）加密控制通道。
+# 服务端无需配置（按魔数自动嗅探）；v1 客户端与服务端行为零变更。
+# 要求 auth.method = "token"；当前作用于控制连接（工作连接仍走 v1）。
+# wire_protocol = "v2"
 
 # 启用 TLS
 [transport.tls]

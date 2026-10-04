@@ -15,7 +15,7 @@
 
 - 数字由 95% 下调至 **≈68%**，**不代表功能退化**，而是度量更细、更严格；
 - 旧版把「代理类型 9/9、传输 8/8、管理 API 4/4、CLI 3/3」记满，本次核对后确认
-  其中 **wire v2、frps 大半 API、frpc stop/nathole/子命令、Store、vnet、
+  其中 **frps 大半 API、frpc stop/nathole/子命令、Store、vnet、
   additionalScopes、SSH 隧道、tracer** 等均未落地，属实打实的缺口。
 
 > 一句话：**数据面已基本对齐，控制面/运维面仍偏瘦。**这与旧版结论方向一致，但差距幅度此前被低估。
@@ -29,7 +29,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~322 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 能力覆盖率 | **≈ 85%（62/73）** ｜ 数据面 **92%（24/26）**、控制/运维面 **81%（38/47）** | 100%（基线） | 见第二节 |
+| 能力覆盖率 | **≈ 86%（63/73）** ｜ 数据面 **96%（25/26）**、控制/运维面 **81%（38/47）** | 100%（基线） | 见第二节 |
 | 配置字段兼容 | ⚠️ 双向 alias 兼容，但**约 25+ 个原版字段未支持**（解析成功 + WARN） | camelCase + 严格模式 | 原版配置**可加载**但部分字段不生效 |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify / reload / status / stop / nathole / 每类代理与访客 / `--config_dir` | reload / status / stop / verify / nathole / 每类代理 | rust 已基本对齐 |
@@ -37,7 +37,8 @@
 | 运行时依赖 | rustls/ring + quinn（无 OpenSSL、无 C 依赖） | golib/quic-go/kcp-go | 均为单二进制 |
 
 **一句话结论**：rust_frp 的**数据面（data plane）已基本对齐**（代理类型、TLS/KCP/QUIC/WebSocket
-传输、应用层加密与压缩、STCP/XTCP 打洞、负载均衡、限速、连接池、热重载、优雅关闭全部可用）；
+传输、wire protocol v2（魔数 + 能力协商 + 方向性 AEAD）、应用层加密与压缩、STCP/XTCP 打洞、
+负载均衡、限速、连接池、热重载、优雅关闭全部可用）；
 **控制面/运维面（控制 API、CLI、插件覆盖面、认证扩展、配置字段）覆盖约 81%**，
 缺口集中在「运维丰富度」与「少数生态特性」，而非「能不能用」。
 
@@ -49,7 +50,7 @@
 |------|:----:|:------:|----------|
 | 代理类型 | **8/8** | 100% | —（rust 另多 1 种 `websocket` 代理类型） |
 | 传输协议 | **5/5** | 100% | —（`wss` 已落地，见 五、传输与协议对照） |
-| 内部线协议 | **1/2** | 50% | wire protocol v2（魔数分帧 + AEAD + 能力协商） |
+| 内部线协议 | **2/2** | 100% | —（v1 与 v2 双版本均已落地，见 五、传输与协议对照） |
 | 数据面能力 | **10/11** | 91% | PROXY protocol v2（rust 仅 v1 布尔开关） |
 | 客户端插件 | **9/10** | 90% | `virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 仍仅支持 CONNECT） |
 | 服务端插件 | **1/2** | 50% | tracer 链路追踪 |
@@ -58,13 +59,13 @@
 | frpc 管理 API | **3/5** | 60% | `/api/stop`、Store 源代理 CRUD |
 | CLI | **7/8** | 88% | `--strict_config`（rust 为 WARN 模式） |
 | 配置体系 | **4/6** | 67% | Store 配置源、FeatureGates |
-| **合计** | **62/73** | **≈85%** | — |
+| **合计** | **63/73** | **≈86%** | — |
 
 **分组小结**：
 
 | 分组 | 覆盖 | 说明 |
 |------|:----:|------|
-| 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **24/26（92%）** | 转发链路基本对齐 |
+| 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **25/26（96%）** | 转发链路基本对齐 |
 | 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **38/47（81%）** | 剩余差距集中在个别插件/认证/配置字段 |
 
 > 计分口径：一项能力「确实可用且与原版等价（或更强）」记 1 分；缺失 / 仅占位 / 显著弱化 / 未强制记 0 分。
@@ -81,7 +82,7 @@
 | 二进制 | `rust_frpc` / `rust_frps` | `frpc` / `frps` |
 | 前端构建 | 无（`include_str!` 内嵌 `web_ui.html`） | Vite 构建，`web/frpc` + `web/frps` + `web/shared` |
 | 配置体系 | 单份 TOML/YAML/JSON（+ 兼容层） | 双体系：`config/legacy`（INI）+ `config/v1`（TOML/YAML/JSON） |
-| 线协议 | 单一：`[4B 大端长度][JSON]`（≈原版 v1） | **双版本**：v1（类型字节+JSON）与 v2（魔数分帧+AEAD+能力协商） |
+| 线协议 | **双版本**：v1（`[4B 大端长度][JSON]`）与 v2（魔数 `FRP\x00\x02\r\n` + 帧化能力协商 + 方向性 AEAD 控制通道） | **双版本**：v1（类型字节+JSON）与 v2（魔数分帧+AEAD+能力协商） |
 
 ---
 
@@ -112,7 +113,7 @@
 | quic | ✅ | ✅ | rust 基于 quinn 0.11（TLS 1.3 强制），单 UDP 连接多路复用控制+工作连接 |
 | websocket | ✅ | ✅ | rust 有 `WebSocketConn` / `accept_websocket` |
 | **wss** | ✅ | ✅ | rust：TLS 之上叠加 WebSocket（路径 `/~!frp`），服务端在 TLS 握手后嗅探升级；fail-closed 要求信任来源 |
-| **wire protocol v2** | ❌ | ✅ | 原版 `pkg/proto/wire`（能力协商 + AEAD aes-256-gcm/xchacha20） |
+| **wire protocol v2** | ✅（控制连接） | ✅ | rust `wire_v2.rs`：魔数 `FRP\x00\x02\r\n` + 帧化 ClientHello/ServerHello 能力协商 + HKDF 方向性 AEAD（aes-256-gcm）。**scope**：仅控制连接；`xchacha20-poly1305` 列为路线图 |
 | tcp_mux | ✅ | ✅ | rust `mux.rs`（魔数 `0x5A`）；原版 wire v1 内置 |
 | TLS 默认加密 | ✅（默认 on） | ✅（默认 on） | 双方无证书时均**运行时自签** |
 | TLS force / 仅 TLS | ✅ `tls_only` | ✅ `transport.tls.force` | 等价 |
@@ -257,7 +258,7 @@
 | 侧 | 缺失字段（原版有，rust 无） |
 |----|------------------------------|
 | frps | `vhostHTTPTimeout`、`subDomainHost`（rust 用 `subdomain_base`）、`tcpmuxPassthrough`、`detailedErrorsToClient`、`userConnTimeout`、`maxPortsPerClient`（rust 用 `maxPortsPerUser`，命名不同）、`natholeAnalysisDataReserveHours`、`udpPacketSize`、`sshTunnelGateway`、`featureGates`、`auth.additionalScopes`、`transport.heartbeatTimeout`/`tcpKeepalive`/`maxPoolCount` |
-| frpc | `natHoleStunServer`、`dnsServer`、`loginFailExit`、`start`（按名启用代理）、`udpPacketSize`、`virtualNet`、`featureGates`、`store`、`auth.additionalScopes`、`transport.wireProtocol`/`proxyURL`/`connectServerLocalIP`/`dialServerTimeout`/`dialServerKeepalive`/`tcpMuxKeepaliveInterval`/`heartbeatInterval`/`heartbeatTimeout` |
+| frpc | `natHoleStunServer`、`dnsServer`、`loginFailExit`、`start`（按名启用代理）、`udpPacketSize`、`virtualNet`、`featureGates`、`store`、`auth.additionalScopes`、`transport.proxyURL`/`connectServerLocalIP`/`dialServerTimeout`/`dialServerKeepalive`/`tcpMuxKeepaliveInterval`/`heartbeatInterval`/`heartbeatTimeout` |
 | 代理 | HTTP/HTTPS：`requestHeaders`、`responseHeaders`、`routeByHTTPUser`；PROXY protocol v2 |
 
 > 兼容策略差异：原版 `--strict_config` 默认 **true**（未知字段直接报错）；rust 采取
@@ -301,7 +302,7 @@
 | 14 | ~~`wss` 传输~~ | ✅ 已落地（TLS + WebSocket，`/~!frp` 路径，双端嗅探升级；3 个 e2e 测试） |
 | 15 | ~~frpc `stop` / `nathole` / 每类代理子命令 / `--config_dir`~~ | ✅ 已落地（`stop` 走管理端 `POST /stop`；`nathole discover` 含 NAT 行为分类；9 类代理 + 3 类 visitor 快速启动；`--config_dir` 多实例；`--api-timeout`） |
 | 16 | ~~frps API 补齐~~（serverinfo / 按类型名称查询 / clients / v2 套件 / DELETE offline） | ✅ 已落地（v1 全端点 + v2 `{code,msg,data}` 信封 + 分页 + prune + users 聚合） |
-| 17 | **wire protocol v2** | ❌ 线协议仍为 v1 等价实现 |
+| 17 | ~~wire protocol v2~~ | ✅ 已落地（魔数 + 帧化能力协商 + 方向性 AEAD 控制通道；11 个单测 + 5 个 e2e）。**残留**：仅控制连接，工作连接仍走 v1；`xchacha20-poly1305` 未实现 |
 
 ### P2 — 生态 / 增强项（非必需）
 `virtual_net`（vnet）、`pkg/sdk` 进程内嵌库、SSH 隧道网关、
@@ -320,7 +321,7 @@ PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start
 **定位判断**：rust_frp 的**数据面已基本对齐**——TCP/UDP/HTTP/HTTPS/STCP/XTCP/tcpmux/sudp
 转发、TLS/KCP/QUIC/WebSocket/WSS 传输、AES-256-GCM 应用层加密、snappy 压缩、STUN 真打洞、
 负载均衡、健康检查、限速、连接池、配置热重载、优雅关闭全部可用。
-**控制面/运维面覆盖约 68%**，缺口以「运维丰富度」和「少数生态特性」为主，
+**控制面/运维面覆盖约 81%**，缺口以「运维丰富度」和「少数生态特性」为主，
 **且已无阻塞使用的硬缺口**（P0 全部落地、P1 核心项落地）。
 
 **建议路线（按投入产出排序）**：
@@ -329,11 +330,11 @@ PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start
 3. ~~**frpc CLI 补齐**（`stop`、`--config_dir`）~~ —— ✅ 已完成（另含 `nathole discover`、9 类代理/3 类 visitor 快速启动、`--api-timeout`）。
 4. ~~**`http2http` / `http2https` 插件**~~ —— ✅ 已完成（手写 HTTP/1.1 反代桥接，零新依赖）。
 5. **`http_proxy` 普通 HTTP 转发** —— 补齐与原版的最后一处插件语义差异。
-6. **wire protocol v2** —— 最大项，改线格式、回归风险高，建议放最后。
+6. ~~**wire protocol v2**~~ —— ✅ 已完成（`transport.wire_protocol = "v2"` 可选启用，默认 v1 向后兼容；服务端自动嗅探魔数）。
 
 > ✅ 已完成：`http_proxy` / `socks5` 插件级认证；`wss` 传输（原建议路线第 1 项）；
 > **frps 管理 API 补齐**（第 2 项）；**frpc CLI 补齐**（第 3 项）；
-> **`http2http` / `http2https` 插件**（第 4 项）。
+> **`http2http` / `http2https` 插件**（第 4 项）；**wire protocol v2**（第 6 项）。
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关、FeatureGates——
 属原版「生态扩展」，除非有明确场景，否则投入产出比低。

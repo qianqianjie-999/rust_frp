@@ -50,7 +50,10 @@ const MAX_PAYLOAD: usize = NONCE_LEN + MAX_PLAINTEXT_RECORD + TAG_LEN;
 /// `read_message`/`write_message` 与 `bridge_streams` 桥接。
 pub struct EncryptedStream<S> {
     inner: S,
-    key: LessSafeKey,
+    /// 读方向密钥（解密对端记录）
+    read_key: LessSafeKey,
+    /// 写方向密钥（加密本端记录）
+    write_key: LessSafeKey,
     /// 本方向 nonce 随机前缀（4B）
     nonce_prefix: [u8; 4],
     write_counter: u64,
@@ -67,26 +70,49 @@ pub struct EncryptedStream<S> {
 }
 
 impl<S: crate::FrpConn> EncryptedStream<S> {
-    /// 创建加密流
+    /// 创建加密流（读写同密钥）
     ///
     /// # 参数
     ///
     /// - `key_bytes`: 必须 32 字节（AES-256）。两端应使用同源派生密钥
     ///   （`SHA-256(token)`），不匹配时对端解密失败、连接报错。
     pub fn new(inner: S, key_bytes: &[u8]) -> Result<Self, std::io::Error> {
-        let unbound = UnboundKey::new(&AES_256_GCM, key_bytes).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "key must be 32 bytes for AES-256-GCM",
-            )
-        })?;
+        Self::new_directional(inner, key_bytes, key_bytes)
+    }
+
+    /// 创建**方向性密钥**加密流（读/写使用不同密钥）
+    ///
+    /// 用于 wire v2 控制通道：密钥由 HKDF 按 `client-to-server` /
+    /// `server-to-client` 两个方向分别派生，从根本上排除双向使用
+    /// 同一 (key, nonce) 组合的风险。wire v1 的 `use_encryption`
+    /// 仍走 [`EncryptedStream::new`]（读写同密钥，与既有实现兼容）。
+    pub fn new_directional(
+        inner: S,
+        read_key_bytes: &[u8],
+        write_key_bytes: &[u8],
+    ) -> Result<Self, std::io::Error> {
+        let read_key =
+            LessSafeKey::new(UnboundKey::new(&AES_256_GCM, read_key_bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "read key must be 32 bytes for AES-256-GCM",
+                )
+            })?);
+        let write_key =
+            LessSafeKey::new(UnboundKey::new(&AES_256_GCM, write_key_bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "write key must be 32 bytes for AES-256-GCM",
+                )
+            })?);
         let mut prefix = [0u8; 4];
         let rng = SystemRandom::new();
         rng.fill(&mut prefix)
             .map_err(|_| std::io::Error::other("rng unavailable"))?;
         Ok(Self {
             inner,
-            key: LessSafeKey::new(unbound),
+            read_key,
+            write_key,
             nonce_prefix: prefix,
             write_counter: 0,
             out_buf: Vec::new(),
@@ -114,7 +140,7 @@ impl<S: crate::FrpConn> EncryptedStream<S> {
         let mut body = data.to_vec();
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
             .map_err(|_| std::io::Error::other("invalid nonce"))?;
-        self.key
+        self.write_key
             .seal_in_place_append_tag(nonce, Aad::empty(), &mut body)
             .map_err(|_| std::io::Error::other("seal failed"))?;
 
@@ -178,7 +204,7 @@ impl<S: crate::FrpConn> EncryptedStream<S> {
         let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
             .map_err(|_| std::io::Error::other("invalid nonce"))?;
         let plain = self
-            .key
+            .read_key
             .open_in_place(nonce, Aad::empty(), ct)
             .map_err(|_| {
                 std::io::Error::new(
