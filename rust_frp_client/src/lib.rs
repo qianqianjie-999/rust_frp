@@ -1041,6 +1041,14 @@ fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
     base64::encode(tag.as_ref())
 }
 
+/// 派生应用层加密密钥（SHA-256(token)，与服务端 AuthManager::generate_encryption_key 一致）
+fn derive_encryption_key(token: &str) -> Vec<u8> {
+    use ring::digest;
+    let mut hasher = digest::Context::new(&digest::SHA256);
+    hasher.update(token.as_bytes());
+    hasher.finish().as_ref().to_vec()
+}
+
 /// 建立工作连接（独立函数，供 ClientControl::run 调用）
 ///
 /// - 多路复用：tcp_mux 会话存在时直接打开会话流（无需新建 TCP，TLS 在会话层）
@@ -1059,6 +1067,16 @@ async fn establish_work_connection(
         .iter()
         .find(|p| p.name == proxy_name)
         .ok_or_else(|| format!("Proxy config not found: {}", proxy_name))?;
+
+    // 应用层加密（fail-closed）：启用 use_encryption 必须已配置 token 以派生密钥
+    let use_encryption = proxy_config.use_encryption;
+    if use_encryption && config.auth.token.is_none() {
+        return Err(format!(
+            "proxy [{}] enables use_encryption but client has no token configured",
+            proxy_name
+        )
+        .into());
+    }
 
     let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if let Some(session) = mux_session {
         // tcp_mux：工作连接 = 会话流（服务端分发循环经 process_work_conn 处理，
@@ -1107,7 +1125,7 @@ async fn establish_work_connection(
         proxy_name: proxy_name.to_string(),
         timestamp: get_timestamp(),
         sign_key,
-        use_encryption: false,
+        use_encryption,
         use_compression: false,
     };
     rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
@@ -1126,6 +1144,17 @@ async fn establish_work_connection(
             return Err("Unexpected response from server".into());
         }
     };
+
+    // 应用层加密：握手完成后包装工作连接为 AES-256-GCM 加密流
+    if use_encryption {
+        let token = config.auth.token.as_deref().expect("token checked above");
+        let key = derive_encryption_key(token);
+        work_conn = Box::new(rust_frp_net::crypto::EncryptedStream::new(work_conn, &key)?);
+        log::info!(
+            "Work conn application-layer encryption (AES-256-GCM) enabled for proxy: {}",
+            proxy_name
+        );
+    }
 
     // 连接到本地服务
     let local_addr = format!("{}:{}", proxy_config.local_ip, proxy_config.local_port);
@@ -1485,6 +1514,21 @@ async fn handle_stcp_visitor_conn(
         .and_then(|v| v.secret_key.clone())
         .unwrap_or_default();
 
+    // 应用层加密：需与对端代理的 use_encryption 配置一致（fail-closed）
+    let use_encryption = config
+        .visitors
+        .iter()
+        .find(|v| v.server_name == proxy_name)
+        .map(|v| v.use_encryption)
+        .unwrap_or(false);
+    if use_encryption && config.auth.token.is_none() {
+        return Err(format!(
+            "visitor for [{}] enables use_encryption but client has no token configured",
+            proxy_name
+        )
+        .into());
+    }
+
     // XTCP：先尝试 P2P 打洞，成功则本地连接直接桥接到 KCP 流
     let local_conn = if is_xtcp {
         match xtcp_try_p2p(
@@ -1556,7 +1600,7 @@ async fn handle_stcp_visitor_conn(
         proxy_name: proxy_name.clone(),
         timestamp: get_timestamp(),
         sign_key: work_sign_key,
-        use_encryption: false,
+        use_encryption,
         use_compression: false,
     };
     rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
@@ -1572,6 +1616,17 @@ async fn handle_stcp_visitor_conn(
         _ => {
             return Err("Unexpected response from server".into());
         }
+    }
+
+    // 应用层加密：握手完成后包装为 AES-256-GCM 加密流（需与对端代理配置一致）
+    if use_encryption {
+        let token = config.auth.token.as_deref().expect("token checked above");
+        let key = derive_encryption_key(token);
+        work_conn = Box::new(rust_frp_net::crypto::EncryptedStream::new(work_conn, &key)?);
+        log::info!(
+            "STCP visitor work conn application-layer encryption (AES-256-GCM) enabled for {}",
+            proxy_name
+        );
     }
 
     rust_frp_util::bridge_streams(work_conn, local_conn).await?;

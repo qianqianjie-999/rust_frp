@@ -86,6 +86,13 @@ pub trait FrpConn: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static {
 /// 可直接用于消息读写与 bridge_streams 桥接。
 pub type AnyConn = Box<dyn FrpConn>;
 
+/// 已装箱的类型擦除连接同样满足 FrpConn（支持多层包装，如 EncryptedStream）
+impl FrpConn for Box<dyn FrpConn> {
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        (**self).remote_addr()
+    }
+}
+
 /// 实现 TokioTcpStream 的 FrpConn trait
 impl FrpConn for TokioTcpStream {
     fn remote_addr(&self) -> Option<SocketAddr> {
@@ -736,6 +743,9 @@ impl ConnManager {
 
 // 导出连接池模块
 pub mod pool;
+
+/// 应用层加密（use_encryption）：AES-256-GCM 工作连接加密流
+pub mod crypto;
 
 // 重新导出连接池类型
 

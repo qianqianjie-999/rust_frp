@@ -269,6 +269,7 @@ fn test_stcp_visitor_config() {
         bind_addr: "127.0.0.1".to_string(),
         bind_port: 9000,
         transport: None,
+        use_encryption: false,
     };
     assert_eq!(visitor.r#type, "stcp");
     assert_eq!(visitor.server_name, "ssh_proxy");
@@ -286,6 +287,7 @@ fn test_xtcp_visitor_config() {
         bind_addr: "127.0.0.1".to_string(),
         bind_port: 13389,
         transport: None,
+        use_encryption: false,
     };
     assert_eq!(visitor.r#type, "xtcp");
     assert_eq!(visitor.server_name, "rdp_proxy");
@@ -394,6 +396,7 @@ fn test_client_config_with_stcp_xtcp_proxies() {
                 bind_addr: "127.0.0.1".to_string(),
                 bind_port: 9000,
                 transport: None,
+                use_encryption: false,
             },
             rust_frp_config::VisitorConfig {
                 name: "v_rdp".to_string(),
@@ -403,6 +406,7 @@ fn test_client_config_with_stcp_xtcp_proxies() {
                 bind_addr: "127.0.0.1".to_string(),
                 bind_port: 13389,
                 transport: None,
+                use_encryption: false,
             },
         ],
         ..Default::default()

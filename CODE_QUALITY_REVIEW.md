@@ -259,7 +259,7 @@ git ls-files | grep -iE "\.key$|\.pem$|\.crt$|frpc\.toml$|frps\.toml$|\.env$"
 
 | 编号 | 问题 | 处理方式 | 位置 |
 |---|---|---|---|
-| P1-1 | 假加密空实现 | **已删除** `AuthManager::encrypt/decrypt` 明文透传桩；README 声明不支持应用层加密（frp `use_encryption`），`encryption_key` 保留仅用于工作连接签名 | rust_frp_auth/src/lib.rs |
+| P1-1 | 假加密空实现 | **已删除** `AuthManager::encrypt/decrypt` 明文透传桩，`encryption_key` 保留仅用于工作连接签名。**2026-10-04 追记：应用层加密已正式实现**（`rust_frp_net::crypto::EncryptedStream`，AES-256-GCM，代理级 `use_encryption`），假桩隐患彻底闭合 | rust_frp_auth/src/lib.rs、rust_frp_net/src/crypto.rs |
 | P1-2 / P2-3 | TLS 静默跳验证 + `skip_verify` 死配置 | **fail-closed 重构**：`skip_verify=false`（默认）且无 `trusted_ca_file` → 拒绝启动；`skip_verify=true` → 显式跳过 + WARN；README/frpc.example.toml 同步；新增 4 个回归测试 | rust_frp_client/src/lib.rs |
 | P2-2 | 4 处脆弱 unwrap | metrics 日志 `unwrap_or(0)`；`axum::serve` 改记日志；STCP `proxy_run_id` 改 let-else fail-safe；`Client::clone` 整个移除（全库无人调用，Clone 内 unwrap 无法传播错误） | server.rs / web.rs / control.rs / client lib.rs |
 | P2-5 | clippy 15 条风格告警 | `clippy --fix` + 手工修复（while-let ×2、type alias、`&Box<T>`→`&dyn`、9 参函数显式豁免等）→ **全库 0 告警** | 多处 |
