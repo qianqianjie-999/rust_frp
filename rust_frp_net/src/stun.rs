@@ -209,6 +209,142 @@ async fn probe_one(socket: Arc<UdpSocket>, server: SocketAddr) -> Result<SocketA
     parse_mapped_address(&buf[..n])
 }
 
+/// 向**指定** STUN 服务器探测本 socket 的公网映射
+///
+/// 与 [`discover_public_endpoint`] 的区别：本函数不做轮询回退，失败即返回错误，
+/// 供 `frpc nathole discover` 逐服务器采样（同一 socket 对多个目的地址的映射
+/// 是否一致，即为 NAT 行为分类的依据）。
+pub async fn discover_from_server(
+    socket: Arc<UdpSocket>,
+    server: SocketAddr,
+) -> Result<SocketAddr, NetError> {
+    probe_one(socket, server).await
+}
+
+/// 探测到 `server` 的本机出口 IP（用于判定是否处于公网）
+///
+/// 用一次性 socket `connect` 后读 `local_addr`，借内核路由选择拿到出口网卡 IP；
+/// 解析 DNS 场景下与实际探测 socket 走同一默认路由，结果一致。
+pub async fn local_outbound_ip(server: SocketAddr) -> Option<std::net::IpAddr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    sock.connect(server).await.ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
+// ---------------------------------------------------------------------------
+// NAT 行为分类（对齐原版 frp `pkg/nathole/classify.go` 的 ClassifyNATFeature）
+// ---------------------------------------------------------------------------
+
+/// 易打洞 NAT（不同目的地址观察到同一公网映射）
+pub const EASY_NAT: &str = "EasyNAT";
+/// 难打洞 NAT（映射随目的地址变化）
+pub const HARD_NAT: &str = "HardNAT";
+
+/// 映射不变
+pub const BEHAVIOR_NO_CHANGE: &str = "BehaviorNoChange";
+/// 仅公网 IP 变化
+pub const BEHAVIOR_IP_CHANGED: &str = "BehaviorIPChanged";
+/// 仅端口变化
+pub const BEHAVIOR_PORT_CHANGED: &str = "BehaviorPortChanged";
+/// IP 与端口都变化
+pub const BEHAVIOR_BOTH_CHANGED: &str = "BehaviorBothChanged";
+
+/// NAT 特征（对齐原版 `nathole.NatFeature`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatFeature {
+    /// `EasyNAT` / `HardNAT`
+    pub nat_type: String,
+    /// `BehaviorNoChange` / `BehaviorIPChanged` / `BehaviorPortChanged` / `BehaviorBothChanged`
+    pub behavior: String,
+    /// 端口变化时的最大端口差（仅 `BehaviorPortChanged` 有意义）
+    pub ports_difference: i64,
+    /// 端口变化是否规律（差值 1..=5 视为规律，打洞可预测）
+    pub regular_ports_change: bool,
+    /// 是否处于公网（映射地址与本机出口 IP 相同）
+    pub public_network: bool,
+}
+
+/// 由「同一 socket 对多个目的地址的采样」分类 NAT 特征
+///
+/// - `addresses`：各 STUN 服务器返回的公网映射（要求 ≥ 2 个采样）
+/// - `local_ip`：本机出口 IP，用于判定 `public_network`
+///
+/// 多个采样完全一致 → `EasyNAT`；任一 IP 或端口变化 → `HardNAT`。
+pub fn classify_nat_feature(
+    addresses: &[SocketAddr],
+    local_ip: Option<std::net::IpAddr>,
+) -> Result<NatFeature, NetError> {
+    if addresses.len() <= 1 {
+        return Err(NetError::Other("not enough addresses".into()));
+    }
+
+    let mut feature = NatFeature {
+        nat_type: String::new(),
+        behavior: String::new(),
+        ports_difference: 0,
+        regular_ports_change: false,
+        public_network: false,
+    };
+
+    let mut ip_changed = false;
+    let mut port_changed = false;
+    let mut base: Option<(std::net::IpAddr, u16)> = None;
+    let mut port_max: i64 = 0;
+    let mut port_min: i64 = 0;
+
+    for addr in addresses {
+        if let Some(local) = local_ip {
+            if addr.ip() == local {
+                feature.public_network = true;
+            }
+        }
+
+        match base {
+            None => {
+                base = Some((addr.ip(), addr.port()));
+                port_max = addr.port() as i64;
+                port_min = addr.port() as i64;
+            }
+            Some((base_ip, base_port)) => {
+                port_max = port_max.max(addr.port() as i64);
+                port_min = port_min.min(addr.port() as i64);
+                if base_ip != addr.ip() {
+                    ip_changed = true;
+                }
+                if base_port != addr.port() {
+                    port_changed = true;
+                }
+            }
+        }
+    }
+
+    match (ip_changed, port_changed) {
+        (true, true) => {
+            feature.nat_type = HARD_NAT.to_string();
+            feature.behavior = BEHAVIOR_BOTH_CHANGED.to_string();
+        }
+        (true, false) => {
+            feature.nat_type = HARD_NAT.to_string();
+            feature.behavior = BEHAVIOR_IP_CHANGED.to_string();
+        }
+        (false, true) => {
+            feature.nat_type = HARD_NAT.to_string();
+            feature.behavior = BEHAVIOR_PORT_CHANGED.to_string();
+        }
+        (false, false) => {
+            feature.nat_type = EASY_NAT.to_string();
+            feature.behavior = BEHAVIOR_NO_CHANGE.to_string();
+        }
+    }
+
+    if feature.behavior == BEHAVIOR_PORT_CHANGED {
+        feature.ports_difference = port_max - port_min;
+        feature.regular_ports_change = (1..=5).contains(&feature.ports_difference);
+    }
+
+    Ok(feature)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +442,77 @@ mod tests {
         let mut msg = vec![0u8; 24];
         msg[0..2].copy_from_slice(&0x0111u16.to_be_bytes());
         assert!(parse_mapped_address(&msg).is_err());
+    }
+
+    #[test]
+    fn test_classify_requires_multiple_addresses() {
+        let one: SocketAddr = "203.0.113.7:1000".parse().unwrap();
+        assert!(classify_nat_feature(&[], None).is_err());
+        assert!(classify_nat_feature(&[one], None).is_err());
+    }
+
+    #[test]
+    fn test_classify_easy_nat_when_mapping_stable() {
+        let a: SocketAddr = "203.0.113.7:1000".parse().unwrap();
+        let f = classify_nat_feature(&[a, a], None).expect("classify");
+        assert_eq!(f.nat_type, EASY_NAT);
+        assert_eq!(f.behavior, BEHAVIOR_NO_CHANGE);
+        assert!(!f.regular_ports_change);
+        assert!(!f.public_network);
+    }
+
+    #[test]
+    fn test_classify_hard_nat_regular_port_change() {
+        // 端口差 2（<=5）→ 规律变化
+        let a: SocketAddr = "203.0.113.7:1000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.7:1002".parse().unwrap();
+        let f = classify_nat_feature(&[a, b], None).expect("classify");
+        assert_eq!(f.nat_type, HARD_NAT);
+        assert_eq!(f.behavior, BEHAVIOR_PORT_CHANGED);
+        assert_eq!(f.ports_difference, 2);
+        assert!(f.regular_ports_change);
+    }
+
+    #[test]
+    fn test_classify_hard_nat_irregular_port_change() {
+        let a: SocketAddr = "203.0.113.7:1000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.7:1200".parse().unwrap();
+        let f = classify_nat_feature(&[a, b], None).expect("classify");
+        assert_eq!(f.behavior, BEHAVIOR_PORT_CHANGED);
+        assert_eq!(f.ports_difference, 200);
+        assert!(!f.regular_ports_change);
+    }
+
+    #[test]
+    fn test_classify_both_changed_and_public_network() {
+        let a: SocketAddr = "203.0.113.7:1000".parse().unwrap();
+        let b: SocketAddr = "198.51.100.9:2000".parse().unwrap();
+        // 本机出口 IP 即映射地址之一 → 判定处在公网
+        let local = Some("203.0.113.7".parse().unwrap());
+        let f = classify_nat_feature(&[a, b], local).expect("classify");
+        assert_eq!(f.nat_type, HARD_NAT);
+        assert_eq!(f.behavior, BEHAVIOR_BOTH_CHANGED);
+        assert!(f.public_network);
+    }
+
+    #[test]
+    fn test_classify_ip_changed_only() {
+        let a: SocketAddr = "203.0.113.7:1000".parse().unwrap();
+        let b: SocketAddr = "198.51.100.9:1000".parse().unwrap();
+        let f = classify_nat_feature(&[a, b], None).expect("classify");
+        assert_eq!(f.nat_type, HARD_NAT);
+        assert_eq!(f.behavior, BEHAVIOR_IP_CHANGED);
+        assert_eq!(f.ports_difference, 0);
+    }
+
+    #[tokio::test]
+    async fn test_discover_from_server_single() {
+        let (stun_addr, _handle) = spawn_mock_stun().await;
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local = client.local_addr().unwrap();
+        let mapped = discover_from_server(client, stun_addr)
+            .await
+            .expect("probe");
+        assert_eq!(mapped.port(), local.port());
     }
 }

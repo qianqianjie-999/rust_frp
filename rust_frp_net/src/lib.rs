@@ -52,7 +52,10 @@ pub mod mux;
 pub use mux::{MuxSession, TCP_MUX_MAGIC};
 
 pub mod stun;
-pub use stun::{default_stun_socket_addrs, discover_public_endpoint};
+pub use stun::{
+    classify_nat_feature, default_stun_socket_addrs, discover_from_server,
+    discover_public_endpoint, local_outbound_ip, NatFeature,
+};
 
 pub mod kcp_stream;
 pub use kcp_stream::KcpStream;
