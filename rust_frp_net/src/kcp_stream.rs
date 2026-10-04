@@ -171,7 +171,7 @@ fn send_all(socket: &Arc<UdpSocket>, pkts: &[Vec<u8>], shared: &Shared) {
         if st.dead {
             return;
         }
-        st.active_peer.clone()
+        st.active_peer
     };
     for pkt in pkts {
         match &target {
@@ -364,12 +364,7 @@ impl AsyncRead for KcpStream {
                     st.read_waker = Some(cx.waker().clone());
                     return Poll::Pending;
                 }
-                Err(e) => {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )))
-                }
+                Err(e) => return Poll::Ready(Err(std::io::Error::other(e.to_string()))),
             }
         }
     }
@@ -410,10 +405,7 @@ impl AsyncWrite for KcpStream {
                     st.dead = true;
                     Shared::wake_read(&mut st);
                     Shared::wake_write(&mut st);
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )));
+                    return Poll::Ready(Err(std::io::Error::other(e.to_string())));
                 }
                 let pkts: Vec<Vec<u8>> = st
                     .out
@@ -425,10 +417,7 @@ impl AsyncWrite for KcpStream {
                 send_all(&shared.socket, &pkts, shared);
                 Poll::Ready(Ok(n))
             }
-            Err(e) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))),
+            Err(e) => Poll::Ready(Err(std::io::Error::other(e.to_string()))),
         }
     }
 
@@ -479,7 +468,7 @@ fn spawn_recv_loop(weak: Weak<Shared>) {
                 let _ = socket.try_send_to(PUNCH_PACKET, src);
                 continue;
             }
-            if data.len() < KCP_OVERHEAD as usize {
+            if data.len() < KCP_OVERHEAD {
                 continue; // 无效短包
             }
 

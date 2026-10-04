@@ -1191,9 +1191,12 @@ mod tests {
 
     #[test]
     fn test_preauth_limit_constant() {
-        // 预认证首帧上限：64KB（P0-2 回归锚点）
-        assert_eq!(MAX_PREAUTH_MESSAGE_SIZE, 64 * 1024);
-        assert!(MAX_PREAUTH_MESSAGE_SIZE < MAX_MESSAGE_SIZE);
+        // 预认证首帧上限：64KB（P0-2 回归锚点，断言常量本身就是测试目的）
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert_eq!(MAX_PREAUTH_MESSAGE_SIZE, 64 * 1024);
+            assert!(MAX_PREAUTH_MESSAGE_SIZE < MAX_MESSAGE_SIZE);
+        }
     }
 
     #[tokio::test]

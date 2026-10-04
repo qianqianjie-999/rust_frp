@@ -675,9 +675,7 @@ impl ConnManager {
         url: &str,
     ) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error>
     {
-        let (stream, _) = connect_async(url)
-            .await
-            .map_err(|e| std::io::Error::other(e))?;
+        let (stream, _) = connect_async(url).await.map_err(std::io::Error::other)?;
         let remote_addr = "127.0.0.1:0".parse().unwrap();
         Ok(WebSocketConn::new(stream, remote_addr))
     }
@@ -706,9 +704,7 @@ impl ConnManager {
         stream: TokioTcpStream,
     ) -> Result<WebSocketConn<TokioTcpStream>, std::io::Error> {
         let remote_addr = stream.peer_addr()?;
-        let stream = accept_async(stream)
-            .await
-            .map_err(|e| std::io::Error::other(e))?;
+        let stream = accept_async(stream).await.map_err(std::io::Error::other)?;
         Ok(WebSocketConn::new(stream, remote_addr))
     }
 

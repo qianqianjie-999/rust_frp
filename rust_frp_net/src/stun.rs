@@ -219,7 +219,7 @@ mod tests {
             std::net::IpAddr::V4(v4) => v4.octets(),
             _ => panic!("test only supports ipv4"),
         };
-        let x_port = (mapped.port() as u16) ^ (MAGIC_COOKIE >> 16) as u16;
+        let x_port = mapped.port() ^ (MAGIC_COOKIE >> 16) as u16;
         let x_addr = u32::from_be_bytes(ip) ^ MAGIC_COOKIE;
 
         let mut attr = vec![0u8; 8];
@@ -245,19 +245,14 @@ mod tests {
         let addr = socket.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 1024];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, src)) => {
-                        if n < 20 {
-                            continue;
-                        }
-                        let mut tx_id = [0u8; 12];
-                        tx_id.copy_from_slice(&buf[8..20]);
-                        let resp = build_response(tx_id, src);
-                        let _ = socket.send_to(&resp, src).await;
-                    }
-                    Err(_) => break,
+            while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+                if n < 20 {
+                    continue;
                 }
+                let mut tx_id = [0u8; 12];
+                tx_id.copy_from_slice(&buf[8..20]);
+                let resp = build_response(tx_id, src);
+                let _ = socket.send_to(&resp, src).await;
             }
         });
         (addr, handle)
