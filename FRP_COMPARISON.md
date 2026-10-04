@@ -12,14 +12,14 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~217 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 功能点覆盖率 | **约 91%**（44 项能力点中 40 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计、优雅关闭、tcpmux、sudp、服务端 HTTP 插件、完整 OIDC 实联已于 2026-10-04 落地） | 100%（基线） | — |
+| 功能点覆盖率 | **约 93%**（44 项能力点中 42 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计、优雅关闭、tcpmux、sudp、服务端 HTTP 插件、完整 OIDC 实联、QUIC 传输已于 2026-10-04 落地） | 100%（基线） | — |
 | 配置字段兼容 | ✅ 双向兼容（alias） | camelCase | 原版配置可直接复用（2026-10-04 起） |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify/reload/status | reload/status/stop/verify/… | reload/status/verify 已补齐 |
 | 安全默认值 | ✅ 更保守（见第九节） | 一般 | **rust 更严** |
-| 运行时依赖 | rustls/ring（无 OpenSSL） | golib/quic-go/kcp-go | 均为单二进制 |
+| 运行时依赖 | rustls/ring + quinn（无 OpenSSL、无 C 依赖） | golib/quic-go/kcp-go | 均为单二进制 |
 
-**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型全覆盖、TLS/KCP/WebSocket 传输、应用层加密与压缩、STCP/XTCP 真打洞、负载均衡、限速、连接池、tcpmux/sudp、服务端 HTTP 插件回调、OIDC 真实验签），**剩余缺口集中在「协议前沿与少数企业特性」**——QUIC、http2http/http2https、virtual_net、tokenSource、SSH 隧道网关等 4 项。**它现在是一个「内核达标、周边基本补齐」的实现**。
+**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型全覆盖、TLS/KCP/QUIC/WebSocket 传输、应用层加密与压缩、STCP/XTCP 真打洞、负载均衡、限速、连接池、tcpmux/sudp、服务端 HTTP 插件回调、OIDC 真实验签），**剩余缺口集中在「少数企业特性」**——http2http/http2https、virtual_net、tokenSource、SSH 隧道网关、wss 等。**它现在是一个「内核达标、周边基本补齐」的实现，P1 能力缺口已全部清零**。
 
 ---
 
@@ -28,13 +28,13 @@
 | 分类 | 覆盖 | 覆盖率 | 主要缺口 |
 |------|:----:|:------:|----------|
 | 代理类型 | 9/9 | 100% | — |
-| 传输与协议 | 7/8 | 88% | QUIC、wss |
+| 传输与协议 | 8/8 | 100% | — |
 | 插件体系 | 7/8 | 88% | http2http、http2https、virtual_net |
 | 配置兼容 | 4/5 | 80% | 严格未知字段校验（现为 WARN 告警模式，见 P0-2） |
 | 认证与安全 | 5/7 | 71% | tokenSource、SSH 隧道；OIDC 未实现 `additionalScopes` |
 | 管理 API | 4/4 | 100% | — |
 | CLI 运维 | 3/3 | 100% | — |
-| **合计** | **40/44** | **91%** | — |
+| **合计** | **42/44** | **93%** | — |
 
 > 计分口径：一项能力「等价或更强」记 1 分；缺失 / 仅占位 / 显著弱化记 0 分。
 
@@ -81,7 +81,7 @@
 | kcp | ✅ | ✅ | rust 自研 `kcp_stream.rs`；原版用 `xtaci/kcp-go` |
 | websocket | ✅ | ✅ | rust 有 `WebSocketConn` / `accept_websocket` |
 | wss | ⚠️ | ✅ | rust 需自行叠加 TLS，无 `wss` 一键协议 |
-| **quic** | ❌ 占位 | ✅ | rust `quic_bind_port` / `protocol="quic"` 仅字段，无实现；原版 quic-go v0.60 完整 |
+| **quic** | ✅ | ✅ | 2026-10-04 落地：基于 quinn 0.11（TLS 1.3 强制），单 UDP 连接多路复用控制+工作连接，服务端按流首帧分派 Login/NewWorkConn；原版 quic-go v0.60 |
 | tcp_mux | ✅ | ✅ | rust `mux.rs`（魔数 `0x5A`）；原版 wire v1 内置 |
 | wire protocol v2 | ❌ | ✅ | 原版 `pkg/proto/wire`（能力协商 + AEAD aes-256-gcm/xchacha20） |
 | TLS 默认加密 | ✅（默认 on） | ✅（默认 on） | 双方无证书时均**运行时自签** |
@@ -176,7 +176,7 @@
 ## 九、rust_frp 更严格 / 更优的项（保留优势）
 
 1. **安全默认值更保守**：端口白名单默认「空即拒绝」；`web_server.user/password` 不成对则拒绝启动；TLS fail-closed；`/metrics` 默认关闭；Dashboard 登录 5 次失败锁 5 分钟。
-2. **无 C 依赖**：rustls/ring，无 OpenSSL，Alpine/musl 天然友好（原版 Go 也静态，但依赖 golib/quic-go/kcp-go 体积更大）。
+2. **无 C 依赖**：rustls/ring + quinn（`rustls-ring` backend），无 OpenSSL、**无 aws-lc-rs 等 C 依赖**，Alpine/musl 天然友好（原版 Go 也静态，但依赖 golib/quic-go/kcp-go 体积更大）。
 3. **内存安全 + 无 GC**：Rust 所有权模型，无 STW 停顿。
 4. **TLS 客户端校验 fail-closed**：原版「未配 CA 时是否校验」语义弱于 rust 的显式拒绝。
 5. **代码量仅 1/3**：19k vs 57k 行，服务端拆 10 模块，可读性更高。
@@ -197,7 +197,7 @@
 ### P1 — 能力缺口（功能对不齐）
 | # | 缺口 | 现状 |
 |---|------|------|
-| 5 | QUIC 传输 | 仅配置占位 |
+| 5 | ~~QUIC 传输~~ | ✅ 已实现（2026-10-04）：quinn 0.11 + rustls-ring，TLS 1.3 强制、单端口多路复用、fail-closed 校验；`transport.quic.*` 参数（maxIdleTimeout/maxIncomingStreams/keepalivePeriod） |
 | 6 | ~~`use_compression` 压缩~~ | ✅ 已实现（2026-10-04）：snappy 压缩流，顺序为先压缩后加密 |
 | 7 | ~~OIDC 完整流程~~ | ✅ 已实现（2026-10-04）：`{issuer}/.well-known/openid-configuration` Discovery + JWKS 拉取（按 `kid` 选钥、1h 缓存、未知 kid 即刷新）+ ring RS256/ES256 验签（拒绝 `none`/`HS*`）+ iss/aud/exp/nbf 校验 + subject 绑定；客户端 `client_credentials` 取令牌。剩余：`additionalScopes` 未做 |
 | 8 | ~~tcpmux 代理~~ | ✅ 已实现（2026-10-04）：HTTP CONNECT 复用 + 域名/HTTP 用户路由 |
@@ -213,7 +213,7 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 
 ## 十一、结论与建议
 
-**定位判断**：rust_frp 的**数据面（data plane）已达标**——TCP/UDP/HTTP/HTTPS/STCP/XTCP/tcpmux/sudp 转发、TLS/KCP/WebSocket 传输、AES-256-GCM 应用层加密、snappy 压缩、STUN 真打洞、负载均衡、健康检查、限速、连接池、配置热重载全部可用，并经 301 个单测覆盖。**控制面**（CLI、配置管理 API、服务端 HTTP 插件回调、流量统计、优雅关闭、OIDC 真实验签）已基本补齐，剩余短板集中在**协议前沿（QUIC、wire protocol v2）与少数生态特性（virtual_net、SSH 隧道网关）**。
+**定位判断**：rust_frp 的**数据面（data plane）已达标**——TCP/UDP/HTTP/HTTPS/STCP/XTCP/tcpmux/sudp 转发、TLS/KCP/QUIC/WebSocket 传输、AES-256-GCM 应用层加密、snappy 压缩、STUN 真打洞、负载均衡、健康检查、限速、连接池、配置热重载全部可用。**控制面**（CLI、配置管理 API、服务端 HTTP 插件回调、流量统计、优雅关闭、OIDC 真实验签）已基本补齐，**P1 能力缺口全部清零**，剩余短板仅为 **wire protocol v2 与少数生态特性（virtual_net、SSH 隧道网关、wss、tokenSource）**。
 
 **建议路线（按投入产出排序）**：
 1. ~~**配置兼容层**（P0-1/2）~~ ✅ 已落地（2026-10-04）：serde `alias` 双向兼容 + 未知字段 WARN 告警，新增 `rust_frp_config::compat` 模块与原版风格配置回归测试。
@@ -223,7 +223,7 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 5. ~~**优雅关闭**（P1-11）~~：✅ 已落地（2026-10-04），SIGINT/SIGTERM → 停止 accept → 排空（10s 上限）。
 6. ~~**tcpmux / sudp**（P1-8/9）~~ ✅ 已落地（2026-10-04）：代理类型 9/9 全覆盖，tcpmux 支持域名 + HTTP 用户路由，sudp 为 UDP over STCP 隧道。
 7. ~~**服务端插件机制**（P1-10）~~ ✅ 已落地（2026-10-04）：六类 HTTP 回调钩子，支持 reject / 覆写，扩展性问题已解决。
-8. ~~**OIDC 完整流程**（P1-7）~~ ✅ 已落地（2026-10-04）：Discovery + JWKS + RS256/ES256 验签 + 客户端取令牌。**QUIC** 仍为路线图项（需引入 quinn，影响面大、按弱网需求排期）。
+8. ~~**QUIC 传输**（P1-5）~~ ✅ 已落地（2026-10-04）：quinn 0.11 + rustls-ring，TLS 1.3 强制、单 UDP 端口多路复用控制+工作连接、按流首帧分派、客户端 fail-closed 校验。**至此 P1 能力缺口（「功能对不齐」项）已全部清零。**
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关——这些是原版的「生态扩展」，除非有明确场景，否则投入产出比低。
 
@@ -236,3 +236,4 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 - 2026-10-04（tcpmux/sudp 轮）：上述「应用层压缩 / tcpmux / sudp」三行均已更新为 ✅（tcpmux/sudp 本轮落地）。
 - 2026-10-04（服务端插件轮）：新增「服务端 HTTP 插件 ✅」一行；插件体系覆盖 7/8，合计覆盖率 86% → **88%（39/44）**。
 - 2026-10-04（OIDC 实联轮）：OIDC 由「仅本地 HS256」升级为「Discovery + JWKS + RS256/ES256 验签 + 客户端 `client_credentials` 取令牌」，认证与安全覆盖 4/7 → 5/7，合计覆盖率 **88% → 91%（40/44）**；同时修复 `compat` 已知键集漏 `http_plugins` 的回归（该漏项会让服务端插件配置被整体误报为未知字段）。
+- 2026-10-04（QUIC 轮）：QUIC 由「仅配置占位」升级为「quinn 0.11 完整实现」，传输与协议覆盖 7/8 → **8/8**，合计覆盖率 **91% → 93%（42/44）**；README 状态表 QUIC 行 🚧 → ✅，新增 QUIC 场景/协议章节、`quic_bind_port` 端口表与 `[transport.quic]` 示例。同时清理死依赖：`rustls 0.23` 改 `rustls-ring` backend、移除 `aws-lc-rs` C 依赖（`cargo tree -i aws-lc-rs` 已无匹配），「无 C 依赖」成为字面事实。

@@ -44,6 +44,8 @@ pub struct Control {
     metas: std::collections::HashMap<String, String>,
     /// 服务端 HTTP 插件管理器（登录 / 注册 / 心跳 / 关闭代理回调）
     plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
+    /// 上层已读取的登录消息（QUIC 流分派复用；仅首次 run 消费）
+    pre_read_login: Option<rust_frp_core::LoginMsg>,
 }
 
 /// 构造控制会话所需的依赖集合（收敛 15 个独立参数，避免参数顺序误用）
@@ -62,6 +64,8 @@ pub struct ControlDeps {
     pub stcp_bridge_manager: Arc<StcpBridgeManager>,
     pub work_conn_manager: Arc<ServerWorkConnManager>,
     pub work_conn_tls: bool,
+    /// 上层已读取的登录消息（QUIC 流按首条消息分派时复用，避免重复读取）
+    pub pre_read_login: Option<rust_frp_core::LoginMsg>,
     pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
 }
 
@@ -83,6 +87,7 @@ impl Control {
             work_conn_manager,
             work_conn_tls,
             plugin_manager,
+            pre_read_login,
         } = deps;
         Self {
             conn,
@@ -104,6 +109,7 @@ impl Control {
             work_conn_tls,
             metas: std::collections::HashMap::new(),
             plugin_manager,
+            pre_read_login,
         }
     }
 
@@ -179,20 +185,25 @@ impl Control {
         // 安全：登录前读必须带超时（安全评审 P0-1）。否则未认证连接可以
         // 永久挂起本任务（Slowloris 式资源耗尽）；同时首帧上限收紧到
         // 64KB（P0-2），登录消息是几百字节量级的 JSON，无需 10MB 预算。
-        let msg_result = match tokio::time::timeout(
-            LOGIN_READ_TIMEOUT,
-            self.conn
-                .read_message_with_limit(rust_frp_core::MAX_PREAUTH_MESSAGE_SIZE),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                log::warn!(
-                    "Login read timed out after {:?}, closing unauthenticated connection",
-                    LOGIN_READ_TIMEOUT
-                );
-                return Err("login read timeout".into());
+        // 读取登录消息；QUIC 流等由上层按首条消息分派时已读取，直接复用
+        let msg_result = if let Some(login) = self.pre_read_login.take() {
+            Ok(Message::Login(login))
+        } else {
+            match tokio::time::timeout(
+                LOGIN_READ_TIMEOUT,
+                self.conn
+                    .read_message_with_limit(rust_frp_core::MAX_PREAUTH_MESSAGE_SIZE),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    log::warn!(
+                        "Login read timed out after {:?}, closing unauthenticated connection",
+                        LOGIN_READ_TIMEOUT
+                    );
+                    return Err("login read timeout".into());
+                }
             }
         };
 
