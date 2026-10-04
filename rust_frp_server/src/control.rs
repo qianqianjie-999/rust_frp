@@ -2,8 +2,8 @@
 
 use rust_frp_auth::AuthManager;
 use rust_frp_core::{
-    ControlConn, Message, ProxyManager, ReqWorkConnMsg, StcpVisitorRespMsg, VisitorManager,
-    XtcpHolePunchMsg, XtcpNatInfoMsg,
+    ControlConn, Message, ProxyManager, ReqWorkConnMsg, StcpVisitorRespMsg, XtcpHolePunchMsg,
+    XtcpNatInfoMsg,
 };
 use rust_frp_net::AnyConn;
 use std::sync::Arc;
@@ -19,8 +19,6 @@ pub struct Control {
     user: String,
     client_id: String,
     proxy_manager: Arc<dyn ProxyManager + Send + Sync>,
-    #[allow(dead_code)]
-    visitor_manager: Arc<dyn VisitorManager + Send + Sync>,
     auth_manager: Arc<AuthManager>,
     /// 控制器管理器（用于注册客户端信息）
     control_manager: Arc<ControlManager>,
@@ -37,7 +35,6 @@ pub struct Control {
     /// STCP 桥接管理器
     stcp_bridge_manager: Arc<StcpBridgeManager>,
     /// 工作连接管理器
-    #[allow(dead_code)]
     work_conn_manager: Arc<ServerWorkConnManager>,
     /// 工作连接池大小（来自客户端 LoginMsg）
     pool_count: u32,
@@ -45,32 +42,48 @@ pub struct Control {
     work_conn_tls: bool,
 }
 
+/// 构造控制会话所需的依赖集合（收敛 15 个独立参数，避免参数顺序误用）
+pub struct ControlDeps {
+    pub conn: ControlConn,
+    pub run_id: String,
+    pub user: String,
+    pub client_id: String,
+    pub proxy_manager: Arc<dyn ProxyManager + Send + Sync>,
+    pub auth_manager: Arc<AuthManager>,
+    pub control_manager: Arc<ControlManager>,
+    pub proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub login_tx: Option<mpsc::Sender<String>>,
+    pub msg_tx: Option<mpsc::Sender<Message>>,
+    pub stcp_bridge_manager: Arc<StcpBridgeManager>,
+    pub work_conn_manager: Arc<ServerWorkConnManager>,
+    pub work_conn_tls: bool,
+}
+
 impl Control {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        conn: ControlConn,
-        run_id: String,
-        user: String,
-        client_id: String,
-        proxy_manager: Arc<dyn ProxyManager + Send + Sync>,
-        visitor_manager: Arc<dyn VisitorManager + Send + Sync>,
-        auth_manager: Arc<AuthManager>,
-        control_manager: Arc<ControlManager>,
-        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        login_tx: Option<mpsc::Sender<String>>,
-        msg_tx: Option<mpsc::Sender<Message>>,
-        stcp_bridge_manager: Arc<StcpBridgeManager>,
-        work_conn_manager: Arc<ServerWorkConnManager>,
-        work_conn_tls: bool,
-    ) -> Self {
+    pub fn new(deps: ControlDeps) -> Self {
+        let ControlDeps {
+            conn,
+            run_id,
+            user,
+            client_id,
+            proxy_manager,
+            auth_manager,
+            control_manager,
+            proxy_owners,
+            xtcp_visitors,
+            login_tx,
+            msg_tx,
+            stcp_bridge_manager,
+            work_conn_manager,
+            work_conn_tls,
+        } = deps;
         Self {
             conn,
             run_id,
             user,
             client_id,
             proxy_manager,
-            visitor_manager,
             auth_manager,
             control_manager,
             last_heartbeat: Instant::now(),

@@ -676,7 +676,10 @@ impl ConnManager {
     ) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error>
     {
         let (stream, _) = connect_async(url).await.map_err(std::io::Error::other)?;
-        let remote_addr = "127.0.0.1:0".parse().unwrap();
+        // WebSocket 不暴露对端地址，用常量占位（仅用于日志展示）
+        let remote_addr = "127.0.0.1:0"
+            .parse()
+            .expect("constant socket addr is always valid");
         Ok(WebSocketConn::new(stream, remote_addr))
     }
 

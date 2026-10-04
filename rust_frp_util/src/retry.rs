@@ -200,7 +200,8 @@ where
         }
     }
 
-    Err(last_error.unwrap())
+    // 不变量：循环 0..=max_retries 至少执行一次 operation，失败路径必有 last_error
+    Err(last_error.expect("at least one attempt ran, so last_error is always set"))
 }
 
 /// 执行带重试的操作，使用默认配置

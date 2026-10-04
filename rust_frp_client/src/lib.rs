@@ -677,6 +677,7 @@ impl XtcpRegistry {
 }
 
 /// 客户端控制
+// 部分通道字段（udp_resp_rx 等）由消息循环按需消费，整结构保留以便协议扩展
 #[allow(dead_code)]
 pub struct ClientControl {
     pub conn: ControlConn,

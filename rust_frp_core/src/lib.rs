@@ -78,6 +78,7 @@ pub enum CoreError {
 ///   |<-- PongMsg -------------------|
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize)]
+// 性能豁免：Message 是热路径枚举，Box 装箱变体会增加每条消息的堆分配
 #[allow(clippy::large_enum_variant)]
 pub enum Message {
     /// 客户端登录请求

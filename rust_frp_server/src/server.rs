@@ -60,7 +60,22 @@ pub(crate) async fn write_message_with_timeout<T: tokio::io::AsyncWrite + Unpin>
         })?
 }
 
+/// 服务端共享管理器集合：连接处理链路（TCP/TLS/KCP/mux）统一打包传递，
+/// 替代 8-10 个独立 Arc 参数（评审 P2：too_many_arguments 收敛）
+#[derive(Clone)]
+pub(crate) struct ServerManagers {
+    pub control_manager: Arc<ControlManager>,
+    pub proxy_manager: Arc<ServerProxyManager>,
+    pub visitor_manager: Arc<ServerVisitorManager>,
+    pub auth_manager: Arc<AuthManager>,
+    pub proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    pub stcp_bridge_manager: Arc<StcpBridgeManager>,
+    pub work_conn_manager: Arc<ServerWorkConnManager>,
+}
+
 /// 服务器服务
+// 个别监听器字段（vhost_* / work_conn_listener）仅在对应功能启用时读取
 #[allow(dead_code)]
 pub struct Server {
     config: ServerConfig,
@@ -94,6 +109,20 @@ pub struct Server {
 }
 
 impl Server {
+    /// 打包共享管理器集合（全部为 Arc 克隆，代价 O(1)）
+    pub(crate) fn managers(&self) -> ServerManagers {
+        ServerManagers {
+            control_manager: self.control_manager.clone(),
+            proxy_manager: self.proxy_manager.clone(),
+            visitor_manager: self.visitor_manager.clone(),
+            auth_manager: self.auth_manager.clone(),
+            proxy_owners: self.proxy_owners.clone(),
+            xtcp_visitors: self.xtcp_visitors.clone(),
+            stcp_bridge_manager: self.stcp_bridge_manager.clone(),
+            work_conn_manager: self.work_conn_manager.clone(),
+        }
+    }
+
     pub async fn new(
         config: ServerConfig,
         config_path: Option<String>,
@@ -311,27 +340,22 @@ impl Server {
                         Ok((kcp_conn, addr)) => {
                             log::info!("new KCP connection from: {:?}", addr);
                             metrics.increment_connections();
-                            let cm = control_manager.clone();
-                            let pm = proxy_manager.clone();
-                            let vm = visitor_manager.clone();
-                            let am = auth_manager.clone();
-                            let po = proxy_owners.clone();
+                            let managers = ServerManagers {
+                                control_manager: control_manager.clone(),
+                                proxy_manager: proxy_manager.clone(),
+                                visitor_manager: visitor_manager.clone(),
+                                auth_manager: auth_manager.clone(),
+                                proxy_owners: proxy_owners.clone(),
+                                xtcp_visitors: xtcp_visitors.clone(),
+                                stcp_bridge_manager: stcp_bridge_manager.clone(),
+                                work_conn_manager: work_conn_manager.clone(),
+                            };
                             let m = metrics.clone();
-                            let wcm = work_conn_manager.clone();
-                            let sbm = stcp_bridge_manager.clone();
-                            let xv = xtcp_visitors.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_kcp_connection(
                                     kcp_conn,
-                                    cm,
-                                    pm,
-                                    vm,
-                                    am,
-                                    po,
-                                    xv,
-                                    wcm,
-                                    sbm,
+                                    managers,
                                     kcp_work_conn_tls,
                                 )
                                 .await
@@ -829,9 +853,11 @@ impl Server {
         };
 
         // 从池中获取工作连接
-        let visitor_addr = conn
-            .peer_addr()
-            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        let visitor_addr = conn.peer_addr().unwrap_or_else(|_| {
+            "0.0.0.0:0"
+                .parse()
+                .expect("constant socket addr is always valid")
+        });
         match work_conn_manager
             .get_work_conn(&proxy_name, &msg_tx, Duration::from_secs(30), visitor_addr)
             .await
@@ -1058,31 +1084,15 @@ impl Server {
                                     continue;
                                 }
                             };
-                            let control_manager = self.control_manager.clone();
-                            let proxy_manager = self.proxy_manager.clone();
-                            let visitor_manager = self.visitor_manager.clone();
-                            let auth_manager = self.auth_manager.clone();
-                            let proxy_owners = self.proxy_owners.clone();
+                            let managers = self.managers();
                             let metrics = self.metrics.clone();
                             let tls_config = tls_config.clone();
-                            let work_conn_manager = self.work_conn_manager.clone();
-                            let stcp_bridge_manager = self.stcp_bridge_manager.clone();
-                            let xtcp_visitors = self.xtcp_visitors.clone();
 
                             tokio::spawn(async move {
                                 let _conn_permit = permit;
-                                if let Err(e) = Self::handle_connection(
-                                    conn,
-                                    control_manager,
-                                    proxy_manager,
-                                    visitor_manager,
-                                    auth_manager,
-                                    proxy_owners,
-                                    xtcp_visitors,
-                                    tls_config,
-                                    work_conn_manager,
-                                    stcp_bridge_manager,
-                                ).await {
+                                if let Err(e) =
+                                    Self::handle_connection(conn, managers, tls_config).await
+                                {
                                     log::error!("handle connection error: {:?}", e);
                                 }
                                 metrics.decrement_connections();
@@ -1112,33 +1122,13 @@ impl Server {
                             continue;
                         }
                     };
-                    let control_manager = self.control_manager.clone();
-                    let proxy_manager = self.proxy_manager.clone();
-                    let visitor_manager = self.visitor_manager.clone();
-                    let auth_manager = self.auth_manager.clone();
-                    let proxy_owners = self.proxy_owners.clone();
+                    let managers = self.managers();
                     let metrics = self.metrics.clone();
                     let tls_config = tls_config.clone();
-                    let work_conn_manager = self.work_conn_manager.clone();
-                    let stcp_bridge_manager = self.stcp_bridge_manager.clone();
-                    let xtcp_visitors = self.xtcp_visitors.clone();
 
                     tokio::spawn(async move {
                         let _conn_permit = permit;
-                        if let Err(e) = Self::handle_connection(
-                            conn,
-                            control_manager,
-                            proxy_manager,
-                            visitor_manager,
-                            auth_manager,
-                            proxy_owners,
-                            xtcp_visitors,
-                            tls_config,
-                            work_conn_manager,
-                            stcp_bridge_manager,
-                        )
-                        .await
-                        {
+                        if let Err(e) = Self::handle_connection(conn, managers, tls_config).await {
                             log::error!("handle connection error: {:?}", e);
                         }
                         metrics.decrement_connections();
@@ -1149,19 +1139,21 @@ impl Server {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         mut conn: tokio::net::TcpStream,
-        control_manager: Arc<ControlManager>,
-        proxy_manager: Arc<ServerProxyManager>,
-        visitor_manager: Arc<ServerVisitorManager>,
-        auth_manager: Arc<AuthManager>,
-        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        managers: ServerManagers,
         tls_config: Option<TlsConfig>,
-        work_conn_manager: Arc<ServerWorkConnManager>,
-        stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ServerManagers {
+            control_manager,
+            proxy_manager,
+            visitor_manager,
+            auth_manager,
+            proxy_owners,
+            xtcp_visitors,
+            stcp_bridge_manager,
+            work_conn_manager,
+        } = managers;
         // 首字节嗅探：TCP_MUX_MAGIC = tcp_mux 客户端（多路复用路径）
         // 安全：入口嗅探与 TLS 握手都必须受握手超时约束（P0-1），
         // 未认证连接不允许永久占用任务。
@@ -1189,15 +1181,17 @@ impl Server {
             log::info!("tcp_mux connection detected");
             return Self::handle_mux_connection(
                 conn,
-                control_manager,
-                proxy_manager,
-                visitor_manager,
-                auth_manager,
-                proxy_owners,
-                xtcp_visitors,
+                ServerManagers {
+                    control_manager,
+                    proxy_manager,
+                    visitor_manager,
+                    auth_manager,
+                    proxy_owners,
+                    xtcp_visitors,
+                    stcp_bridge_manager,
+                    work_conn_manager,
+                },
                 tls_config,
-                work_conn_manager,
-                stcp_bridge_manager,
             )
             .await;
         }
@@ -1228,14 +1222,16 @@ impl Server {
 
         Self::spawn_control(
             conn,
-            control_manager,
-            proxy_manager,
-            visitor_manager,
-            auth_manager,
-            proxy_owners,
-            xtcp_visitors,
-            stcp_bridge_manager,
-            work_conn_manager,
+            ServerManagers {
+                control_manager,
+                proxy_manager,
+                visitor_manager,
+                auth_manager,
+                proxy_owners,
+                xtcp_visitors,
+                stcp_bridge_manager,
+                work_conn_manager,
+            },
             work_conn_tls,
         );
 
@@ -1245,45 +1241,47 @@ impl Server {
     /// 启动控制连接处理任务（登录注册 + 控制循环 + 退出清理）
     ///
     /// 返回任务句柄：多路复用路径在控制流退出后据此关闭会话。
-    #[allow(clippy::too_many_arguments)]
     fn spawn_control(
         conn: ControlConn,
-        control_manager: Arc<ControlManager>,
-        proxy_manager: Arc<ServerProxyManager>,
-        visitor_manager: Arc<ServerVisitorManager>,
-        auth_manager: Arc<AuthManager>,
-        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        stcp_bridge_manager: Arc<StcpBridgeManager>,
-        work_conn_manager: Arc<ServerWorkConnManager>,
+        managers: ServerManagers,
         work_conn_tls: bool,
     ) -> tokio::task::JoinHandle<()> {
+        let ServerManagers {
+            control_manager,
+            proxy_manager,
+            auth_manager,
+            proxy_owners,
+            xtcp_visitors,
+            stcp_bridge_manager,
+            work_conn_manager,
+            ..
+        } = managers;
         // 创建登录通知通道
         let (login_tx, mut login_rx) = mpsc::channel::<String>(1);
 
         // 创建消息发送通道（用于 Control::run 统一处理消息发送）
         let (msg_tx, msg_rx) = mpsc::channel::<Message>(100);
 
+        // cm 在 Control::new 消费 control_manager 之前取出（任务收尾清理用）
+        let cm = control_manager.clone();
+
         // 创建控制器（不需要 Arc<Mutex>，因为只在一个任务中使用）
-        let mut control = Control::new(
+        let mut control = Control::new(ControlDeps {
             conn,
-            "".to_string(),
-            "".to_string(),
-            "".to_string(),
+            run_id: "".to_string(),
+            user: "".to_string(),
+            client_id: "".to_string(),
             proxy_manager,
-            visitor_manager,
             auth_manager,
-            control_manager.clone(),
+            control_manager,
             proxy_owners,
             xtcp_visitors,
-            Some(login_tx),
-            Some(msg_tx),
+            login_tx: Some(login_tx),
+            msg_tx: Some(msg_tx),
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
-        );
-
-        let cm = control_manager.clone();
+        });
 
         // 克隆 msg_tx 用于注册
         let msg_tx_clone = control.msg_tx.clone();
@@ -1322,19 +1320,21 @@ impl Server {
     /// 连接结构：TLS（如启用）→ yamux 会话；首条流为控制流，
     /// 后续流为工作连接（与 work listener 共用 process_work_conn，协议零变更）。
     /// 控制流退出 → 关闭整个会话（分发循环随之结束）。
-    #[allow(clippy::too_many_arguments)]
     async fn handle_mux_connection(
         conn: tokio::net::TcpStream,
-        control_manager: Arc<ControlManager>,
-        proxy_manager: Arc<ServerProxyManager>,
-        visitor_manager: Arc<ServerVisitorManager>,
-        auth_manager: Arc<AuthManager>,
-        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        managers: ServerManagers,
         tls_config: Option<TlsConfig>,
-        work_conn_manager: Arc<ServerWorkConnManager>,
-        stcp_bridge_manager: Arc<StcpBridgeManager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ServerManagers {
+            control_manager,
+            proxy_manager,
+            visitor_manager,
+            auth_manager,
+            proxy_owners,
+            xtcp_visitors,
+            stcp_bridge_manager,
+            work_conn_manager,
+        } = managers;
         // 工作连接 TLS 协商标志（mux 下工作连接为会话流，TLS 在会话层；
         // 保持与 LoginResp 协商一致性）
         let work_conn_tls = tls_config.is_some();
@@ -1360,23 +1360,25 @@ impl Server {
         // 分发循环所需的克隆（spawn_control 会移走原值）
         let am = auth_manager.clone();
         let sbm = stcp_bridge_manager.clone();
+        let cm = control_manager.clone();
+        let wcm = work_conn_manager.clone();
         let control_handle = Self::spawn_control(
             ControlConn::new(control_stream),
-            control_manager.clone(),
-            proxy_manager,
-            visitor_manager,
-            auth_manager,
-            proxy_owners,
-            xtcp_visitors,
-            stcp_bridge_manager,
-            work_conn_manager.clone(),
+            ServerManagers {
+                control_manager,
+                proxy_manager,
+                visitor_manager,
+                auth_manager,
+                proxy_owners,
+                xtcp_visitors,
+                stcp_bridge_manager,
+                work_conn_manager,
+            },
             work_conn_tls,
         );
 
         // 后续流 = 工作连接，逐条分发
         let dispatch_session = session.clone();
-        let cm = control_manager.clone();
-        let wcm = work_conn_manager.clone();
         let dispatch = tokio::spawn(async move {
             while let Ok(stream) = dispatch_session.accept_stream().await {
                 log::info!("New mux work stream");
@@ -1405,43 +1407,45 @@ impl Server {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn handle_kcp_connection(
         kcp_conn: KcpConn,
-        control_manager: Arc<ControlManager>,
-        proxy_manager: Arc<ServerProxyManager>,
-        visitor_manager: Arc<ServerVisitorManager>,
-        auth_manager: Arc<AuthManager>,
-        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
-        work_conn_manager: Arc<ServerWorkConnManager>,
-        stcp_bridge_manager: Arc<StcpBridgeManager>,
+        managers: ServerManagers,
         work_conn_tls: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ServerManagers {
+            control_manager,
+            proxy_manager,
+            auth_manager,
+            proxy_owners,
+            xtcp_visitors,
+            stcp_bridge_manager,
+            work_conn_manager,
+            ..
+        } = managers;
         let conn = ControlConn::new(Box::new(kcp_conn));
 
         let (login_tx, mut login_rx) = mpsc::channel::<String>(1);
         let (msg_tx, msg_rx) = mpsc::channel::<Message>(100);
 
-        let mut control = Control::new(
+        let cm = control_manager.clone();
+
+        let mut control = Control::new(ControlDeps {
             conn,
-            "".to_string(),
-            "".to_string(),
-            "".to_string(),
+            run_id: "".to_string(),
+            user: "".to_string(),
+            client_id: "".to_string(),
             proxy_manager,
-            visitor_manager,
             auth_manager,
-            control_manager.clone(),
+            control_manager,
             proxy_owners,
             xtcp_visitors,
-            Some(login_tx),
-            Some(msg_tx),
-            stcp_bridge_manager.clone(),
-            work_conn_manager.clone(),
+            login_tx: Some(login_tx),
+            msg_tx: Some(msg_tx),
+            stcp_bridge_manager,
+            work_conn_manager,
             work_conn_tls,
-        );
+        });
 
-        let cm = control_manager.clone();
         let msg_tx_clone = control.msg_tx.clone();
 
         tokio::spawn(async move {

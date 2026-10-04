@@ -63,7 +63,7 @@ pub enum UtilError {
 pub fn get_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock must be after UNIX_EPOCH (1970)")
         .as_secs() as i64
 }
 
