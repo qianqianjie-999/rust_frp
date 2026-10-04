@@ -59,15 +59,14 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
 | PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP（**仅 v1**；原版 v2 未实现） |
 | 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容）；**约 25+ 个原版字段暂未支持**，解析成功但会 WARN 提示（清单见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md) 第十节） |
-| frpc CLI 子命令 | ✅ | `frpc verify`（校验配置）/ `frpc reload`（热重载）/ `frpc status`（代理状态），后两者走 frpc 管理端口（Basic Auth 保护）；**尚未支持**原版的 `stop` / `nathole` / 每类代理子命令 / `--config_dir` |
+| frpc CLI 子命令 | ✅ | `verify`（校验配置）/ `reload`（热重载）/ `status`（代理状态）/ `stop`（优雅停止），后三者走 frpc 管理端口（Basic Auth 保护）；另有 `nathole discover`（NAT 探测）、`frpc <type> [visitor]`（单代理/访客快速启动，9 类代理）、`--config_dir`（多实例）、`--api-timeout`；**尚未支持** `--strict_config`（rust 为 WARN 模式） |
 | 流量统计 | ✅ | 桥接结束累加双向字节：服务端 `/api/proxies`（`traffic_in/out`）+ Prometheus per-proxy 指标；客户端 `frpc status`（`traffic_down/up`） |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
-> **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 57%。尚未支持的主要项：
+> **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 77%。尚未支持的主要项：
 > wire protocol v2、客户端插件 `http2http` / `http2https` / `virtual_net`
 > （另：`http_proxy` 仅支持 `CONNECT` 隧道，普通 HTTP 转发未实现）、服务端 tracer、
-> `auth.additionalScopes`、SSH 隧道网关、frps 的 `serverinfo` / `clients` / `v2` API 套件、
-> `frpc stop` / `nathole` / 每类代理子命令、Store 配置源等。
+> `auth.additionalScopes`、SSH 隧道网关、`--strict_config`、Store 配置源等。
 > 逐项源码级对照与本项目更严格的安全默认值，见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md)。
 
 ---
@@ -331,11 +330,62 @@ RUST_LOG=debug ./target/release/rust_frpc -c /opt/rust_frp/conf/frpc.toml
 
 # 查询代理/访客运行状态（走管理端口 GET /status）
 ./target/release/rust_frpc status -c frpc.toml
+
+# 停止运行中的 frpc（走管理端口 POST /stop，优雅退出）
+./target/release/rust_frpc stop -c frpc.toml
+
+# 打印版本
+./target/release/rust_frpc -v
 ```
 
-> 说明：`reload`/`status` 需要 frpc 配置文件中启用管理端口
+> 说明：`reload`/`status`/`stop` 需要 frpc 配置文件中启用管理端口
 > （`[webServer] port > 0`）；配置了 `user` + `password` 时自动附带
-> Basic 认证。建议 `addr` 仅监听 `127.0.0.1`。
+> Basic 认证。`--api-timeout <secs>` 可调管理 API 超时（默认 30s，支持 `500ms`/`2m`）。
+> 建议 `addr` 仅监听 `127.0.0.1`。
+
+### frpc 单代理快速启动（免配置文件）
+
+对齐原版 frp 的 `frpc <type> [flags]`：不写配置文件，直接用旗标跑单个代理或访问者。
+
+```bash
+# TCP：把本地 22 端口映射到服务器 6000
+./target/release/rust_frpc tcp -s frps.example.com -p 7000 -t mytoken \
+    --local_port 22 --remote_port 6000
+
+# HTTP：按自定义域名暴露本地 8080
+./target/release/rust_frpc http -s frps.example.com -p 7000 -t mytoken \
+    --local_ip 127.0.0.1 --local_port 8080 \
+    --custom_domains web.example.com
+
+# STCP 访问者：本地 9000 端口访问远端名为 ssh 的 stcp 代理
+./target/release/rust_frpc stcp visitor -s frps.example.com -p 7000 -t mytoken \
+    --server_name ssh --bind_port 9000 --secret_key s3cr3t
+```
+
+支持的代理类型：`tcp` / `udp` / `http` / `https` / `tcpmux` / `stcp` / `sudp` / `xtcp` / `websocket`；
+`stcp` / `sudp` / `xtcp` 另有 `visitor` 子命令。
+长旗标同时兼容 snake_case 与原版 camelCase 拼写（如 `--local_port` 与 `--localPort`）。
+
+### frpc 多实例（--config_dir）
+
+```bash
+# 目录内每个配置文件各起一个 frpc 实例（对齐原版 runMultipleClients）
+./target/release/rust_frpc --config_dir /etc/frpc.d
+```
+
+### 打洞探测（nathole discover）
+
+```bash
+# 经 STUN 探测本机 NAT 类型与行为（EasyNAT / HardNAT、行为是否变化、是否公网）
+./target/release/rust_frpc nathole discover
+# 指定 STUN 服务器与本地出口地址
+./target/release/rust_frpc nathole discover \
+    --nat_hole_stun_server stun.example.com:3478 -l 0.0.0.0:0
+```
+
+对同一 UDP socket 依次向各 STUN 服务器探测：映射完全一致判为 `EasyNAT`，
+IP/端口任一变化判为 `HardNAT` 并给出 `BehaviorIPChanged/PortChanged/BothChanged`，
+与端口差 ≤5 时标记端口变化规律（可预测打洞）。
 
 ### frpc 管理 API（运行时配置 CRUD）
 
@@ -346,6 +396,7 @@ RUST_LOG=debug ./target/release/rust_frpc -c /opt/rust_frp/conf/frpc.toml
 | `GET /config` | 返回配置文件原文（text/plain） |
 | `PUT /config` | 校验请求体为新配置 → 原子覆写配置文件 → 自动触发热重载 |
 | `POST /reload` | 仅触发热重载（重读磁盘上的配置文件） |
+| `POST /stop` | 触发客户端优雅退出（发送 Disconnect 后退出进程） |
 | `GET /status` | 代理/访客运行状态 |
 
 `PUT /config` 语义：**校验失败返回 400 且不落盘**（原文件保持不动）；

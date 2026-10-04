@@ -2252,6 +2252,7 @@ async fn sudp_open_session(
 /// - `GET  /proxies`  代理配置列表
 /// - `GET  /visitors` 访客配置列表
 /// - `GET  /status`   代理/访客运行状态（`frpc status` 使用）
+/// - `POST /stop`     触发客户端优雅退出（`frpc stop` 使用）
 /// - `POST /reload`   触发配置热重载（`frpc reload` 使用）
 /// - `GET  /config`   读取配置文件原文（对齐原版 `GET /api/config`）
 /// - `PUT  /config`   校验并原子覆写配置文件 + 触发热重载（对齐原版 `PUT /api/config`）
@@ -2274,6 +2275,8 @@ struct WebServerState {
     visitor_manager: Arc<ClientVisitorManager>,
     /// reload 端点通过该 Notify 通知 Client 主循环执行 reload_config
     reload_notify: Arc<tokio::sync::Notify>,
+    /// stop 端点通过该 Notify 通知 Client 主循环优雅退出
+    stop_notify: Arc<tokio::sync::Notify>,
     /// 配置文件路径（PUT /config 原子落盘的目标；None 表示管理端不可用）
     config_path: Option<String>,
     /// webServer 是否配置了 user/password（config 端点在 false 时直接 403）
@@ -2304,6 +2307,7 @@ impl WebServer {
             proxy_manager: client.proxy_manager.clone(),
             visitor_manager: client.visitor_manager.clone(),
             reload_notify: client.reload_notify.clone(),
+            stop_notify: client.stop_notify.clone(),
             config_path: client.config_path.clone(),
             auth_enabled: self.auth.is_some(),
         });
@@ -2314,6 +2318,7 @@ impl WebServer {
             .route("/proxies", get(proxies_handler))
             .route("/visitors", get(visitors_handler))
             .route("/status", get(status_handler))
+            .route("/stop", post(stop_handler))
             .route("/reload", post(reload_handler))
             .route("/config", get(get_config_handler).put(put_config_handler))
             .with_state(state)
@@ -2458,6 +2463,18 @@ async fn reload_handler(State(state): State<Arc<WebServerState>>) -> Json<serde_
     state.reload_notify.notify_one();
     Json(serde_json::json!({
         "msg": "reload signal sent",
+        "code": 200,
+    }))
+}
+
+/// `POST /stop`：通知 Client 主循环优雅退出（对齐原版 `POST /api/stop`）。
+///
+/// 与 `/reload` 同为异步投递：端点返回时退出流程刚被唤醒，
+/// 客户端会先向服务端发送 Disconnect 再排空存量连接后退出。
+async fn stop_handler(State(state): State<Arc<WebServerState>>) -> Json<serde_json::Value> {
+    state.stop_notify.notify_one();
+    Json(serde_json::json!({
+        "msg": "stop signal sent",
         "code": 200,
     }))
 }
@@ -2713,6 +2730,8 @@ pub struct Client {
     web_server: Option<WebServer>,
     /// 管理端 POST /reload 经由此通知主循环执行 reload_config
     reload_notify: Arc<tokio::sync::Notify>,
+    /// 管理端 POST /stop 经由此通知主循环优雅退出
+    stop_notify: Arc<tokio::sync::Notify>,
     config_path: Option<String>,
     health_check_handles: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -2766,6 +2785,7 @@ impl Client {
             connector,
             web_server,
             reload_notify: Arc::new(tokio::sync::Notify::new()),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
             config_path,
             health_check_handles: Vec::new(),
         })
@@ -2834,6 +2854,9 @@ impl Client {
         // 热重载通知：管理端 POST /reload、SIGHUP、配置文件变更共用同一通道
         let reload_notify = Arc::clone(&self.reload_notify);
         let mut reload_requested = false;
+
+        // 退出通知：管理端 POST /stop（`frpc stop`）
+        let stop_notify = Arc::clone(&self.stop_notify);
 
         log::info!("Client started, entering main loop with auto-reconnect...");
 
@@ -2938,6 +2961,12 @@ impl Client {
                 _ = sighup.recv() => {
                     log::info!("Received SIGHUP, triggering config reload...");
                     reload_requested = true;
+                }
+                // 管理端 POST /stop（`frpc stop`）
+                _ = stop_notify.notified() => {
+                    log::info!("Received stop request from admin API, shutting down gracefully...");
+                    self.graceful_shutdown().await?;
+                    break;
                 }
                 // 信号处理
                 _ = sigint.recv() => {
@@ -3509,6 +3538,7 @@ mod web_admin_tests {
             proxy_manager: Arc::new(ClientProxyManager::new()),
             visitor_manager: Arc::new(ClientVisitorManager::new()),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
             config_path: None,
             auth_enabled: false,
         })
@@ -3526,6 +3556,7 @@ mod web_admin_tests {
         let state = test_state();
         Router::new()
             .route("/status", get(status_handler))
+            .route("/stop", post(stop_handler))
             .route("/reload", post(reload_handler))
             .with_state(state)
             .layer(middleware::from_fn(move |req, next| {
@@ -3551,6 +3582,29 @@ mod web_admin_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_stop_endpoint_notifies_and_returns_ok() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/stop", post(stop_handler))
+            .with_state(Arc::clone(&state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // 许可位语义：端点在 await 前已 notify，notified() 应立刻返回
+        tokio::time::timeout(Duration::from_millis(200), state.stop_notify.notified())
+            .await
+            .expect("stop signal should be delivered");
     }
 
     #[tokio::test]
@@ -3650,6 +3704,7 @@ mod web_admin_tests {
             proxy_manager: Arc::new(mgr),
             visitor_manager: Arc::new(ClientVisitorManager::new()),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
             config_path: None,
             auth_enabled: false,
         });
@@ -3759,6 +3814,7 @@ mod web_admin_tests {
             proxy_manager: Arc::new(ClientProxyManager::new()),
             visitor_manager: Arc::new(ClientVisitorManager::new()),
             reload_notify: notify,
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
             config_path: Some(path.to_string_lossy().into_owned()),
             auth_enabled: true,
         })

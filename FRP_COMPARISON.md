@@ -29,16 +29,16 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~322 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 能力覆盖率 | **≈ 77%（56/73）** ｜ 数据面 **92%（24/26）**、控制/运维面 **68%（32/47）** | 100%（基线） | 见第二节 |
+| 能力覆盖率 | **≈ 82%（60/73）** ｜ 数据面 **92%（24/26）**、控制/运维面 **77%（36/47）** | 100%（基线） | 见第二节 |
 | 配置字段兼容 | ⚠️ 双向 alias 兼容，但**约 25+ 个原版字段未支持**（解析成功 + WARN） | camelCase + 严格模式 | 原版配置**可加载**但部分字段不生效 |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
-| CLI 子命令 | verify / reload / status | reload / status / stop / verify / nathole / 每类代理 | rust 明显偏少 |
+| CLI 子命令 | verify / reload / status / stop / nathole / 每类代理与访客 / `--config_dir` | reload / status / stop / verify / nathole / 每类代理 | rust 已基本对齐 |
 | 安全默认值 | ✅ 更保守（见第九节） | 一般 | **rust 更严** |
 | 运行时依赖 | rustls/ring + quinn（无 OpenSSL、无 C 依赖） | golib/quic-go/kcp-go | 均为单二进制 |
 
 **一句话结论**：rust_frp 的**数据面（data plane）已基本对齐**（代理类型、TLS/KCP/QUIC/WebSocket
 传输、应用层加密与压缩、STCP/XTCP 打洞、负载均衡、限速、连接池、热重载、优雅关闭全部可用）；
-**控制面/运维面（控制 API、CLI、插件覆盖面、认证扩展、配置字段）覆盖约 68%**，
+**控制面/运维面（控制 API、CLI、插件覆盖面、认证扩展、配置字段）覆盖约 77%**，
 缺口集中在「运维丰富度」与「少数生态特性」，而非「能不能用」。
 
 ---
@@ -56,16 +56,16 @@
 | 认证与安全 | **4/7** | 57% | `additionalScopes`、SSH 隧道网关、FeatureGate/`--allow-unsafe` |
 | frps 管理 API | **9/9** | 100% | —（v1 serverinfo/clients/按类型名称查询/流量 + v2 套件/分页/prune/users + DELETE offline 全部落地） |
 | frpc 管理 API | **3/5** | 60% | `/api/stop`、Store 源代理 CRUD |
-| CLI | **4/8** | 50% | `stop`、`nathole`、每类代理/访客子命令、`--config_dir` |
+| CLI | **7/8** | 88% | `--strict_config`（rust 为 WARN 模式） |
 | 配置体系 | **4/6** | 67% | Store 配置源、FeatureGates |
-| **合计** | **56/73** | **≈77%** | — |
+| **合计** | **60/73** | **≈82%** | — |
 
 **分组小结**：
 
 | 分组 | 覆盖 | 说明 |
 |------|:----:|------|
 | 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **24/26（92%）** | 转发链路基本对齐 |
-| 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **32/47（68%）** | 运维丰富度差距明显 |
+| 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **36/47（77%）** | 剩余差距集中在插件/认证/配置字段 |
 
 > 计分口径：一项能力「确实可用且与原版等价（或更强）」记 1 分；缺失 / 仅占位 / 显著弱化 / 未强制记 0 分。
 
@@ -212,9 +212,9 @@
 |------|:--------:|:--------:|
 | reload | ✅ `POST /reload` | ✅ `GET /api/reload` |
 | status | ✅ `GET /status` | ✅ `GET /api/status` |
-| stop | ❌ | ✅ `POST /api/stop` |
+| stop | ✅ `POST /stop` | ✅ `POST /api/stop` |
 | config 读取/写入 | ✅ `GET/PUT /config` | ✅ `GET/PUT /api/config` |
-| 单代理/访客配置查询 | ❌ | ✅ `/api/proxy/{name}/config`、`/api/visitor/{name}/config` |
+| 单代理/访客配置查询 | ⚠️ `/status` 内联全部代理与访客 | ✅ `/api/proxy/{name}/config`、`/api/visitor/{name}/config` |
 | Store 源代理/访客 CRUD | ❌ | ✅ `/api/store/proxies`、`/api/store/visitors`（Create/Get/Update/Delete） |
 
 ### 9.3 CLI 子命令
@@ -223,12 +223,19 @@
 |------|:--------:|:--------:|
 | 启动（`-c config`） | ✅ | ✅ |
 | `frpc reload` / `status` | ✅ | ✅ |
-| `frpc stop` | ❌ | ✅ |
+| `frpc stop` | ✅ `POST /stop` | ✅ |
 | `frpc verify`（配置校验） | ✅ | ✅ |
-| `frpc nathole discover`（打洞调试） | ❌ | ✅ |
-| 每类代理子命令（`frpc tcp/udp/http/…`） | ❌ | ✅（8 类 + 访客子命令） |
-| `--config_dir`（多实例） | ❌ | ✅ |
+| `frpc nathole discover`（打洞调试） | ✅（STUN 多服务器采样 + NAT 行为分类，对齐 `ClassifyNATFeature`） | ✅ |
+| 每类代理子命令（`frpc tcp/udp/http/…`） | ✅（9 类代理 + stcp/sudp/xtcp `visitor` 子命令） | ✅（8 类 + 访客子命令） |
+| `--config_dir`（多实例） | ✅（目录内每文件起一实例） | ✅ |
+| `--api-timeout`（管理 API 超时） | ✅（默认 30s，支持 `s`/`ms`/`m`） | ✅ |
 | `--strict_config`（未知字段即报错，默认 true） | ❌（rust 为 WARN 模式） | ✅ |
+
+> 快速启动（`frpc <type>`）支持的旗标：`-s/-p/-t/-u`（服务器与认证）、
+> `-n/--name`、`--local_ip`、`--local_port`、`--remote_port`、`--custom_domains`、
+> `--subdomain`、`--secret_key`、`--allow_users`、`--group`、`--group_key`、
+> `--use_encryption`、`--use_compression`、`--plugin`；访问者另有
+> `--server_name`、`--bind_addr`、`--bind_port`。长旗标同时兼容 snake_case 与原版 camelCase。
 
 ---
 
@@ -292,7 +299,7 @@
 | 12 | ~~流量统计~~ | ✅ 已落地 |
 | 13 | ~~`http_proxy`/`socks5` 插件级认证未强制~~ | ✅ 已落地（http_proxy → 407；socks5 → RFC 1929）。**残留**：`http_proxy` 仅支持 CONNECT |
 | 14 | ~~`wss` 传输~~ | ✅ 已落地（TLS + WebSocket，`/~!frp` 路径，双端嗅探升级；3 个 e2e 测试） |
-| 15 | **frpc `stop` / `nathole` / 每类代理子命令 / `--config_dir`** | ❌ CLI 面偏瘦 |
+| 15 | ~~frpc `stop` / `nathole` / 每类代理子命令 / `--config_dir`~~ | ✅ 已落地（`stop` 走管理端 `POST /stop`；`nathole discover` 含 NAT 行为分类；9 类代理 + 3 类 visitor 快速启动；`--config_dir` 多实例；`--api-timeout`） |
 | 16 | ~~frps API 补齐~~（serverinfo / 按类型名称查询 / clients / v2 套件 / DELETE offline） | ✅ 已落地（v1 全端点 + v2 `{code,msg,data}` 信封 + 分页 + prune + users 聚合） |
 | 17 | **wire protocol v2** | ❌ 线协议仍为 v1 等价实现 |
 
@@ -315,13 +322,13 @@ PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start
 **建议路线（按投入产出排序）**：
 1. ~~**`wss` 传输**~~ —— ✅ 已完成（复用 websocket+TLS 代码 + 服务端嗅探升级）。
 2. ~~**frps API 补齐**（serverinfo、按类型/名称查询、clients、DELETE offline）~~ —— ✅ 已完成（v1 + v2 套件、分页信封、离线历史）。
-3. **frpc CLI 补齐**（`stop`、`--config_dir`）—— 运维便捷性。
+3. ~~**frpc CLI 补齐**（`stop`、`--config_dir`）~~ —— ✅ 已完成（另含 `nathole discover`、9 类代理/3 类 visitor 快速启动、`--api-timeout`）。
 4. **`http2http` / `http2https` 插件** —— 引入 `h2`，自包含在插件 crate。
 5. **`http_proxy` 普通 HTTP 转发** —— 补齐与原版的最后一处插件语义差异。
 6. **wire protocol v2** —— 最大项，改线格式、回归风险高，建议放最后。
 
 > ✅ 已完成：`http_proxy` / `socks5` 插件级认证；`wss` 传输（原建议路线第 1 项）；
-> **frps 管理 API 补齐**（原建议路线第 2 项）。
+> **frps 管理 API 补齐**（第 2 项）；**frpc CLI 补齐**（第 3 项）。
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关、FeatureGates——
 属原版「生态扩展」，除非有明确场景，否则投入产出比低。
