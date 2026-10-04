@@ -483,10 +483,10 @@ pub struct TransportConfig {
 
     /// 应用层压缩（兼容原版 `transport.useCompression`）
     ///
-    // 路线图配置项：压缩算法未实现，字段先随配置 schema 固化，仅保证
-    // 原版配置可解析不报错（未知字段告警不会误报）。
+    /// 仅在代理/访问者级 `[[proxies]].transport` 子表中生效：解析后会被
+    /// 合并进该代理的 `use_compression`（见 ConfigLoader 的 normalize 步骤）。
+    /// 出现在全局 `[transport]` 中时被忽略。
     #[serde(default, alias = "useCompression")]
-    #[allow(dead_code)]
     pub use_compression: bool,
 
     /// 带宽限制模式（兼容原版 `transport.bandwidthLimitMode`，"client"/"server"）
@@ -805,6 +805,13 @@ pub struct ProxyConfig {
     /// 客户端未配置 token 时启用此选项会导致代理启动失败（fail-closed）。
     #[serde(default, alias = "useEncryption")]
     pub use_encryption: bool,
+
+    /// 应用层压缩：对该代理的工作连接流量启用 snappy 压缩
+    ///
+    /// 两端需配置一致（对端关闭压缩时收到压缩帧会立即断连）；
+    /// 与 `use_encryption` 可叠加，顺序固定为「先压缩、后加密」。
+    #[serde(default, alias = "useCompression")]
+    pub use_compression: bool,
 }
 
 /// 访问者配置 - 定义如何访问其他客户端的 STCP/XTCP 服务
@@ -855,6 +862,10 @@ pub struct VisitorConfig {
     /// 应用层加密：需与对端代理的 use_encryption 配置一致
     #[serde(default, alias = "useEncryption")]
     pub use_encryption: bool,
+
+    /// 应用层压缩：需与对端代理的 use_compression 配置一致
+    #[serde(default, alias = "useCompression")]
+    pub use_compression: bool,
 }
 
 /// 健康检查配置 - 定义代理健康检查规则
@@ -1181,12 +1192,18 @@ impl ConfigLoader {
                 if t.use_encryption {
                     proxy.use_encryption = true;
                 }
+                if t.use_compression {
+                    proxy.use_compression = true;
+                }
             }
         }
         for visitor in &mut config.visitors {
             if let Some(t) = &visitor.transport {
                 if t.use_encryption {
                     visitor.use_encryption = true;
+                }
+                if t.use_compression {
+                    visitor.use_compression = true;
                 }
             }
         }

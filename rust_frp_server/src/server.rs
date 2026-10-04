@@ -601,6 +601,18 @@ impl Server {
                     }
                 }
 
+                // 应用层压缩：包装在验签后、入池/桥接前，池与 STCP 桥接路径
+                // 自动获得压缩能力（必须先于加密包装，保证「先压缩、后加密」）
+                let mut conn: AnyConn = if work_msg.use_compression {
+                    log::info!(
+                        "Work conn compression (snappy) enabled for proxy: {}",
+                        work_msg.proxy_name
+                    );
+                    Box::new(rust_frp_net::compress::CompressedStream::new(conn))
+                } else {
+                    conn
+                };
+
                 // 应用层加密（fail-closed）：客户端请求加密但服务端未配 token 时拒绝；
                 // 包装在验签后、入池/桥接前，池与 STCP 桥接路径自动获得加密能力
                 let conn: AnyConn = if work_msg.use_encryption {

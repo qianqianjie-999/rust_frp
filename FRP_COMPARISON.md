@@ -12,14 +12,14 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~217 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 功能点覆盖率 | **约 75%**（44 项能力点中 33 项等价或更强；配置兼容层、CLI 子命令与配置管理 API 已于 2026-10-04 落地） | 100%（基线） | — |
+| 功能点覆盖率 | **约 77%**（44 项能力点中 34 项等价或更强；配置兼容层、CLI 子命令、配置管理 API、应用层压缩已于 2026-10-04 落地） | 100%（基线） | — |
 | 配置字段兼容 | ✅ 双向兼容（alias） | camelCase | 原版配置可直接复用（2026-10-04 起） |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify/reload/status | reload/status/stop/verify/… | reload/status/verify 已补齐 |
 | 安全默认值 | ✅ 更保守（见第九节） | 一般 | **rust 更严** |
 | 运行时依赖 | rustls/ring（无 OpenSSL） | golib/quic-go/kcp-go | 均为单二进制 |
 
-**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型主体、TLS/KCP/WebSocket 传输、应用层加密、STCP/XTCP 真打洞、负载均衡、限速、连接池），但**「周边工程化能力」缺口明显**——QUIC、压缩、完整 OIDC、tcpmux/sudp、服务端插件、配置管理 API、CLI 子命令、优雅关闭等 12 项未落地或仅占位。**它现在是一个「内核达标、周边偏瘦」的实现**。
+**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型主体、TLS/KCP/WebSocket 传输、应用层加密、STCP/XTCP 真打洞、负载均衡、限速、连接池），但**「周边工程化能力」缺口明显**——QUIC、完整 OIDC、tcpmux/sudp、服务端插件、优雅关闭、流量统计 API 等 10 项未落地或仅占位。**它现在是一个「内核达标、周边偏瘦」的实现**。
 
 ---
 
@@ -28,13 +28,13 @@
 | 分类 | 覆盖 | 覆盖率 | 主要缺口 |
 |------|:----:|:------:|----------|
 | 代理类型 | 7/9 | 78% | tcpmux、sudp |
-| 传输与协议 | 6/8 | 75% | QUIC、wss |
+| 传输与协议 | 7/8 | 88% | QUIC、wss |
 | 插件体系 | 6/8 | 75% | http2http、http2https、virtual_net、服务端插件 |
 | 配置兼容 | 4/5 | 80% | 严格未知字段校验（现为 WARN 告警模式，见 P0-2） |
 | 认证与安全 | 4/7 | 57% | 完整 OIDC、tokenSource、SSH 隧道 |
 | 管理 API | 3/4 | 75% | 流量/详情统计 |
 | CLI 运维 | 3/3 | 100% | — |
-| **合计** | **33/44** | **75%** | — |
+| **合计** | **34/44** | **77%** | — |
 
 > 计分口径：一项能力「等价或更强」记 1 分；缺失 / 仅占位 / 显著弱化记 0 分。
 
@@ -88,7 +88,7 @@
 | TLS force / 仅 TLS | ✅ `tls_only` | ✅ `transport.tls.force` | 等价 |
 | TLS 客户端校验 | ✅ fail-closed（无 CA 且未显式 skip → 拒绝启动） | ⚠️ 有 TrustedCAFile 才 force | **rust 更严** |
 | 应用层加密 `use_encryption` | ✅ AES-256-GCM（自研帧） | ✅ libio WithEncryption | 双方均已实现 |
-| **应用层压缩 `use_compression`** | ❌ 占位 | ✅ snappy（libio） | rust 字段存在但硬编码 false |
+| **应用层压缩 `use_compression`** | ✅ snappy（raw block，可与加密叠加） | ✅ snappy | 2026-10-04 落地 |
 
 ---
 
@@ -198,7 +198,7 @@
 | # | 缺口 | 现状 |
 |---|------|------|
 | 5 | QUIC 传输 | 仅配置占位 |
-| 6 | `use_compression` 压缩 | 字段占位、硬编码 false |
+| 6 | ~~`use_compression` 压缩~~ | ✅ 已实现（2026-10-04）：snappy 压缩流，顺序为先压缩后加密 |
 | 7 | OIDC 完整流程 | 仅本地 HS256 验签，不连 issuer |
 | 8 | tcpmux 代理 | 仅端口占位 |
 | 9 | sudp 代理 | 完全缺失 |
