@@ -3,6 +3,100 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// 小时级流量序列长度（对齐原版 dashboard 的 24 小时视图）
+pub const TRAFFIC_HOURS: usize = 24;
+
+/// 小时级双向流量序列（环形缓冲，容量 [`TRAFFIC_HOURS`] 小时）
+///
+/// 用于 `/api/traffic/{name}` 与 `/api/v2/proxies/{name}/traffic` 的
+/// `trafficIn` / `trafficOut` 数组（按小时聚合，索引 0 为最早小时）。
+struct TrafficSeries {
+    inner: std::sync::Mutex<TrafficSeriesInner>,
+}
+
+struct TrafficSeriesInner {
+    /// 第 0 个桶对应的小时序号（Unix 小时 = epoch_secs / 3600）
+    base_hour: u64,
+    /// 每个元素为 (bytes_in, bytes_out)
+    buckets: Vec<(u64, u64)>,
+}
+
+impl TrafficSeries {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(TrafficSeriesInner {
+                base_hour: current_hour(),
+                buckets: vec![(0, 0); TRAFFIC_HOURS],
+            }),
+        }
+    }
+
+    /// 记录一次转发的双向字节
+    fn add(&self, bytes_in: u64, bytes_out: u64) {
+        let now_hour = current_hour();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = &mut *inner;
+        if now_hour < inner.base_hour {
+            // 时钟回拨：重置序列
+            inner.base_hour = now_hour;
+            inner.buckets = vec![(0, 0); TRAFFIC_HOURS];
+        }
+        let mut idx = (now_hour - inner.base_hour) as usize;
+        if idx >= TRAFFIC_HOURS {
+            // 前移窗口：丢弃最旧的小时
+            let advance = idx - (TRAFFIC_HOURS - 1);
+            inner.buckets.drain(..advance);
+            inner.buckets.resize(TRAFFIC_HOURS, (0, 0));
+            inner.base_hour += advance as u64;
+            idx = TRAFFIC_HOURS - 1;
+        }
+        let bucket = &mut inner.buckets[idx];
+        bucket.0 = bucket.0.saturating_add(bytes_in);
+        bucket.1 = bucket.1.saturating_add(bytes_out);
+    }
+
+    /// 导出 (traffic_in[], traffic_out[]) 两个等长数组
+    fn snapshot(&self) -> (Vec<u64>, Vec<u64>) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let incoming = inner.buckets.iter().map(|(i, _)| *i).collect();
+        let outgoing = inner.buckets.iter().map(|(_, o)| *o).collect();
+        (incoming, outgoing)
+    }
+}
+
+/// 当前 Unix 小时序号
+fn current_hour() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 3600
+}
+
+/// 已关闭代理的历史记录
+///
+/// 代理在线时由 [`MonitorMetrics::register_proxy_stat`] 统计；客户端断开或
+/// 代理下线时经 [`MonitorMetrics::record_proxy_closed`] 落入历史表，供
+/// `/api/proxies?status=offline`（查询）与 `DELETE`（清理）使用。
+#[derive(Debug, Clone)]
+pub struct ClosedProxyInfo {
+    pub name: String,
+    pub proxy_type: String,
+    pub user: String,
+    pub client_id: String,
+    pub remote_port: Option<u16>,
+    pub last_start_time: i64,
+    pub last_close_time: i64,
+    pub traffic_in: u64,
+    pub traffic_out: u64,
+}
+
 pub struct ProxyStat {
     pub name: String,
     pub proxy_type: String,
@@ -13,6 +107,10 @@ pub struct ProxyStat {
     pub bytes_in: AtomicUsize,
     /// 出口方向累计字节（工作连接 → 访问者）
     pub bytes_out: AtomicUsize,
+    /// 注册时间（Unix 秒）
+    pub created_at: i64,
+    /// 小时级流量序列
+    series: TrafficSeries,
 }
 
 impl ProxyStat {
@@ -25,6 +123,8 @@ impl ProxyStat {
             total_conns: AtomicUsize::new(0),
             bytes_in: AtomicUsize::new(0),
             bytes_out: AtomicUsize::new(0),
+            created_at: rust_frp_util::get_timestamp(),
+            series: TrafficSeries::new(),
         }
     }
 
@@ -33,6 +133,20 @@ impl ProxyStat {
         self.bytes_in.fetch_add(bytes_in as usize, Ordering::SeqCst);
         self.bytes_out
             .fetch_add(bytes_out as usize, Ordering::SeqCst);
+        self.series.add(bytes_in, bytes_out);
+    }
+
+    /// 小时级流量序列快照
+    pub fn traffic_series(&self) -> (Vec<u64>, Vec<u64>) {
+        self.series.snapshot()
+    }
+
+    /// 当前累计 (bytes_in, bytes_out)
+    pub fn totals(&self) -> (u64, u64) {
+        (
+            self.bytes_in.load(Ordering::SeqCst) as u64,
+            self.bytes_out.load(Ordering::SeqCst) as u64,
+        )
     }
 }
 
@@ -75,7 +189,12 @@ pub struct MonitorMetrics {
     work_conn_total: AtomicUsize,
     /// per-proxy 统计表（proxy_name -> 指标）
     proxy_stats: std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<ProxyStat>>>,
+    /// 已关闭代理历史（上限 [`MAX_CLOSED_PROXIES`]，FIFO 淘汰）
+    closed_proxies: std::sync::RwLock<Vec<ClosedProxyInfo>>,
 }
+
+/// 已关闭代理历史的最大保留条数
+pub const MAX_CLOSED_PROXIES: usize = 500;
 
 impl Default for MonitorMetrics {
     fn default() -> Self {
@@ -98,6 +217,7 @@ impl MonitorMetrics {
             tls_rejects: AtomicUsize::new(0),
             work_conn_total: AtomicUsize::new(0),
             proxy_stats: std::sync::RwLock::new(std::collections::HashMap::new()),
+            closed_proxies: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -191,7 +311,50 @@ impl MonitorMetrics {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(name.to_string(), stat.clone());
+        // 同名代理重新上线：从「已关闭」历史里摘除（避免同一名字同时出现在两个列表）
+        self.closed_proxies
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|p| p.name != name);
         stat
+    }
+
+    /// 代理下线时落一份历史记录（供 offline 查询与清理）
+    ///
+    /// 按名字去重后 FIFO 追加，超过 [`MAX_CLOSED_PROXIES`] 丢弃最旧记录。
+    pub fn record_proxy_closed(&self, info: ClosedProxyInfo) {
+        let mut list = self
+            .closed_proxies
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        list.retain(|p| p.name != info.name);
+        list.push(info);
+        if list.len() > MAX_CLOSED_PROXIES {
+            let overflow = list.len() - MAX_CLOSED_PROXIES;
+            list.drain(..overflow);
+        }
+    }
+
+    /// 已关闭代理历史快照（按关闭时间降序）
+    pub fn list_closed_proxies(&self) -> Vec<ClosedProxyInfo> {
+        let mut list = self
+            .closed_proxies
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        list.sort_by(|a, b| b.last_close_time.cmp(&a.last_close_time));
+        list
+    }
+
+    /// 清理已关闭代理历史，返回 (被清理条数, 剩余条数)
+    pub fn clear_closed_proxies(&self) -> (usize, usize) {
+        let mut list = self
+            .closed_proxies
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cleared = list.len();
+        list.clear();
+        (cleared, 0)
     }
 
     /// 代理注销时移除统计

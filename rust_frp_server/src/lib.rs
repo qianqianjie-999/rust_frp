@@ -116,6 +116,7 @@
 //! ]
 //! ```
 
+mod api;
 mod control;
 mod error;
 mod metrics;
@@ -128,6 +129,7 @@ mod visitor;
 mod web;
 mod work_conn;
 
+pub use api::*;
 pub use control::*;
 pub use error::*;
 pub use metrics::*;

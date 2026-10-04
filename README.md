@@ -648,12 +648,32 @@ server {
 
 ### API 接口
 
-提供以下 API：
-- `GET /health` — 健康检查
+管理端口提供对齐原版 frp 的 v1 / v2 两套 HTTP API（`Authorization: Basic <base64(user:password)>`）：
+
+**v1（扁平 JSON，兼容原版 Dashboard 与脚本）**
+
+- `GET /health`、`GET /healthz` — 健康检查
 - `GET /api/metrics` — 服务器指标（连接数、代理数等）
-- `GET /api/controllers` — 已连接客户端列表
-- `GET /api/proxies` — 已注册代理列表
+- `GET /api/serverinfo` — 服务器信息（版本、端口、代理类型计数、在线客户端数）
+- `GET /api/clients?user=&clientId=&runId=&status=` — 客户端列表（含在线/离线）
+- `GET /api/clients/{key}` — 客户端详情（`key = base64url(user|clientId|runId)`）
+- `GET /api/controllers` — 已连接客户端列表（简版，保留兼容）
+- `GET /api/proxies` — 全部代理（`status=online|offline` 可过滤）
+- `GET /api/proxy/{type}` — 按类型列出代理
+- `GET /api/proxy/{type}/{name}` — 按类型 + 名称查询
+- `GET /api/proxies/{name}` — 按名称查询
+- `GET /api/traffic/{name}` — 单代理 24 小时流量序列（`trafficIn`/`trafficOut`）
+- `DELETE /api/proxies?status=offline` — 清理离线代理历史
 - `POST /api/reload` — 触发配置热重载
+
+**v2（统一 `{code, msg, data}` 信封，分页 `page`/`pageSize`，默认 1/50、上限 200）**
+
+- `GET /api/v2/system/info` — 系统信息（`config` + `status` 两段）
+- `POST /api/v2/system/prune?type=offline_proxies|clients` — 清理离线代理 / 离线客户端
+- `GET /api/v2/users` — 按用户聚合（客户端数、代理数）
+- `GET /api/v2/clients?status=` / `GET /api/v2/clients/{key}` — 客户端列表 / 详情
+- `GET /api/v2/proxies?status=` / `GET /api/v2/proxies/{name}` — 代理列表 / 详情
+- `GET /api/v2/proxies/{name}/traffic` — 单代理流量序列
 
 ### 功能特性
 

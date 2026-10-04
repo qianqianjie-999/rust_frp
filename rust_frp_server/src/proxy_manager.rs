@@ -1163,6 +1163,10 @@ impl ServerProxyManager {
 
 #[async_trait::async_trait]
 impl ProxyManager for ServerProxyManager {
+    async fn get_proxy_config(&self, name: &str) -> Option<rust_frp_config::ProxyConfig> {
+        self.proxies.read().await.get(name).cloned()
+    }
+
     async fn add_proxy(
         &self,
         config: rust_frp_config::ProxyConfig,

@@ -149,6 +149,28 @@ impl Control {
                 "proxy_name": proxy_name,
             });
             self.plugin_manager.close_proxy(&close_content).await;
+            // 关闭前落一份离线历史（含流量快照），供 /api/proxies?status=offline 查询
+            if let Some(cfg) = self.proxy_manager.get_proxy_config(proxy_name).await {
+                let (traffic_in, traffic_out, last_start_time) =
+                    match global_metrics().get_proxy_stat(proxy_name) {
+                        Some(stat) => {
+                            let (i, o) = stat.totals();
+                            (i, o, stat.created_at)
+                        }
+                        None => (0, 0, rust_frp_util::get_timestamp()),
+                    };
+                global_metrics().record_proxy_closed(crate::metrics::ClosedProxyInfo {
+                    name: proxy_name.clone(),
+                    proxy_type: cfg.r#type.clone(),
+                    user: self.user.clone(),
+                    client_id: self.client_id.clone(),
+                    remote_port: cfg.remote_port,
+                    last_start_time,
+                    last_close_time: rust_frp_util::get_timestamp(),
+                    traffic_in,
+                    traffic_out,
+                });
+            }
             if let Err(e) = self.proxy_manager.remove_proxy(proxy_name).await {
                 log::error!("Failed to remove proxy {}: {:?}", proxy_name, e);
             } else {
@@ -212,6 +234,10 @@ impl Control {
                 match msg {
                     Message::Login(login_msg) => {
                         log::info!("Received login message from user: {}", login_msg.user);
+                        // 管理端 API 需要版本/主机名；下面的插件 json! 会移走这些字段，
+                        // 因此先取出副本
+                        let client_version = login_msg.version.clone();
+                        let client_hostname = login_msg.hostname.clone();
                         // 验证登录
                         let verify_result = self
                             .auth_manager
@@ -273,13 +299,22 @@ impl Control {
                             })
                             .unwrap_or_default();
 
-                        // 注册客户端信息到 ControlManager
+                        // 注册客户端信息到 ControlManager（含版本/主机名/IP/线协议，供管理端 API）
+                        let client_ip = self
+                            .conn
+                            .remote_addr()
+                            .map(|a| a.ip().to_string())
+                            .unwrap_or_default();
                         self.control_manager
-                            .add_client(
-                                self.client_id.clone(),
-                                self.run_id.clone(),
-                                self.user.clone(),
-                            )
+                            .add_client(ClientRegistration {
+                                run_id: self.run_id.clone(),
+                                client_id: self.client_id.clone(),
+                                user: self.user.clone(),
+                                version: client_version,
+                                hostname: client_hostname,
+                                client_ip,
+                                wire_protocol: "v1".to_string(),
+                            })
                             .await;
 
                         // frpc 断线重连会用新 run_id、同 client_id 再次登录。
@@ -827,26 +862,69 @@ impl Control {
     }
 }
 
-/// 控制器管理器
-/// 客户端连接信息
+/// 离线客户端历史最大保留条数（FIFO 淘汰）
+pub const MAX_OFFLINE_CLIENTS: usize = 200;
+
+/// 客户端连接信息（在线条目 + 历史离线条目共用同一结构）
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
     pub run_id: String,
     pub client_id: String,
     pub user: String,
+    /// 客户端版本（登录消息携带）
+    pub version: String,
+    /// 客户端主机名（登录消息携带）
+    pub hostname: String,
+    /// 客户端来源 IP（可为空，如多路复用/QUIC 路径拿不到对端地址时）
+    pub client_ip: String,
+    /// 线协议版本标识（v1 / v2）
+    pub wire_protocol: String,
     pub connected_at: Instant,
     pub last_heartbeat: Instant,
+    /// 最近一次上线时间（Unix 秒）
+    pub first_connected_at: i64,
+    /// 最近一次离线时间（Unix 秒；在线时为 None）
+    pub disconnected_at: Option<i64>,
+    /// 是否在线
+    pub online: bool,
+}
+
+impl ClientInfo {
+    /// 客户端唯一键：`base64(user|client_id|run_id)`（URL 安全、无填充）
+    ///
+    /// 与 `/api/clients/{key}` 的 key 语义对应；用 URL 安全字母表是为了让
+    /// key 可以直接放进路径而无需额外转义。
+    pub fn key(&self) -> String {
+        base64::encode_config(
+            format!("{}|{}|{}", self.user, self.client_id, self.run_id),
+            base64::URL_SAFE_NO_PAD,
+        )
+    }
+}
+
+/// 登录成功时的客户端注册信息（供 [`ControlManager::add_client`] 使用）
+pub struct ClientRegistration {
+    pub run_id: String,
+    pub client_id: String,
+    pub user: String,
+    pub version: String,
+    pub hostname: String,
+    pub client_ip: String,
+    pub wire_protocol: String,
 }
 
 /// 踢连接信号表：run_id -> (kick 通知, 清理完成回执接收端)
 type KickSignalMap =
     RwLock<std::collections::HashMap<String, (watch::Sender<()>, oneshot::Receiver<()>)>>;
 
+/// 控制器管理器：维护在线客户端、消息通道与被踢信号
 pub struct ControlManager {
     // 存储 run_id -> msg_tx 映射，用于向客户端发送消息
     msg_channels: RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>,
     // 存储客户端连接信息 (run_id -> ClientInfo)
     clients: RwLock<std::collections::HashMap<String, ClientInfo>>,
+    // 已断开客户端的历史信息（FIFO，供管理端 offline 查询）
+    offline_clients: RwLock<Vec<ClientInfo>>,
     // 踢连接信号：同一 client_id 重复登录时，用它通知旧 Control 退出并等待其释放 proxy
     kick_signals: KickSignalMap,
 }
@@ -863,6 +941,7 @@ impl ControlManager {
             msg_channels: RwLock::new(std::collections::HashMap::new()),
             clients: RwLock::new(std::collections::HashMap::new()),
             kick_signals: RwLock::new(std::collections::HashMap::new()),
+            offline_clients: RwLock::new(Vec::new()),
         }
     }
 
@@ -883,8 +962,21 @@ impl ControlManager {
         let mut msg_channels = self.msg_channels.write().await;
         msg_channels.remove(run_id);
 
-        let mut clients = self.clients.write().await;
-        clients.remove(run_id);
+        // 在线条目转存离线历史（保留 version/hostname/client_ip 供管理端查询）
+        {
+            let mut clients = self.clients.write().await;
+            if let Some(mut info) = clients.remove(run_id) {
+                info.online = false;
+                info.disconnected_at = Some(rust_frp_util::get_timestamp());
+                let mut offline = self.offline_clients.write().await;
+                offline.retain(|c| c.run_id != info.run_id);
+                offline.push(info);
+                if offline.len() > MAX_OFFLINE_CLIENTS {
+                    let overflow = offline.len() - MAX_OFFLINE_CLIENTS;
+                    offline.drain(..overflow);
+                }
+            }
+        }
 
         // 顺带清理踢连接信号
         self.kick_signals.write().await.remove(run_id);
@@ -953,19 +1045,27 @@ impl ControlManager {
     }
 
     /// 添加或更新客户端信息
-    pub async fn add_client(&self, client_id: String, run_id: String, user: String) {
+    pub async fn add_client(&self, reg: ClientRegistration) {
         let now = Instant::now();
+        let info = ClientInfo {
+            run_id: reg.run_id.clone(),
+            client_id: reg.client_id,
+            user: reg.user,
+            version: reg.version,
+            hostname: reg.hostname,
+            client_ip: reg.client_ip,
+            wire_protocol: reg.wire_protocol,
+            connected_at: now,
+            last_heartbeat: now,
+            first_connected_at: rust_frp_util::get_timestamp(),
+            disconnected_at: None,
+            online: true,
+        };
         let mut clients = self.clients.write().await;
-        clients.insert(
-            run_id.clone(),
-            ClientInfo {
-                run_id,
-                client_id,
-                user,
-                connected_at: now,
-                last_heartbeat: now,
-            },
-        );
+        // 同一 run_id 重新上线：从离线历史中移除，避免两个列表重复
+        let mut offline = self.offline_clients.write().await;
+        offline.retain(|c| c.run_id != info.run_id);
+        clients.insert(reg.run_id, info);
     }
 
     /// 更新客户端心跳时间
@@ -976,10 +1076,41 @@ impl ControlManager {
         }
     }
 
-    /// 获取所有客户端列表
+    /// 获取所有**在线**客户端列表
     pub async fn get_clients(&self) -> Vec<ClientInfo> {
         let clients = self.clients.read().await;
         clients.values().cloned().collect()
+    }
+
+    /// 获取在线 + 历史离线的全部客户端（供管理端 `/api/clients` 使用）
+    pub async fn get_all_clients(&self) -> Vec<ClientInfo> {
+        let mut all: Vec<ClientInfo> = self.clients.read().await.values().cloned().collect();
+        all.extend(self.offline_clients.read().await.iter().cloned());
+        all
+    }
+
+    /// 清理离线客户端历史，返回被清理条数
+    pub async fn clear_offline_clients(&self) -> usize {
+        let mut offline = self.offline_clients.write().await;
+        let cleared = offline.len();
+        offline.clear();
+        cleared
+    }
+
+    /// 按 key 查询客户端（在线优先，其次离线历史）
+    pub async fn get_client_by_key(&self, key: &str) -> Option<ClientInfo> {
+        {
+            let clients = self.clients.read().await;
+            if let Some(c) = clients.values().find(|c| c.key() == key) {
+                return Some(c.clone());
+            }
+        }
+        self.offline_clients
+            .read()
+            .await
+            .iter()
+            .find(|c| c.key() == key)
+            .cloned()
     }
 
     /// 按 run_id 查询用户名（供插件回调构造 UserInfo）
