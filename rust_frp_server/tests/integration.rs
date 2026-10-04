@@ -142,6 +142,7 @@ fn build_manager(
         Arc::new(ServerWorkConnManager::new(4)),
         allow_ports,
         max_ports_per_user,
+        None,
     )
 }
 

@@ -89,7 +89,7 @@ name = "tcp_app"
 type = "tcp"
 local_ip = "127.0.0.1"
 local_port = 8080
-remote_port = 9303
+remote_port = 9305
 
 # 健康检查是单个内联表（[[proxies]] 的子表），不要写成 [[proxies.health_check]]
 [proxies.health_check]
@@ -97,3 +97,44 @@ type = "tcp"
 interval_seconds = 10
 timeout_seconds = 3
 max_failed = 3
+
+# =============================================================================
+# tcpmux：HTTP CONNECT 复用（服务器需配置 tcpmux_http_connect_port，见 frps.example.toml）
+# 多个内网服务共享服务器同一个端口，访问端用 HTTP CONNECT 指定目标域名：
+#   curl -x http://<frps>:7777 http://mux.example.com/
+# =============================================================================
+[[proxies]]
+name = "tcpmux_ssh"
+type = "tcpmux"
+local_ip = "127.0.0.1"
+local_port = 22
+custom_domains = ["mux.example.com"]
+multiplexer = "httpconnect"       # 缺省即 httpconnect，目前仅支持该值
+# 可选：要求访问端提供 HTTP Basic 凭据（缺失或不符返回 407）
+# http_user = "alice"
+# http_password = "CHANGE_ME_CONNECT_PASSWORD"
+# 可选：同一域名下按 HTTP 用户区分多个 tcpmux 代理
+# route_by_http_user = "alice"
+
+# =============================================================================
+# sudp：安全 UDP（经 STCP 隧道承载 UDP 报文，不在服务端开放 UDP 端口）
+# 鉴权规则与 stcp 一致：secret_key 签名 + 120s 防重放，未配置则拒绝访问。
+# 访问端配置见文件末尾的 [[visitors]]。
+# =============================================================================
+[[proxies]]
+name = "sudp_dns"
+type = "sudp"
+local_ip = "127.0.0.1"
+local_port = 53
+secret_key = "CHANGE_ME_SHARED_SECRET"
+
+# =============================================================================
+# 访问者（visitors）：访问其他 frpc 暴露的 stcp / xtcp / sudp 服务
+# =============================================================================
+[[visitors]]
+name = "visit_dns"
+type = "sudp"
+server_name = "sudp_dns"          # 与对方客户端的 proxy name 一致
+secret_key = "CHANGE_ME_SHARED_SECRET"
+bind_addr = "127.0.0.1"
+bind_port = 5353                  # 本地 UDP 端口：dig @127.0.0.1 -p 5353 example.com

@@ -43,8 +43,8 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | QUIC 协议 | 🚧 | **未实现**（路线图项），配置字段 `quic_bind_port` 已预留但无效果 |
 | 应用层加密 | ✅ | `use_encryption`：工作连接 AES-256-GCM 加密（**仅加密不认证**，密钥派生自 token；无 token 时 fail-closed） |
 | 应用层压缩 | ✅ | `use_compression`：工作连接 snappy 压缩（**需两端配置一致**；与 `use_encryption` 可叠加，顺序为先压缩后加密） |
-| tcpmux 代理 | 🚧 | **未实现**，`tcpmux_http_connect_port` 字段已预留但无效果 |
-| sudp 代理 | ❌ | **未实现**（安全 UDP） |
+| tcpmux 代理 | ✅ | HTTP CONNECT 复用：服务器在 `tcpmux_http_connect_port` 单端口按域名（+ 可选 `route_by_http_user` / `http_user` / `http_password`）路由，多个 tcpmux 代理共享同一端口 |
+| sudp 代理 | ✅ | 安全 UDP：经 STCP 隧道承载 UDP 报文（`secret_key` 签名校验与 STCP 一致），代理端/访问端各自监听本地 UDP |
 | OIDC 认证 | ✅ | 支持 HS256 JWT 验证 |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
@@ -732,6 +732,88 @@ bind_port = 13389              # 本地监听端口
 ```
 
 > **说明**：XTCP 访问者连接 `bind_port` 后，会先尝试与代理端进行 NAT 穿透打洞（2 秒超时），成功则使用 P2P 直连；失败则自动回退为 STCP 服务端中转模式。
+
+### tcpmux（HTTP CONNECT 复用）
+
+多个内网 TCP 服务通过**同一个服务器端口**暴露：客户端用 HTTP `CONNECT` 指定
+目标域名，服务器按域名（以及可选的 HTTP 用户）路由到对应的 tcpmux 代理。
+
+**服务器端**（必须显式配置复用端口，否则 tcpmux 代理注册会被拒绝）：
+
+```toml
+tcpmux_http_connect_port = 7777
+```
+
+**代理端**（持有内网服务的一方，不绑定 remote_port）：
+
+```toml
+[[proxies]]
+name = "mux-ssh"
+type = "tcpmux"
+local_ip = "127.0.0.1"
+local_port = 22
+custom_domains = ["ssh.example.com"]
+multiplexer = "httpconnect"      # 缺省即 httpconnect，目前仅支持该值
+# 可选：要求访问者提供 HTTP Basic 凭据
+# http_user = "alice"
+# http_password = "s3cret"
+# 可选：同一域名下按 HTTP 用户区分代理
+# route_by_http_user = "alice"
+```
+
+**访问方式**：
+
+```bash
+# curl 走 HTTP CONNECT 隧道
+curl -x http://服务器:7777 http://ssh.example.com/
+# 或显式携带凭据（代理端配置了 http_user/http_password 时必需）
+curl -x http://alice:s3cret@服务器:7777 http://ssh.example.com/
+
+# SSH 经 CONNECT 隧道
+ssh -o ProxyCommand='nc -X connect -x 服务器:7777 ssh.example.com 22' user@ssh.example.com
+```
+
+> **匹配语义**：域名先精确匹配、再按后缀匹配；`route_by_http_user` 设置后仅该
+> HTTP 用户可命中该代理（用于同域多代理）；未配置任何凭据的代理对所有访问者开放。
+> 应答码：`400` 请求格式错误 / `404` 域名无匹配 / `407` 凭据不符 / `502` 后端不可用。
+
+### sudp（安全 UDP）
+
+在 STCP 隧道之上承载 UDP：服务端仍只做工作连接配对桥接（不解析 UDP），
+UDP 报文由两端 frpc 用 `UdpPacketMsg` 帧传输。适合暴露 DNS、游戏、QUIC 等 UDP 服务
+而不在服务端开放 UDP 端口。
+
+> **鉴权与加密**：访问签名规则与 STCP 完全相同（`secret_key` + 120s 防重放，
+> 未配 `secret_key` 时 fail-closed 拒绝）；如需加密可两端同时启用 `use_encryption`。
+
+**代理端配置**：
+
+```toml
+[[proxies]]
+name = "udp-dns"
+type = "sudp"
+local_ip = "127.0.0.1"
+local_port = 53
+secret_key = "shared_secret_key"
+```
+
+**访问端配置**：
+
+```toml
+[[visitors]]
+name = "visit-dns"
+type = "sudp"
+server_name = "udp-dns"       # 与代理端的 proxy name 一致
+secret_key = "shared_secret_key"
+bind_addr = "127.0.0.1"
+bind_port = 5353              # 本地 UDP 监听端口
+```
+
+访问方式：向 `127.0.0.1:5353` 发 UDP 报文（如 `dig @127.0.0.1 -p 5353 example.com`）。
+
+> **会话模型**：访问端每个本地 UDP 源地址占用一条独立隧道，代理端按访问者地址
+> 建立独立的本地 UDP 会话（保证回包准确）；代理端每 30s 发送心跳，访问端
+> 连续 60s 无消息即回收该会话。
 
 ---
 

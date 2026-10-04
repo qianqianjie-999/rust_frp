@@ -166,6 +166,13 @@ mod fields {
         "groupKey",
         "use_encryption",
         "useEncryption",
+        "use_compression",
+        "useCompression",
+        "multiplexer",
+        "route_by_http_user",
+        "routeByHTTPUser",
+        "allow_users",
+        "allowUsers",
     ];
 
     pub const VISITOR: &[&str] = &[
@@ -182,6 +189,8 @@ mod fields {
         "transport",
         "use_encryption",
         "useEncryption",
+        "use_compression",
+        "useCompression",
     ];
 
     pub const HEALTH_CHECK: &[&str] = &[
@@ -374,6 +383,47 @@ mod tests {
             }]
         });
         assert!(collect_unknown_fields(ConfigKind::Client, &root).is_empty());
+    }
+
+    #[test]
+    fn test_tcpmux_sudp_and_compression_keys_are_known() {
+        // tcpmux/sudp 专属字段 + 代理/访客顶层的 useCompression 不应产生未知字段告警
+        let root = json!({
+            "proxies": [
+                {
+                    "name": "mux",
+                    "type": "tcpmux",
+                    "multiplexer": "httpconnect",
+                    "routeByHTTPUser": "alice",
+                    "httpUser": "alice",
+                    "httpPassword": "pw",
+                    "customDomains": ["a.com"],
+                    "useCompression": true,
+                    "useEncryption": false
+                },
+                {
+                    "name": "udp-p2p",
+                    "type": "sudp",
+                    "localIP": "127.0.0.1",
+                    "localPort": 53,
+                    "secretKey": "s3cret",
+                    "allowUsers": ["alice"]
+                }
+            ],
+            "visitors": [
+                {
+                    "name": "visit-udp",
+                    "type": "sudp",
+                    "serverName": "udp-p2p",
+                    "secretKey": "s3cret",
+                    "bindAddr": "127.0.0.1",
+                    "bindPort": 5353,
+                    "useCompression": true
+                }
+            ]
+        });
+        let unknown = collect_unknown_fields(ConfigKind::Client, &root);
+        assert!(unknown.is_empty(), "unexpected unknown fields: {unknown:?}");
     }
 
     #[test]

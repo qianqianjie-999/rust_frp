@@ -12,7 +12,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~217 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 功能点覆盖率 | **约 82%**（44 项能力点中 36 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计、优雅关闭已于 2026-10-04 落地） | 100%（基线） | — |
+| 功能点覆盖率 | **约 86%**（44 项能力点中 38 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计、优雅关闭、tcpmux、sudp 已于 2026-10-04 落地） | 100%（基线） | — |
 | 配置字段兼容 | ✅ 双向兼容（alias） | camelCase | 原版配置可直接复用（2026-10-04 起） |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify/reload/status | reload/status/stop/verify/… | reload/status/verify 已补齐 |
@@ -27,14 +27,14 @@
 
 | 分类 | 覆盖 | 覆盖率 | 主要缺口 |
 |------|:----:|:------:|----------|
-| 代理类型 | 7/9 | 78% | tcpmux、sudp |
+| 代理类型 | 9/9 | 100% | — |
 | 传输与协议 | 7/8 | 88% | QUIC、wss |
 | 插件体系 | 6/8 | 75% | http2http、http2https、virtual_net、服务端插件 |
 | 配置兼容 | 4/5 | 80% | 严格未知字段校验（现为 WARN 告警模式，见 P0-2） |
 | 认证与安全 | 4/7 | 57% | 完整 OIDC、tokenSource、SSH 隧道 |
 | 管理 API | 4/4 | 100% | — |
 | CLI 运维 | 3/3 | 100% | — |
-| **合计** | **36/44** | **82%** | — |
+| **合计** | **38/44** | **86%** | — |
 
 > 计分口径：一项能力「等价或更强」记 1 分；缺失 / 仅占位 / 显著弱化记 0 分。
 
@@ -64,12 +64,12 @@
 | https | ✅ | ✅ | 等价 |
 | stcp | ✅ | ✅ | rust 有 `secret_key` HMAC 签名 + 跨客户端；原版另有 `AllowUsers` |
 | xtcp | ✅ | ✅ | rust 为 STUN + KCP 真打洞，失败回退 STCP；原版默认 QUIC 打洞，模式更全 |
-| **tcpmux** | ❌ | ✅ | rust 仅有 `tcpmux_http_connect_port` 占位字段，未实现 |
-| **sudp** | ❌ | ✅ | rust 完全没有 |
+| **tcpmux** | ✅ | ✅ | 2026-10-04 落地：frps 在 `tcpmux_http_connect_port` 上解析 HTTP CONNECT，按域名（+ 可选 `http_user`/`http_password`/`route_by_http_user`）路由；同域多代理按 HTTP 用户分流已支持 |
+| **sudp** | ✅ | ✅ | 2026-10-04 落地：与 stcp 同构的隧道（frps 不解析 UDP），两端 frpc 用 `UdpPacketMsg` 帧承载 UDP；访问端按源地址建独立隧道会话，代理端按访问者地址建独立本地 UDP 会话 |
 | **websocket** | ✅（作为代理类型，rust 特有） | ❌（仅作传输协议） | rust 把 websocket 也当代理 type，原版无此代理类型 |
-| visitor: stcp/xtcp | ✅ | ✅ | rust 支持 stcp/xtcp visitor；原版另有 **sudp visitor** |
+| visitor: stcp/xtcp/sudp | ✅ | ✅ | rust 支持 stcp/xtcp/sudp visitor |
 
-**净差**：rust **缺 2 种代理（tcpmux / sudp）**，多 1 种自定义用法（websocket 作为代理类型）。
+> **净差**：代理类型已 **9/9 全覆盖**；rust 另多 1 种自定义用法（websocket 作为代理类型）。
 
 ---
 
@@ -200,8 +200,8 @@
 | 5 | QUIC 传输 | 仅配置占位 |
 | 6 | ~~`use_compression` 压缩~~ | ✅ 已实现（2026-10-04）：snappy 压缩流，顺序为先压缩后加密 |
 | 7 | OIDC 完整流程 | 仅本地 HS256 验签，不连 issuer |
-| 8 | tcpmux 代理 | 仅端口占位 |
-| 9 | sudp 代理 | 完全缺失 |
+| 8 | ~~tcpmux 代理~~ | ✅ 已实现（2026-10-04）：HTTP CONNECT 复用 + 域名/HTTP 用户路由 |
+| 9 | ~~sudp 代理~~ | ✅ 已实现（2026-10-04）：UDP over STCP 隧道（代理/访客两端） |
 | 10 | 服务端插件机制 | 无（含 HTTP 回调插件） |
 | 11 | ~~优雅关闭~~ | ✅ 已实现（2026-10-04）：SIGINT/SIGTERM 停止 accept + 排空存量连接（10s 上限），客户端另有 graceful_shutdown |
 | 12 | ~~流量统计 / 客户端详情 API~~ | ✅ 已实现（2026-10-04）：桥接结束累加双向字节，服务端 `/api/proxies` + Prometheus、客户端 `frpc status` 暴露 |
@@ -221,7 +221,8 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 3. **代理 CRUD API**（P0-4）：为 frpc 加 `GET/PUT /api/config` + Store CRUD。
 4. **use_compression**（P1-6）：字段已就绪，接入 snappy/zstd 成本低，可与 `use_encryption` 对称实现。
 5. ~~**优雅关闭**（P1-11）~~：✅ 已落地（2026-10-04），SIGINT/SIGTERM → 停止 accept → 排空（10s 上限）。
-6. **OIDC / QUIC / tcpmux / sudp**（P1）：按业务是否需要企业 SSO、弱网、端口复用再排期。
+6. ~~**tcpmux / sudp**（P1-8/9）~~ ✅ 已落地（2026-10-04）：代理类型 9/9 全覆盖，tcpmux 支持域名 + HTTP 用户路由，sudp 为 UDP over STCP 隧道。
+7. **OIDC / QUIC**（P1）：按业务是否需要企业 SSO、弱网再排期；**服务端插件机制**（六类 HTTP 回调钩子）是扩展性上的主要短板。
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关——这些是原版的「生态扩展」，除非有明确场景，否则投入产出比低。
 

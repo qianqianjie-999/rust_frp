@@ -19,12 +19,19 @@ bind_port = 9300
 vhost_http_port = 9090
 vhost_https_port = 9091
 
+# tcpmux：HTTP CONNECT 复用端口（多个 tcpmux 代理共享此端口）
+# 未配置时，服务端会拒绝注册 tcpmux 代理（fail-closed）
+tcpmux_http_connect_port = 7777
+
 # KCP 协议监听端口
 # kcp_bind_port = 7001
 
 # --- 端口白名单（为空即拒绝所有 TCP 代理端口，显式允许更安全） ---
 allow_ports = [
     { single = 9302 },
+    { single = 9303 },
+    { single = 9304 },
+    { single = 9305 },
     { start = 10000, end = 20000 },
 ]
 

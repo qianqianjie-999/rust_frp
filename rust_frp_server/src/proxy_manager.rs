@@ -215,6 +215,10 @@ pub struct ServerProxyManager {
     accept_handles: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     /// TCP 负载均衡分组注册表（group 代理共享监听端口，round-robin 分发）
     group_registry: Arc<GroupRegistry>,
+    /// tcpmux 路由表（域名 + 可选 HTTP 用户 → tcpmux 代理）
+    tcpmux_router: Arc<TcpMuxRouter>,
+    /// tcpmux 复用端口（None = 未启用，注册 tcpmux 代理时告警）
+    tcpmux_port: Option<u16>,
 }
 
 /// 检查端口是否在允许列表中
@@ -241,6 +245,14 @@ pub(crate) fn port_allowed(port: u16, ranges: &[rust_frp_config::PortRange]) -> 
     false
 }
 
+/// 汇总 tcpmux 代理的域名（custom_domains 优先，附加 subdomain）
+fn build_tcpmux_domains(config: &rust_frp_config::ProxyConfig) -> Vec<String> {
+    let mut domains = config.custom_domains.clone().unwrap_or_default();
+    domains.extend(config.subdomain.clone());
+    domains.retain(|d| !d.is_empty());
+    domains
+}
+
 impl ServerProxyManager {
     pub fn new(
         http_vhost_router: Arc<HttpVhostRouter>,
@@ -249,6 +261,7 @@ impl ServerProxyManager {
         work_conn_manager: Arc<ServerWorkConnManager>,
         allow_ports: Vec<rust_frp_config::PortRange>,
         max_ports_per_user: Option<usize>,
+        tcpmux_port: Option<u16>,
     ) -> Self {
         if allow_ports.is_empty() {
             log::warn!(
@@ -270,6 +283,8 @@ impl ServerProxyManager {
             proxy_user_ports: RwLock::new(std::collections::HashMap::new()),
             accept_handles: RwLock::new(std::collections::HashMap::new()),
             group_registry: Arc::new(GroupRegistry::new()),
+            tcpmux_router: Arc::new(TcpMuxRouter::new()),
+            tcpmux_port,
         }
     }
 
@@ -283,10 +298,69 @@ impl ServerProxyManager {
             "https" => self.register_vhost_proxy(config, "HTTPS").await?,
             "udp" => self.start_udp_proxy(config).await?,
             "websocket" => self.start_websocket_proxy(config).await?,
+            "tcpmux" => self.register_tcpmux_proxy(config).await?,
+            "sudp" => {
+                // sudp 与 stcp 同构：不绑定端口，仅作为访问者监听器等待
+                // frpc visitor 经 STCP 通道请求建桥（UDP 报文由两端 frpc 自行封装）
+                if config.secret_key.as_deref().unwrap_or("").is_empty() {
+                    log::warn!(
+                        "sudp proxy {} has no secret_key configured; visitor access will be rejected",
+                        config.name
+                    );
+                }
+            }
             _ => {
                 log::warn!("unsupported proxy type: {}", config.r#type);
             }
         }
+        Ok(())
+    }
+
+    /// tcpmux 代理：注册域名路由，实际监听由服务端的 tcpmux 复用器统一承担
+    async fn register_tcpmux_proxy(
+        &self,
+        config: &rust_frp_config::ProxyConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // multiplexer 目前仅支持 httpconnect（缺省即 httpconnect）
+        if let Some(multiplexer) = config.multiplexer.as_deref() {
+            if !multiplexer.is_empty() && multiplexer != "httpconnect" {
+                return Err(format!(
+                    "proxy [{}] rejected: unknown multiplexer [{}] (only \"httpconnect\" is supported)",
+                    config.name, multiplexer
+                )
+                .into());
+            }
+        }
+
+        if self.tcpmux_port.is_none() {
+            return Err(format!(
+                "proxy [{}] rejected: tcpmux requires server-side tcpmux_http_connect_port",
+                config.name
+            )
+            .into());
+        }
+
+        let domains = build_tcpmux_domains(config);
+        if domains.is_empty() {
+            return Err(format!(
+                "proxy [{}] rejected: tcpmux requires custom_domains or subdomain",
+                config.name
+            )
+            .into());
+        }
+
+        let route = TcpMuxRoute {
+            proxy_name: config.name.clone(),
+            http_user: config.http_user.clone(),
+            http_password: config.http_password.clone(),
+            route_by_http_user: config.route_by_http_user.clone(),
+        };
+        log::info!(
+            "tcpmux proxy {} registered for domains {:?}",
+            config.name,
+            domains
+        );
+        self.tcpmux_router.register(domains, route).await;
         Ok(())
     }
 
@@ -779,6 +853,9 @@ impl ServerProxyManager {
         // 从 HTTP 虚拟主机路由器中注销
         self.http_vhost_router.unregister_proxy(name).await;
 
+        // 从 tcpmux 路由表中注销（非 tcpmux 代理为空操作）
+        self.tcpmux_router.unregister(name).await;
+
         // 负载均衡分组：成员退出组
         // - 组内仍有成员：保留共享监听器（故障摘除，流量由剩余成员承接）
         // - 组已空：关闭共享监听器（键为组端口，非代理名）
@@ -966,6 +1043,11 @@ impl ServerProxyManager {
 
     pub fn get_http_vhost_router(&self) -> Arc<HttpVhostRouter> {
         self.http_vhost_router.clone()
+    }
+
+    /// tcpmux 路由表（供服务端复用器共享）
+    pub fn get_tcpmux_router(&self) -> Arc<TcpMuxRouter> {
+        self.tcpmux_router.clone()
     }
 }
 
