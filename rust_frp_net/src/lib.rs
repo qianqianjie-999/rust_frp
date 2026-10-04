@@ -745,6 +745,7 @@ impl ConnManager {
 pub mod pool;
 
 /// 应用层加密（use_encryption）：AES-256-GCM 工作连接加密流
+pub mod compress;
 pub mod crypto;
 
 // 重新导出连接池类型

@@ -23,6 +23,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **优雅关闭**：客户端支持 SIGINT/SIGTERM 信号优雅退出
 - **OIDC 认证**：支持 OpenID Connect 认证，集成企业身份系统
 - **配置热重载**：支持 SIGHUP 信号、文件监听、API 触发三种方式重载配置
+- **应用层压缩**：per-proxy `use_compression`，工作连接 snappy 压缩（对齐原版语义）
 - **健康检查**：支持 TCP 和 HTTP 健康检查，自动检测后端服务状态
 - **带宽限制**：支持代理级和全局级带宽限制，基于令牌桶算法
 
@@ -41,7 +42,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | KCP 协议 | ✅ | 完整实现 |
 | QUIC 协议 | 🚧 | **未实现**（路线图项），配置字段 `quic_bind_port` 已预留但无效果 |
 | 应用层加密 | ✅ | `use_encryption`：工作连接 AES-256-GCM 加密（**仅加密不认证**，密钥派生自 token；无 token 时 fail-closed） |
-| 应用层压缩 | 🚧 | **未实现**（路线图项），`use_compression` 字段存在但恒为 false |
+| 应用层压缩 | ✅ | `use_compression`：工作连接 snappy 压缩（**需两端配置一致**；与 `use_encryption` 可叠加，顺序为先压缩后加密） |
 | tcpmux 代理 | 🚧 | **未实现**，`tcpmux_http_connect_port` 字段已预留但无效果 |
 | sudp 代理 | ❌ | **未实现**（安全 UDP） |
 | OIDC 认证 | ✅ | 支持 HS256 JWT 验证 |

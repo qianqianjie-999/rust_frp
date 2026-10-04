@@ -1079,6 +1079,7 @@ async fn establish_work_connection(
 
     // 应用层加密（fail-closed）：启用 use_encryption 必须已配置 token 以派生密钥
     let use_encryption = proxy_config.use_encryption;
+    let use_compression = proxy_config.use_compression;
     if use_encryption && config.auth.token.is_none() {
         return Err(format!(
             "proxy [{}] enables use_encryption but client has no token configured",
@@ -1135,7 +1136,7 @@ async fn establish_work_connection(
         timestamp: get_timestamp(),
         sign_key,
         use_encryption,
-        use_compression: false,
+        use_compression,
     };
     rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
 
@@ -1154,7 +1155,14 @@ async fn establish_work_connection(
         }
     };
 
-    // 应用层加密：握手完成后包装工作连接为 AES-256-GCM 加密流
+    // 应用层压缩与加密：握手完成后按固定顺序包装 —— 先压缩（内层）、后加密（外层）
+    if use_compression {
+        work_conn = Box::new(rust_frp_net::compress::CompressedStream::new(work_conn));
+        log::info!(
+            "Work conn application-layer compression (snappy) enabled for proxy: {}",
+            proxy_name
+        );
+    }
     if use_encryption {
         let token = config.auth.token.as_deref().expect("token checked above");
         let key = derive_encryption_key(token);
@@ -1530,6 +1538,12 @@ async fn handle_stcp_visitor_conn(
         .find(|v| v.server_name == proxy_name)
         .map(|v| v.use_encryption)
         .unwrap_or(false);
+    let use_compression = config
+        .visitors
+        .iter()
+        .find(|v| v.server_name == proxy_name)
+        .map(|v| v.use_compression)
+        .unwrap_or(false);
     if use_encryption && config.auth.token.is_none() {
         return Err(format!(
             "visitor for [{}] enables use_encryption but client has no token configured",
@@ -1610,7 +1624,7 @@ async fn handle_stcp_visitor_conn(
         timestamp: get_timestamp(),
         sign_key: work_sign_key,
         use_encryption,
-        use_compression: false,
+        use_compression,
     };
     rust_frp_core::write_message(&mut work_conn, &Message::NewWorkConn(new_work_conn_msg)).await?;
 
@@ -1627,7 +1641,14 @@ async fn handle_stcp_visitor_conn(
         }
     }
 
-    // 应用层加密：握手完成后包装为 AES-256-GCM 加密流（需与对端代理配置一致）
+    // 应用层压缩与加密：固定顺序「先压缩、后加密」，需与对端代理配置一致
+    if use_compression {
+        work_conn = Box::new(rust_frp_net::compress::CompressedStream::new(work_conn));
+        log::info!(
+            "STCP visitor work conn application-layer compression (snappy) enabled for {}",
+            proxy_name
+        );
+    }
     if use_encryption {
         let token = config.auth.token.as_deref().expect("token checked above");
         let key = derive_encryption_key(token);

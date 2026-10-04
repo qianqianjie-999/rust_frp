@@ -71,6 +71,18 @@ local_port = 5432
 remote_port = 9303
 use_encryption = true
 
+# 应用层压缩示例：压缩与加密可叠加（顺序固定为「先压缩、后加密」）。
+# 也可用原版写法放在 [[proxies.transport]] 子表里，两种写法等价：
+#   [proxies.transport]
+#   useCompression = true
+[[proxies]]
+name = "tcp_compressed"
+type = "tcp"
+local_ip = "127.0.0.1"
+local_port = 5432
+remote_port = 9304
+use_compression = true
+
 # 带健康检查的 TCP 代理
 [[proxies]]
 name = "tcp_app"
