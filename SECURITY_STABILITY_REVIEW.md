@@ -237,5 +237,9 @@ cargo test --workspace      → 186 passed / 0 failed（+2）
 
 ### 10.3 当前剩余（仅季度级重构项）
 
-- `Server` 改 `Arc<Server>`、拆 5000 行巨石文件
-- STCP/XTCP `secret_key` 协议级实现（README 已如实标注 ⚠️）
+- ~~`Server` 改 `Arc<Server>`、拆 5000 行巨石文件~~ → **已完成**（2026-10-03，rust_frp_server 拆为 10 个子模块）
+- ~~STCP/XTCP `secret_key` 协议级实现~~ → **已完成**（2026-10-03，HMAC-SHA256 签名 + 常量时间比较 + 120s 防重放 + 跨客户端支持）
+
+> **收尾说明（2026-10-04）**：本文档为 2026-10-03 的专项复审快照，上述剩余项均已关闭，
+> 后续安全状态以 `CODE_QUALITY_REVIEW.md`（第五/六轮）为准——当前 100/100，
+> 生产 unwrap 0、clippy 0/0、215 测试全绿。
