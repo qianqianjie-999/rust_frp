@@ -1132,6 +1132,34 @@ impl ClientControl {
 }
 
 /// 生成工作连接签名密钥（与服务端 AuthManager::generate_work_conn_sign_key 一致）
+/// 解析登录所用的认证令牌
+///
+/// - `auth.method = "token"`：返回配置中的静态 token（缺省为空串）
+/// - `auth.method = "oidc"`：向 IdP 的令牌端点以 `client_credentials` 换取
+///   `access_token`；每次登录/重连都重新获取，避免复用已过期的令牌
+async fn resolve_auth_token(
+    config: &ClientConfig,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if config.auth.method != "oidc" {
+        return Ok(config.auth.token.clone().unwrap_or_default());
+    }
+    let oidc = config.auth.oidc.as_ref().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "auth.oidc is required when auth.method = \"oidc\"",
+        )
+    })?;
+    let token = rust_frp_auth::OidcClientCredentials::new(oidc)
+        .fetch_access_token()
+        .await
+        .map_err(|e| format!("failed to obtain OIDC access token: {e}"))?;
+    log::info!(
+        "Obtained OIDC access token for login (expires_in={}s)",
+        token.expires_in
+    );
+    Ok(token.access_token)
+}
+
 fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
     use ring::{digest, hmac};
     // encryption_key = SHA-256(token)
@@ -3031,7 +3059,8 @@ impl Client {
             version: "0.1.0".to_string(),
             timestamp: get_timestamp(),
             run_id: run_id.clone(),
-            token: self.config.auth.token.clone().unwrap_or_default(),
+            // token 认证 → 静态令牌；oidc 认证 → 向 IdP 现取 access_token
+            token: resolve_auth_token(&self.config).await?,
             metas: std::collections::HashMap::new(),
             client_spec: None,
         };

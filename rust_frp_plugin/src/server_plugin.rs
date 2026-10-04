@@ -44,7 +44,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 插件回调协议版本
 pub const API_VERSION: &str = "0.1.0";
@@ -140,8 +139,22 @@ impl HttpPlugin {
         let sep = if self.url.contains('?') { '&' } else { '?' };
         let url = format!("{}{}version={}&op={}", self.url, sep, API_VERSION, op);
 
-        let raw = post_json(&url, &body, req_id, self.tls_verify).await?;
-        serde_json::from_str::<PluginResponse>(&raw)
+        let opts = rust_frp_net::http::HttpOptions {
+            tls_verify: self.tls_verify,
+            ca_file: None,
+            timeout: CALLBACK_TIMEOUT,
+        };
+        let resp =
+            rust_frp_net::http::post_json(&url, &body, &[("X-Frp-Reqid", req_id)], &opts).await?;
+        if !resp.is_success() {
+            return Err(format!(
+                "plugin [{}] returned HTTP {}: {}",
+                self.name,
+                resp.status,
+                resp.body.trim()
+            ));
+        }
+        serde_json::from_str::<PluginResponse>(&resp.body)
             .map_err(|e| format!("invalid plugin response JSON: {e}"))
     }
 }
@@ -318,239 +331,10 @@ fn new_req_id() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 解析后的插件 URL
-struct ParsedUrl {
-    use_tls: bool,
-    host: String,
-    port: u16,
-    path_and_query: String,
-}
-
-/// 解析 `http(s)://host[:port][/path]`（未带 scheme 时按 http 处理）
-fn parse_url(raw: &str) -> Result<ParsedUrl, String> {
-    let (use_tls, rest) = if let Some(r) = raw.strip_prefix("https://") {
-        (true, r)
-    } else if let Some(r) = raw.strip_prefix("http://") {
-        (false, r)
-    } else {
-        (false, raw)
-    };
-    let (authority, path) = match rest.find(['/', '?']) {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
-    if authority.is_empty() {
-        return Err(format!("invalid plugin url (empty authority): {raw}"));
-    }
-    let (host, port) = split_host_port(authority, use_tls)?;
-    // path 为空 → "/"；path 直接以 '?' 开头（无路径只有 query）→ "/?xxx"
-    let path_and_query = if path.is_empty() {
-        "/".to_string()
-    } else if path.starts_with('?') {
-        format!("/{path}")
-    } else {
-        path.to_string()
-    };
-    Ok(ParsedUrl {
-        use_tls,
-        host,
-        port,
-        path_and_query,
-    })
-}
-
-/// 拆分 authority 的 host 与 port，支持 `[::1]:8080` 形式的 IPv6 字面量
-fn split_host_port(authority: &str, use_tls: bool) -> Result<(String, u16), String> {
-    let default_port = if use_tls { 443 } else { 80 };
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest
-            .find(']')
-            .ok_or_else(|| format!("invalid IPv6 authority: {authority}"))?;
-        let host = rest[..end].to_string();
-        let after = &rest[end + 1..];
-        let port = match after.strip_prefix(':') {
-            Some(p) => p
-                .parse()
-                .map_err(|_| format!("invalid port in authority: {authority}"))?,
-            None => default_port,
-        };
-        return Ok((host, port));
-    }
-    match authority.rsplit_once(':') {
-        Some((h, p)) => {
-            let port = p
-                .parse()
-                .map_err(|_| format!("invalid port in authority: {authority}"))?;
-            Ok((h.to_string(), port))
-        }
-        None => Ok((authority.to_string(), default_port)),
-    }
-}
-
-/// 建立到插件的连接（按需 TLS）；HTTPS 且未开启校验时使用不校验证书的配置
-async fn connect_to(
-    host: &str,
-    port: u16,
-    use_tls: bool,
-    tls_verify: bool,
-) -> Result<Box<dyn rust_frp_net::FrpConn>, String> {
-    let tcp = tokio::net::TcpStream::connect((host, port))
-        .await
-        .map_err(|e| format!("connect {host}:{port} failed: {e}"))?;
-    if !use_tls {
-        return Ok(Box::new(tcp));
-    }
-    let tls = if tls_verify {
-        rust_frp_net::TlsConfig::new_client()
-    } else {
-        rust_frp_net::TlsConfig::new_client_insecure()
-    }
-    .map_err(|e| format!("failed to build plugin TLS config: {e}"))?;
-    let stream = tls
-        .connect(host, tcp)
-        .await
-        .map_err(|e| format!("plugin TLS handshake failed: {e}"))?;
-    Ok(Box::new(stream))
-}
-
-/// 发起一次 JSON POST 回调，返回响应体字符串
-async fn post_json(
-    url: &str,
-    body: &[u8],
-    req_id: &str,
-    tls_verify: bool,
-) -> Result<String, String> {
-    let parsed = parse_url(url)?;
-    let host_header =
-        if (parsed.use_tls && parsed.port == 443) || (!parsed.use_tls && parsed.port == 80) {
-            parsed.host.clone()
-        } else {
-            format!("{}:{}", parsed.host, parsed.port)
-        };
-
-    let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
-         X-Frp-Reqid: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        parsed.path_and_query,
-        host_header,
-        req_id,
-        body.len()
-    );
-
-    let fut = async {
-        let mut stream = connect_to(&parsed.host, parsed.port, parsed.use_tls, tls_verify).await?;
-        stream
-            .write_all(head.as_bytes())
-            .await
-            .map_err(|e| format!("write plugin request head failed: {e}"))?;
-        stream
-            .write_all(body)
-            .await
-            .map_err(|e| format!("write plugin request body failed: {e}"))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| format!("flush plugin request failed: {e}"))?;
-        let mut raw = Vec::new();
-        stream
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|e| format!("read plugin response failed: {e}"))?;
-        Ok::<Vec<u8>, String>(raw)
-    };
-
-    let raw = match tokio::time::timeout(CALLBACK_TIMEOUT, fut).await {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(format!(
-                "plugin callback timed out after {CALLBACK_TIMEOUT:?}"
-            ))
-        }
-    };
-    parse_http_response(&raw)
-}
-
-/// 解析 HTTP/1.1 响应，返回响应体（要求 200）
-fn parse_http_response(raw: &[u8]) -> Result<String, String> {
-    let header_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("invalid plugin response: header terminator not found")?;
-    let head = String::from_utf8_lossy(&raw[..header_end]);
-
-    let status_line = head
-        .lines()
-        .next()
-        .ok_or("invalid plugin response: empty status line")?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| format!("invalid plugin status line: {status_line}"))?;
-    if status != 200 {
-        return Err(format!("plugin returned non-200 status: {status}"));
-    }
-
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-    for line in head.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim();
-        if name == "content-length" {
-            content_length = value.parse().ok();
-        } else if name == "transfer-encoding" && value.eq_ignore_ascii_case("chunked") {
-            chunked = true;
-        }
-    }
-
-    let body_bytes = &raw[header_end + 4..];
-    let mut body_vec;
-    let body: &[u8] = if chunked {
-        body_vec = Vec::new();
-        decode_chunked_into(body_bytes, &mut body_vec);
-        &body_vec
-    } else if let Some(len) = content_length {
-        &body_bytes[..len.min(body_bytes.len())]
-    } else {
-        body_bytes
-    };
-
-    Ok(String::from_utf8_lossy(body).into_owned())
-}
-
-/// chunked 解码（写入调用方缓冲，避免借用问题）
-fn decode_chunked_into(raw: &[u8], out: &mut Vec<u8>) {
-    let mut pos = 0;
-    while pos < raw.len() {
-        let Some(line_end) = raw[pos..]
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .map(|p| pos + p)
-        else {
-            break;
-        };
-        let size_str = String::from_utf8_lossy(&raw[pos..line_end]);
-        let size = match usize::from_str_radix(size_str.trim().split(';').next().unwrap_or(""), 16)
-        {
-            Ok(s) => s,
-            Err(_) => break,
-        };
-        if size == 0 {
-            break;
-        }
-        let data_start = line_end + 2;
-        let data_end = (data_start + size).min(raw.len());
-        out.extend_from_slice(&raw[data_start..data_end]);
-        pos = data_end + 2;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn cfg(name: &str, addr: &str, path: &str, ops: &[&str]) -> rust_frp_config::HttpPluginConfig {
         rust_frp_config::HttpPluginConfig {
@@ -583,54 +367,6 @@ mod tests {
             req
         });
         (port, handle)
-    }
-
-    #[test]
-    fn test_parse_url_variants() {
-        let u = parse_url("http://127.0.0.1:9000/handler").unwrap();
-        assert!(!u.use_tls);
-        assert_eq!(u.host, "127.0.0.1");
-        assert_eq!(u.port, 9000);
-        assert_eq!(u.path_and_query, "/handler");
-
-        // 无 scheme + 无端口 → http 默认 80
-        let u = parse_url("example.com/plugin").unwrap();
-        assert!(!u.use_tls);
-        assert_eq!(u.host, "example.com");
-        assert_eq!(u.port, 80);
-        assert_eq!(u.path_and_query, "/plugin");
-
-        // https 默认 443
-        let u = parse_url("https://hooks.example.com").unwrap();
-        assert!(u.use_tls);
-        assert_eq!(u.port, 443);
-        assert_eq!(u.path_and_query, "/");
-
-        // IPv6 字面量
-        let u = parse_url("http://[::1]:8080/x").unwrap();
-        assert_eq!(u.host, "::1");
-        assert_eq!(u.port, 8080);
-        assert_eq!(u.path_and_query, "/x");
-
-        assert!(parse_url("http://").is_err());
-    }
-
-    #[test]
-    fn test_parse_http_response_variants() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"msg\":\"ok\"}";
-        assert_eq!(parse_http_response(raw).unwrap(), "{\"msg\":\"ok\"}");
-
-        let mut chunked = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
-        chunked.push_str("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
-        assert_eq!(
-            parse_http_response(chunked.as_bytes()).unwrap(),
-            "hello world"
-        );
-
-        let raw = b"HTTP/1.1 500 Server Error\r\nContent-Length: 0\r\n\r\n";
-        assert!(parse_http_response(raw).is_err());
-
-        assert!(parse_http_response(b"HTTP/1.1 200 OK\r\nno terminator").is_err());
     }
 
     #[tokio::test]

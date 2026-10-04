@@ -54,6 +54,8 @@ mod fields {
         "custom404Page",
         "includes",
         "proxies",
+        "http_plugins",
+        "httpPlugins",
     ];
 
     pub const CLIENT_ROOT: &[&str] = &[
@@ -95,6 +97,17 @@ mod fields {
         "clientSecret",
         "token_endpoint_url",
         "tokenEndpointURL",
+        "scope",
+        "additional_endpoint_params",
+        "additionalEndpointParams",
+        "trusted_ca_file",
+        "trustedCaFile",
+        "insecure_skip_verify",
+        "insecureSkipVerify",
+        "skip_expiry_check",
+        "skipExpiryCheck",
+        "skip_issuer_check",
+        "skipIssuerCheck",
     ];
 
     pub const TRANSPORT: &[&str] = &[
@@ -370,6 +383,38 @@ mod tests {
             unknown.contains(&"proxies[0].metadatas".to_string()),
             "got {unknown:?}"
         );
+    }
+
+    /// 回归：`http_plugins`/`httpPlugins` 必须属于服务端已知键，
+    /// 否则上一轮新增的服务端插件配置会被整体误报为未知字段（含其子键）。
+    #[test]
+    fn test_http_plugins_and_oidc_keys_are_known() {
+        let root = json!({
+            "bindPort": 7000,
+            "httpPlugins": [
+                { "name": "p", "addr": "http://127.0.0.1:9000", "path": "/cb",
+                  "ops": ["Login"], "tlsVerify": true }
+            ],
+            "http_plugins": [],
+            "auth": {
+                "method": "oidc",
+                "oidc": {
+                    "issuer": "https://idp",
+                    "audience": "frp",
+                    "clientID": "c",
+                    "clientSecret": "s",
+                    "tokenEndpointURL": "https://idp/token",
+                    "scope": "openid",
+                    "additionalEndpointParams": { "resource": "r" },
+                    "trustedCaFile": "/etc/ca.pem",
+                    "insecureSkipVerify": false,
+                    "skipExpiryCheck": false,
+                    "skipIssuerCheck": false
+                }
+            }
+        });
+        let unknown = collect_unknown_fields(ConfigKind::Server, &root);
+        assert!(unknown.is_empty(), "unexpected unknown fields: {unknown:?}");
     }
 
     #[test]

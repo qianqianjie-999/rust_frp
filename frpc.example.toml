@@ -17,6 +17,20 @@ server_port = 9300
 method = "token"
 token = "CHANGE_ME_RANDOM_LONG_TOKEN"
 
+# --- 认证方式二：OIDC（客户端以 client_credentials 向 IdP 换取 access_token）---
+# 登录时把 access_token 作为凭据发给 frps，由 frps 用 issuer 的 JWKS 验签。
+# [auth]
+# method = "oidc"
+# [auth.oidc]
+# clientID = "your-client-id"
+# clientSecret = "CHANGE_ME_OIDC_CLIENT_SECRET"
+# tokenEndpointURL = "https://your-oidc-provider.com/token"
+# audience = "frp-server"        # 可选：作为端点参数一并发送
+# scope = "openid profile"       # 可选
+# # additionalEndpointParams 里的键会作为额外表单参数发送：
+# [auth.oidc.additionalEndpointParams]
+# resource = "https://api.example.com"
+
 # --- 管理端口（frpc reload / frpc status 子命令依赖此项，默认禁用） ---
 # [webServer]
 # addr = "127.0.0.1"   # 建议仅监听本地

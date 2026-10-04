@@ -85,12 +85,17 @@ pool_count = 10
 method = "token"
 token = "CHANGE_ME_RANDOM_LONG_TOKEN"
 
-# 方式二：OIDC
+# 方式二：OIDC（服务端只做「验签」：拉取 issuer 的 discovery + JWKS 校验客户端令牌）
 # [auth]
 # method = "oidc"
 # [auth.oidc]
-# issuer = "https://your-oidc-provider.com"
-# audience = "frp-server"
-# client_id = "your-client-id"
-# client_secret = "CHANGE_ME_OIDC_CLIENT_SECRET"
-# token_endpoint_url = "https://your-oidc-provider.com/token"
+# issuer = "https://your-oidc-provider.com"   # 必填：发现文档与 JWKS 的入口
+# audience = "frp-server"                      # 为空时跳过 aud 校验
+# skipExpiryCheck = false                      # true 则跳过 exp 校验
+# skipIssuerCheck = false                      # true 则跳过 iss 校验
+# # 若 IdP 使用私有 CA / 自签证书：
+# trustedCaFile = "/etc/ssl/idp-ca.pem"
+# # 仅调试用：跳过证书校验（会失去中间人防护）
+# insecureSkipVerify = false
+# # 请求令牌时申请的授权范围（客户端角色使用，服务端忽略）
+# scope = "openid profile"
