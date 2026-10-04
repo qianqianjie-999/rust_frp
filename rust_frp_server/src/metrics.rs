@@ -106,6 +106,11 @@ impl MonitorMetrics {
         self.current_connections.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// 当前活跃连接数（优雅关闭的排空判定依据）
+    pub fn current_connections(&self) -> usize {
+        self.current_connections.load(Ordering::SeqCst)
+    }
+
     pub fn decrement_connections(&self) {
         self.current_connections.fetch_sub(1, Ordering::SeqCst);
     }

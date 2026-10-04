@@ -20,7 +20,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **端口白名单**：服务器默认拒绝未明确允许的端口，必须配置才能正常使用
 - **环境变量**：配置文件支持 `${VAR_NAME}` 环境变量替换
 - **多格式配置**：支持 TOML、YAML、JSON 配置格式；**兼容原版 frp 的 camelCase 字段名**（`serverAddr`/`localIP`/`bindPort` 等可直接使用），原版配置文件可直接复用；无法识别的字段（如原版 `log.to`）加载时打印 WARN 但不拒绝启动
-- **优雅关闭**：客户端支持 SIGINT/SIGTERM 信号优雅退出
+- **优雅关闭**：客户端 SIGINT/SIGTERM 优雅退出；服务端 SIGINT/SIGTERM 停止接收新连接并按 10s 上限排空存量连接（不再硬 `exit(0)`）
 - **OIDC 认证**：支持 OpenID Connect 认证，集成企业身份系统
 - **配置热重载**：支持 SIGHUP 信号、文件监听、API 触发三种方式重载配置
 - **应用层压缩**：per-proxy `use_compression`，工作连接 snappy 压缩（对齐原版语义）

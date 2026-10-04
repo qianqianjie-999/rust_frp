@@ -99,18 +99,35 @@ async fn main() {
         }
     });
 
-    // 启动 Ctrl+C 信号处理
-    if let Ok(mut sigint) =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-    {
+    // 优雅关闭：SIGINT/SIGTERM → 停止接收新连接（不再硬 exit(0)），
+    // 随后由 main 等待存量连接排空（超时上限见 DRAIN_TIMEOUT）
+    let shutdown = server.shutdown_handle();
+    if let (Ok(mut sigint), Ok(mut sigterm)) = (
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
+    ) {
         tokio::spawn(async move {
-            sigint.recv().await;
-            info!("Received SIGINT, shutting down...");
-            std::process::exit(0);
+            tokio::select! {
+                _ = sigint.recv() => info!("Received SIGINT"),
+                _ = sigterm.recv() => info!("Received SIGTERM"),
+            }
+            info!("Shutting down gracefully: no longer accepting new connections, draining...");
+            shutdown.notify_one();
         });
+    } else {
+        warn!("Signal handlers not available on this platform");
     }
 
+    // start() 在收到关闭信号、accept 循环退出后返回
     if let Err(e) = server.start().await {
         error!("Failed to start server: {:?}", e);
+    }
+
+    // 排空存量连接（最多等 DRAIN_TIMEOUT）
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    if server.wait_for_drain(DRAIN_TIMEOUT).await {
+        info!("All connections drained, shutdown complete");
+    } else {
+        warn!("Drain timeout reached, forcing shutdown");
     }
 }
