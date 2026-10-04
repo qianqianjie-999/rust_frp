@@ -29,7 +29,8 @@ use futures_util::{Sink, Stream};
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{
     TcpListener as TokioTcpListener, TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket,
 };
@@ -45,7 +46,7 @@ use tokio_rustls::rustls::Error as TlsError;
 use tokio_rustls::rustls::SignatureScheme;
 use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 
 pub mod mux;
 pub use mux::{MuxSession, TCP_MUX_MAGIC};
@@ -110,6 +111,12 @@ pub trait Session: Send + Sync {
     async fn open_stream(&self) -> Result<AnyConn, NetError>;
 }
 
+/// frp 传输层 WebSocket 握手路径（与原版 frp 的 `FrpWebsocketPath` 一致）
+///
+/// `websocket` / `wss` 传输的客户端在完成 TCP（及可选 TLS）握手后，向
+/// `GET <FRP_WS_PATH>` 发起 WebSocket 升级；服务端据此路径前缀识别并升级。
+pub const FRP_WS_PATH: &str = "/~!frp";
+
 /// 实现 TokioTcpStream 的 FrpConn trait
 impl FrpConn for TokioTcpStream {
     fn remote_addr(&self) -> Option<SocketAddr> {
@@ -132,10 +139,22 @@ impl FrpConn for client::TlsStream<TokioTcpStream> {
 }
 
 /// WebSocket 连接
+///
+/// 把 WebSocket 的**帧**语义适配成**字节流**语义（`AsyncRead`/`AsyncWrite`），
+/// 使上层 frp 协议栈（4 字节长度前缀 + JSON）无需感知分帧。
+///
+/// # 写入语义
+///
+/// `Sink`（tokio-tungstenite）在 `start_send` 之后必须 `poll_flush` 才会真正
+/// 落到 TCP 上；而 frp 上层只调用 `write_all`（不 flush）。因此这里在
+/// `poll_write` 内主动驱动 flush，并用 `write_pending` 记录「帧已提交但还没
+/// flush 完」的长度，避免调用方重试时重复发送。
 pub struct WebSocketConn<S> {
     stream: WebSocketStream<S>,
     remote_addr: SocketAddr,
     read_buf: Vec<u8>,
+    /// 已 `start_send` 但尚未 flush 完成的帧长度（用于 poll_write 重入）
+    write_pending: Option<usize>,
 }
 
 impl<S> WebSocketConn<S>
@@ -153,6 +172,7 @@ where
             stream,
             remote_addr,
             read_buf: Vec::new(),
+            write_pending: None,
         }
     }
 }
@@ -213,11 +233,37 @@ where
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        // 上一帧已提交但尚未 flush 完：只推进 flush，成功后按原长度报进度
+        if let Some(pending_len) = self.write_pending {
+            match std::pin::Pin::new(&mut self.stream).poll_flush(cx) {
+                std::task::Poll::Ready(Ok(())) => {
+                    self.write_pending = None;
+                    return std::task::Poll::Ready(Ok(pending_len));
+                }
+                std::task::Poll::Ready(Err(e)) => {
+                    self.write_pending = None;
+                    return std::task::Poll::Ready(Err(std::io::Error::other(e)));
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+
         let msg = WsMessage::Binary(buf.to_vec());
+        let len = buf.len();
         match std::pin::Pin::new(&mut self.stream).poll_ready(cx) {
             std::task::Poll::Ready(Ok(())) => {
                 match std::pin::Pin::new(&mut self.stream).start_send(msg) {
-                    Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
+                    Ok(_) => match std::pin::Pin::new(&mut self.stream).poll_flush(cx) {
+                        std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(len)),
+                        std::task::Poll::Ready(Err(e)) => {
+                            std::task::Poll::Ready(Err(std::io::Error::other(e)))
+                        }
+                        std::task::Poll::Pending => {
+                            // 帧已入队但未 flush 完：下次 poll_write 继续 flush
+                            self.write_pending = Some(len);
+                            std::task::Poll::Pending
+                        }
+                    },
                     Err(e) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
                 }
             }
@@ -231,7 +277,10 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         match std::pin::Pin::new(&mut self.stream).poll_flush(cx) {
-            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(Ok(())) => {
+                self.write_pending = None;
+                std::task::Poll::Ready(Ok(()))
+            }
             std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
@@ -255,6 +304,157 @@ where
 {
     fn remote_addr(&self) -> Option<SocketAddr> {
         Some(self.remote_addr)
+    }
+}
+
+/// 在既有流（TCP 或 TLS）之上完成 WebSocket 客户端握手
+///
+/// 与 [`ConnManager::connect_websocket`] 的区别：不负责建连与 TLS，仅在调用方
+/// 已建立的流上做 HTTP Upgrade，便于「TLS 之后再叠加 WebSocket」（`wss`）。
+pub async fn client_websocket_stream<S>(
+    stream: S,
+    url: &str,
+    remote_addr: SocketAddr,
+) -> Result<WebSocketConn<S>, NetError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (ws, _resp) = tokio_tungstenite::client_async(url, stream)
+        .await
+        .map_err(|e| NetError::Other(format!("websocket handshake failed: {e}")))?;
+    Ok(WebSocketConn::new(ws, remote_addr))
+}
+
+/// 在既有流上完成 WebSocket 服务端握手（接受 Upgrade）
+pub async fn accept_websocket_stream<S>(
+    stream: S,
+    remote_addr: SocketAddr,
+) -> Result<WebSocketConn<S>, NetError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let ws = tokio_tungstenite::accept_async(stream)
+        .await
+        .map_err(|e| NetError::Other(format!("websocket accept failed: {e}")))?;
+    Ok(WebSocketConn::new(ws, remote_addr))
+}
+
+/// 从流中预读至多 `n` 字节（EOF / 超时前提前返回已读到的部分）
+///
+/// 用于「先看前几个字节再决定如何解析」的嗅探场景（如 TLS 之后判断是否
+/// WebSocket 升级）。读到的字节需由调用方通过 [`PrefixedStream`] 回放。
+pub async fn read_prefix<S>(
+    stream: &mut S,
+    n: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, NetError>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; n];
+    let mut filled = 0usize;
+    let fut = async {
+        while filled < n {
+            match stream.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(k) => filled += k,
+                Err(e) => return Err(NetError::Io(e)),
+            }
+        }
+        Ok::<(), NetError>(())
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => {
+            r?;
+            buf.truncate(filled);
+            Ok(buf)
+        }
+        // 超时不算致命：按已读到的字节返回（可能为空）
+        Err(_) => {
+            buf.truncate(filled);
+            Ok(buf)
+        }
+    }
+}
+
+/// 前缀回放流：先吐出预先读出的字节，再委托给底层流
+///
+/// 用于「嗅探前 N 字节做协议判定，但后续仍需完整字节流」的场景。
+pub struct PrefixedStream<S> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    /// 用预读字节与底层流构造
+    pub fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
+    }
+
+    /// 取回底层流（丢弃未消费的前缀）
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S> AsyncRead for PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let remaining = &self.prefix[self.pos..];
+            let len = std::cmp::min(remaining.len(), buf.remaining());
+            buf.put_slice(&remaining[..len]);
+            self.pos += len;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> FrpConn for PrefixedStream<S>
+where
+    S: FrpConn,
+{
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        self.inner.remote_addr()
     }
 }
 
@@ -689,24 +889,6 @@ impl ConnManager {
         }
     }
 
-    /// 建立 WebSocket 连接
-    ///
-    /// # 参数
-    ///
-    /// * `url` - WebSocket 服务地址
-    pub async fn connect_websocket(
-        &self,
-        url: &str,
-    ) -> Result<WebSocketConn<tokio_tungstenite::MaybeTlsStream<TokioTcpStream>>, std::io::Error>
-    {
-        let (stream, _) = connect_async(url).await.map_err(std::io::Error::other)?;
-        // WebSocket 不暴露对端地址，用常量占位（仅用于日志展示）
-        let remote_addr = "127.0.0.1:0"
-            .parse()
-            .expect("constant socket addr is always valid");
-        Ok(WebSocketConn::new(stream, remote_addr))
-    }
-
     /// 建立 KCP 连接
     ///
     /// # 参数
@@ -719,20 +901,6 @@ impl ConnManager {
         socket.connect(addr).await.map_err(NetError::Io)?;
         let socket = std::sync::Arc::new(socket);
         KcpConn::new(socket, *addr, None).await
-    }
-
-    /// 接受 WebSocket 连接
-    ///
-    /// # 参数
-    ///
-    /// * `stream` - 底层 TCP 流
-    pub async fn accept_websocket(
-        &self,
-        stream: TokioTcpStream,
-    ) -> Result<WebSocketConn<TokioTcpStream>, std::io::Error> {
-        let remote_addr = stream.peer_addr()?;
-        let stream = accept_async(stream).await.map_err(std::io::Error::other)?;
-        Ok(WebSocketConn::new(stream, remote_addr))
     }
 
     /// 将连接放回连接池
@@ -1025,3 +1193,117 @@ impl KcpListener {
     }
 }
 pub use pool::{ConnPool, PoolConfig, PoolManager, PoolStats, PooledConn};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 前缀回放：先吐前缀字节，再委托底层流
+    #[tokio::test]
+    async fn prefixed_stream_replays_prefix_then_inner() {
+        let (mut a, b) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            a.write_all(b"world").await.expect("write inner");
+        });
+        let mut stream = PrefixedStream::new(b"hello ".to_vec(), b);
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.expect("read all");
+        assert_eq!(out, b"hello world");
+    }
+
+    /// 前缀回放：前缀跨多次 poll_read 仍完整（buf 小于前缀）
+    #[tokio::test]
+    async fn prefixed_stream_replays_across_short_reads() {
+        let (mut a, b) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            a.write_all(b"XY").await.expect("write inner");
+            drop(a);
+        });
+        let mut stream = PrefixedStream::new(b"ABCDE".to_vec(), b);
+        let mut small = [0u8; 2];
+        let mut got = Vec::new();
+        loop {
+            let n = stream.read(&mut small).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&small[..n]);
+        }
+        assert_eq!(got, b"ABCDEXY");
+    }
+
+    /// 预读前缀：正常读满 n 字节
+    #[tokio::test]
+    async fn read_prefix_reads_requested_bytes() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        a.write_all(b"GET /~!frp").await.expect("write");
+        let prefix = read_prefix(&mut b, 4, Duration::from_secs(1))
+            .await
+            .expect("read prefix");
+        assert_eq!(prefix, b"GET ");
+    }
+
+    /// 预读前缀：对端不发数据时按超时返回已读到的部分（不报错）
+    #[tokio::test]
+    async fn read_prefix_times_out_gracefully() {
+        let (_a, mut b) = tokio::io::duplex(64);
+        let prefix = read_prefix(&mut b, 4, Duration::from_millis(50))
+            .await
+            .expect("should not error");
+        assert!(prefix.is_empty());
+    }
+
+    /// 前缀嗅探：部分字节（"G"）也应被判为 WebSocket 前缀
+    #[test]
+    fn websocket_prefix_sniffing() {
+        let is_ws = |b: &[u8]| !b.is_empty() && (b.starts_with(b"GET ") || b"GET ".starts_with(b));
+        assert!(is_ws(b"GET "));
+        assert!(is_ws(b"GET /~!frp HTTP/1.1"));
+        assert!(is_ws(b"G"));
+        assert!(is_ws(b"GET"));
+        assert!(!is_ws(b""));
+        assert!(!is_ws(b"POST"));
+        assert!(!is_ws(&[TCP_MUX_MAGIC]));
+        assert!(!is_ws(&[0x16, 0x03, 0x01, 0x00]));
+    }
+
+    /// WebSocket 适配层：`write_all`（不显式 flush）后对端必须能收到完整字节流。
+    ///
+    /// 这是回归守卫：Sink 在 `start_send` 后需 `poll_flush` 才真正发包，
+    /// 而 frp 上层只调用 `write_all`，因此适配层必须自行驱动 flush。
+    #[tokio::test]
+    async fn websocket_conn_write_all_flushes_without_explicit_flush() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.expect("accept");
+            let mut ws = accept_websocket_stream(stream, peer)
+                .await
+                .expect("server handshake");
+            let mut buf = vec![0u8; 13];
+            ws.read_exact(&mut buf).await.expect("read payload");
+            ws
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut ws = client_websocket_stream(
+            tcp,
+            &format!("ws://127.0.0.1:{}{FRP_WS_PATH}", addr.port()),
+            addr,
+        )
+        .await
+        .expect("client handshake");
+
+        // 只 write_all，不 flush：内容应完整到达对端
+        ws.write_all(b"hello frp ws!").await.expect("write_all");
+
+        let _server_ws = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server task within timeout")
+            .expect("server task join");
+    }
+}

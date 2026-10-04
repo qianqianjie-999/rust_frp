@@ -12,6 +12,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **UDP 代理**：支持 UDP 数据包双向转发，适用于游戏、DNS 等场景
 - **KCP 协议**：基于 UDP 的低延迟可靠传输协议，适合弱网和跨国场景
 - **QUIC 协议**：基于 quinn 的 QUIC (TLS 1.3) 传输，单 UDP 连接多路复用承载控制连接与全部工作连接，适合弱网/移动网络
+- **WebSocket / WSS 传输**：`protocol = "websocket"`（明文）或 `"wss"`（TLS 叠加 WebSocket，路径 `/~!frp`），在只放行 HTTP 的网关/反代后仍可建立隧道
 - **TLS 加密**：使用 rustls 实现，未配置证书时服务端在运行时生成自签名证书（内存中、不落盘不入库），也支持自定义证书；控制连接和数据连接均默认启用加密；客户端支持跳过证书验证模式，方便使用自签名证书
 - **HMAC 签名验证**：工作连接使用 HMAC-SHA256 签名，防止连接伪造
 - **PROXY Protocol**：可选启用，透传真实访问者 IP 给本地 nginx/haproxy，方便日志记录和访问控制
@@ -44,6 +45,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | XTCP (P2P TCP) | ✅ | NAT 穿透打洞 + STCP 回退可用，鉴权规则与 STCP 一致 |
 | KCP 协议 | ✅ | 完整实现 |
 | QUIC 协议 | ✅ | 基于 quinn 完整实现；TLS 1.3 强制（无明文模式），单 UDP 端口承载控制+工作连接，客户端 fail-closed 校验 |
+| WebSocket / WSS 传输 | ✅ | `protocol = "websocket"` 明文 / `"wss"` TLS+WS；服务端在控制口按 `GET ` 前缀自动嗅探升级（TLS 场景在握手后嗅探），客户端 wss 为强制 TLS 且 fail-closed |
 | 应用层加密 | ✅ | `use_encryption`：工作连接 AES-256-GCM 加密（**仅加密不认证**，密钥派生自 token；无 token 时 fail-closed） |
 | 应用层压缩 | ✅ | `use_compression`：工作连接 snappy 压缩（**需两端配置一致**；与 `use_encryption` 可叠加，顺序为先压缩后加密） |
 | tcpmux 代理 | ✅ | HTTP CONNECT 复用：服务器在 `tcpmux_http_connect_port` 单端口按域名（+ 可选 `route_by_http_user` / `http_user` / `http_password`）路由，多个 tcpmux 代理共享同一端口 |
@@ -62,7 +64,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
 > **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 57%。尚未支持的主要项：
-> `wss` 传输、wire protocol v2、客户端插件 `http2http` / `http2https` / `virtual_net`
+> wire protocol v2、客户端插件 `http2http` / `http2https` / `virtual_net`
 > （另：`http_proxy` 仅支持 `CONNECT` 隧道，普通 HTTP 转发未实现）、服务端 tracer、
 > `auth.additionalScopes`、SSH 隧道网关、frps 的 `serverinfo` / `clients` / `v2` API 套件、
 > `frpc stop` / `nathole` / 每类代理子命令、Store 配置源等。
@@ -513,6 +515,11 @@ tls = { enable = true, skip_verify = true }  # 自签名环境：显式跳过证
 # filePath = "/run/secrets/frp_token"
 # # type = "exec"
 # # exec = ["/usr/local/bin/get-frp-token", "--env", "prod"]
+
+# WebSocket / WSS 传输：将上面 protocol 改为 "websocket"（明文）或 "wss"（TLS + WS）。
+# 服务端无需额外配置——它在控制端口按 `GET /~!frp` 前缀自动识别并升级。
+# 说明："websocket" 仍受 [transport.tls] 控制是否叠加 TLS；"wss" 则强制 TLS，
+# 且与 quic 一样必须提供信任来源（trusted_ca_file 或 skip_verify = true）。
 
 # QUIC 传输：将上面 protocol 改为 "quic"。QUIC 强制 TLS 1.3，
 # 必须提供信任来源（trusted_ca_file 或 skip_verify = true），否则拒绝启动。
@@ -981,8 +988,8 @@ pub struct UdpPacketMsg {
 
 **涉及文件**：
 - `rust_frp_server/Cargo.toml` — 添加 `tokio-tungstenite` 依赖
-- `rust_frp_net/src/lib.rs` — `WebSocketConn` 实现 `StreamLike` trait
-- `rust_frp_server/src/lib.rs` — WebSocket proxy 处理
+- `rust_frp_net/src/lib.rs` — `WebSocketConn` 实现 `FrpConn` + `AsyncRead`/`AsyncWrite`（帧↔字节流适配，自行驱动 flush）
+- `rust_frp_server/src/server.rs` — WebSocket 代理处理 + 控制口 WebSocket/WSS 升级嗅探
 
 **数据流**：
 

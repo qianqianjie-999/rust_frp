@@ -32,6 +32,18 @@ pub(crate) fn conn_limiter() -> &'static std::sync::Arc<tokio::sync::Semaphore> 
     SEM.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CONNECTIONS)))
 }
 
+/// 嗅探字节是否构成 WebSocket 升级请求前缀（`GET `）
+///
+/// 兼容「只读到部分字节」的情况（"G" / "GE" / "GET"），因此用双向前缀判断。
+fn is_websocket_prefix(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && (bytes.starts_with(b"GET ") || b"GET ".starts_with(bytes))
+}
+
+/// 无法取得对端地址时的占位（仅用于日志展示）
+fn placeholder_addr() -> SocketAddr {
+    SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0))
+}
+
 /// 尝试获取连接许可；达到上限时返回 None（调用方应立即关闭连接，不接受排队）
 pub(crate) fn try_acquire_conn_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
     std::sync::Arc::clone(conn_limiter())
@@ -1418,12 +1430,13 @@ impl Server {
             work_conn_manager,
             plugin_manager,
         } = managers;
-        // 首字节嗅探：TCP_MUX_MAGIC = tcp_mux 客户端（多路复用路径）
+        // 首字节嗅探：TCP_MUX_MAGIC = tcp_mux 客户端（多路复用路径）；
+        // "GET " = WebSocket 升级控制连接（明文 websocket 传输）。
         // 安全：入口嗅探与 TLS 握手都必须受握手超时约束（P0-1），
         // 未认证连接不允许永久占用任务。
-        let mut first = [0u8; 1];
-        let sniff = tokio::time::timeout(LOGIN_READ_TIMEOUT, conn.peek(&mut first)).await;
-        match sniff {
+        let mut first = [0u8; 4];
+        let sniffed = tokio::time::timeout(LOGIN_READ_TIMEOUT, conn.peek(&mut first)).await;
+        let sniffed_len = match sniffed {
             // 对端一直不发首字节：直接断开，不让未认证连接占用任务
             Err(_) => {
                 log::debug!(
@@ -1436,7 +1449,32 @@ impl Server {
                 log::debug!("Control conn sniff failed: {}", e);
                 return Err(format!("control conn sniff failed: {}", e).into());
             }
-            Ok(Ok(_)) => {}
+            Ok(Ok(n)) => n,
+        };
+        // 明文 WebSocket 控制连接：先完成 Upgrade，再按控制连接处理
+        if sniffed_len > 0 && is_websocket_prefix(&first[..sniffed_len]) {
+            let peer = conn.peer_addr().ok();
+            log::info!("websocket control connection detected from {:?}", peer);
+            let ws_conn =
+                rust_frp_net::accept_websocket_stream(conn, peer.unwrap_or_else(placeholder_addr))
+                    .await?;
+            Self::spawn_control(
+                ControlConn::new(Box::new(ws_conn)),
+                ServerManagers {
+                    control_manager,
+                    proxy_manager,
+                    visitor_manager,
+                    auth_manager,
+                    proxy_owners,
+                    xtcp_visitors,
+                    stcp_bridge_manager,
+                    work_conn_manager,
+                    plugin_manager,
+                },
+                tls_config.is_some(),
+                None,
+            );
+            return Ok(());
         }
         if first[0] == TCP_MUX_MAGIC {
             // 消费 magic 字节（peek 不消费；不读掉会污染后续 TLS 握手）
@@ -1463,6 +1501,7 @@ impl Server {
 
         // 工作连接 TLS 协商标志：与控制连接共用同一 TLS 配置
         let work_conn_tls = tls_config.is_some();
+        let peer = conn.peer_addr().ok().unwrap_or_else(placeholder_addr);
         let conn = if let Some(tls_config) = tls_config {
             // 处理 TLS 连接
             let tls_stream =
@@ -1479,7 +1518,25 @@ impl Server {
                         return Err("TLS handshake timeout".into());
                     }
                 };
-            ControlConn::new(Box::new(tls_stream))
+            // TLS 之上仍可能是 wss 的 WebSocket 升级：预读前 4 字节判定，
+            // 非升级请求则原样回放给普通控制连接解析。
+            let mut tls_stream = tls_stream;
+            let prefix = rust_frp_net::read_prefix(&mut tls_stream, 4, LOGIN_READ_TIMEOUT)
+                .await
+                .unwrap_or_default();
+            if is_websocket_prefix(&prefix) {
+                log::info!("wss control connection detected from {:?}", peer);
+                let ws_conn = rust_frp_net::accept_websocket_stream(
+                    rust_frp_net::PrefixedStream::new(prefix, tls_stream),
+                    peer,
+                )
+                .await?;
+                ControlConn::new(Box::new(ws_conn))
+            } else {
+                ControlConn::new(Box::new(rust_frp_net::PrefixedStream::new(
+                    prefix, tls_stream,
+                )))
+            }
         } else {
             // 处理普通 TCP 连接
             ControlConn::new(Box::new(conn))

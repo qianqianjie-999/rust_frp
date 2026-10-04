@@ -595,7 +595,13 @@ pub struct QuicConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct TransportConfig {
-    /// 传输协议: "tcp", "kcp", "quic", "websocket"
+    /// 传输协议: "tcp", "kcp", "quic", "websocket", "wss"
+    ///
+    /// # 说明
+    ///
+    /// - `websocket`：明文 WebSocket（可在其上叠加 TLS，由 `transport.tls.enable` 控制）
+    /// - `wss`：**强制** TLS + WebSocket（等价于原版 frp 的 `protocol = "wss"`），
+    ///   要求 `transport.tls` 中配置 `trusted_ca_file` 或 `skip_verify = true`
     pub protocol: String,
 
     /// TLS 配置
@@ -1823,7 +1829,7 @@ impl ConfigLoader {
         }
 
         // 传输协议：非法值直接报错，避免拼写错误静默回退到 TCP
-        const VALID_PROTOCOLS: &[&str] = &["tcp", "kcp", "quic", "websocket"];
+        const VALID_PROTOCOLS: &[&str] = &["tcp", "kcp", "quic", "websocket", "wss"];
         if !VALID_PROTOCOLS.contains(&config.transport.protocol.as_str()) {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1834,8 +1840,9 @@ impl ConfigLoader {
             )));
         }
 
-        // QUIC 强制 TLS 1.3、无明文模式：与 TLS 一致地 fail-closed 要求显式信任来源
-        if config.transport.protocol == "quic" {
+        // QUIC / WSS 强制 TLS：QUIC 无明文模式；WSS 语义即为「TLS + WebSocket」。
+        // 与 TLS 一致地 fail-closed 要求显式信任来源（pin CA 或显式 skip_verify）。
+        if matches!(config.transport.protocol.as_str(), "quic" | "wss") {
             let tls = config.transport.tls.as_ref();
             let has_ca = tls
                 .and_then(|t| t.trusted_ca_file.as_deref())
@@ -1844,9 +1851,13 @@ impl ConfigLoader {
             if !has_ca && !insecure {
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "transport.protocol = \"quic\" always uses TLS 1.3 and has no plaintext \
-                     mode: set transport.tls.trusted_ca_file to pin the server CA, or \
-                     transport.tls.skip_verify = true to accept encryption without authentication",
+                    format!(
+                        "transport.protocol = \"{}\" always uses TLS and has no plaintext \
+                         mode: set transport.tls.trusted_ca_file to pin the server CA, or \
+                         transport.tls.skip_verify = true to accept encryption without \
+                         authentication",
+                        config.transport.protocol
+                    ),
                 )));
             }
         }
@@ -2582,6 +2593,33 @@ skipIssuerCheck = false
         assert_eq!(q.max_idle_timeout, Some(15));
         assert_eq!(q.max_incoming_streams, Some(4096));
         assert_eq!(q.keepalive_period, Some(5));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// wss：强制 TLS（无明文模式）→ 必须显式声明信任来源（CA 或 skip_verify）
+    #[test]
+    fn test_wss_requires_explicit_trust_source() {
+        let content =
+            "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n[transport]\nprotocol = \"wss\"\n";
+        let path = write_temp_config("frpc_wss_no_trust", content);
+        let err = ConfigLoader::load_client_config(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("trusted_ca_file") && text.contains("skip_verify"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// wss：合法的 `wss` 协议名必须被接受（对齐原版 frp 的 protocol 取值）
+    #[test]
+    fn test_wss_protocol_accepted_with_trust_source() {
+        let content = "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n\
+            [transport]\nprotocol = \"wss\"\n\n\
+            [transport.tls]\nskipVerify = true\n";
+        let path = write_temp_config("frpc_wss_ok", content);
+        let config = ConfigLoader::load_client_config(&path).expect("wss client config must parse");
+        assert_eq!(config.transport.protocol, "wss");
         let _ = std::fs::remove_file(&path);
     }
 
