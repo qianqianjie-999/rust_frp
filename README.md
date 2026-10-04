@@ -23,6 +23,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **多格式配置**：支持 TOML、YAML、JSON 配置格式；**兼容原版 frp 的 camelCase 字段名**（`serverAddr`/`localIP`/`bindPort` 等可直接使用），原版配置文件可直接复用；无法识别的字段（如原版 `log.to`）加载时打印 WARN 但不拒绝启动
 - **优雅关闭**：客户端 SIGINT/SIGTERM 优雅退出；服务端 SIGINT/SIGTERM 停止接收新连接并按 10s 上限排空存量连接（不再硬 `exit(0)`）
 - **OIDC 认证**：服务端拉取 issuer 的 Discovery + JWKS 并校验 RS256/ES256 签名（拒绝 `none`/`HS*`，防算法混淆）；客户端支持 `client_credentials` 换取访问令牌
+- **tokenSource 动态令牌**：`auth.tokenSource` 支持 `type = "file"`（读文件）或 `type = "exec"`（执行命令取 stdout），避免把明文 token 写进配置文件（与静态 `token` 互斥）
 - **配置热重载**：支持 SIGHUP 信号、文件监听、API 触发三种方式重载配置
 - **应用层压缩**：per-proxy `use_compression`，工作连接 snappy 压缩（对齐原版语义）
 - **服务端 HTTP 插件**：`[[http_plugins]]` 配置外部 HTTP 服务，在 Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn 六类事件回调，支持拒绝（reject）与内容覆写（unchange）
@@ -49,6 +50,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | sudp 代理 | ✅ | 安全 UDP：经 STCP 隧道承载 UDP 报文（`secret_key` 签名校验与 STCP 一致），代理端/访问端各自监听本地 UDP |
 | 服务端 HTTP 插件 | ✅ | `[[http_plugins]]`：六类事件回调（Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn），支持 `reject` 拒绝 + `unchange` 覆写；https 地址可用 `tls_verify` 控制证书校验 |
 | OIDC 认证 | ✅ | 服务端：issuer Discovery + JWKS 拉取 + RS256/ES256 验签（按 `kid` 选钥、支持密钥轮转）；客户端：`client_credentials` 换取 `access_token` |
+| tokenSource 动态令牌 | ✅ | `auth.tokenSource`：`type = "file"` 读文件 / `type = "exec"` 执行命令取 stdout；与静态 `token` 互斥，客户端启动与配置重载时解析（仅存内存） |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
@@ -146,6 +148,28 @@ rust_frp/
 | 企业 SSO | 集成企业身份认证系统（如 Okta、Azure AD） |
 | 多租户管理 | 支持多个组织使用同一 frp 服务 |
 | 审计日志 | 与企业身份系统集成，便于审计 |
+
+### tokenSource 动态令牌 ✅
+
+| 场景 | 说明 |
+|------|------|
+| 避免明文令牌 | 令牌不写进配置文件，改由文件或命令提供 |
+| 密钥轮转 | 配合 Secret 挂载（K8s/Vault），`frpc reload` 即重新读取 |
+| 云上取令牌 | `type = "exec"` 调用云元数据 / 密钥服务动态取 token |
+
+**配置**（与静态 `token` 互斥，二者只能配一个）：
+
+```toml
+[auth]
+method = "token"
+
+[auth.tokenSource]
+type = "file"                       # 或 "exec"
+filePath = "/run/secrets/frp_token"
+
+# type = "exec" 示例：
+# exec = ["/usr/local/bin/get-frp-token", "--env", "prod"]
+```
 
 ### 配置热重载 ✅
 
@@ -473,6 +497,13 @@ tls = { enable = true, skip_verify = true }  # 自签名环境：显式跳过证
 
 # 可选：配置自定义 CA 证书进行验证（防止中间人攻击，生产推荐）
 # tls = { enable = true, trusted_ca_file = "/path/to/ca.crt" }
+
+# 可选：用 tokenSource 替代明文 token（与上面 token 互斥）
+# [auth.tokenSource]
+# type = "file"                       # 或 "exec"
+# filePath = "/run/secrets/frp_token"
+# # type = "exec"
+# # exec = ["/usr/local/bin/get-frp-token", "--env", "prod"]
 
 # QUIC 传输：将上面 protocol 改为 "quic"。QUIC 强制 TLS 1.3，
 # 必须提供信任来源（trusted_ca_file 或 skip_verify = true），否则拒绝启动。

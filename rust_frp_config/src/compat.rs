@@ -86,7 +86,9 @@ mod fields {
         "exposeMetrics",
     ];
 
-    pub const AUTH: &[&str] = &["method", "token", "oidc"];
+    pub const AUTH: &[&str] = &["method", "token", "tokenSource", "token_source", "oidc"];
+
+    pub const TOKEN_SOURCE: &[&str] = &["type", "file_path", "filePath", "exec"];
 
     pub const OIDC: &[&str] = &[
         "issuer",
@@ -259,6 +261,7 @@ fn section_fields(section: &str) -> &'static [&'static str] {
         "web_server" => fields::WEB_SERVER,
         "auth" => fields::AUTH,
         "oidc" => fields::OIDC,
+        "token_source" => fields::TOKEN_SOURCE,
         "transport" => fields::TRANSPORT,
         "tls" => fields::TLS,
         "quic" => fields::QUIC,
@@ -286,7 +289,11 @@ fn child_section(section: &str, key: &str) -> Option<&'static str> {
             "http_plugins" | "httpPlugins" => Some("http_plugin"),
             _ => None,
         },
-        "auth" => (key == "oidc").then_some("oidc"),
+        "auth" => match key {
+            "oidc" => Some("oidc"),
+            "tokenSource" | "token_source" => Some("token_source"),
+            _ => None,
+        },
         "transport" => match key {
             "tls" => Some("tls"),
             "quic" => Some("quic"),
@@ -421,6 +428,24 @@ mod tests {
 
     /// 回归：`http_plugins`/`httpPlugins` 必须属于服务端已知键，
     /// 否则上一轮新增的服务端插件配置会被整体误报为未知字段（含其子键）。
+    /// 回归：`auth.tokenSource.*`（含 camelCase）必须属于已知键。
+    #[test]
+    fn test_auth_token_source_keys_are_known() {
+        let root = json!({
+            "serverAddr": "1.2.3.4",
+            "serverPort": 7000,
+            "auth": {
+                "method": "token",
+                "tokenSource": { "type": "file", "filePath": "/run/secrets/tok" }
+            }
+        });
+        assert!(
+            collect_unknown_fields(ConfigKind::Client, &root).is_empty(),
+            "got {:?}",
+            collect_unknown_fields(ConfigKind::Client, &root)
+        );
+    }
+
     #[test]
     fn test_http_plugins_and_oidc_keys_are_known() {
         let root = json!({

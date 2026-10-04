@@ -1195,6 +1195,63 @@ async fn resolve_auth_token(
     Ok(token.access_token)
 }
 
+/// 解析 `auth.tokenSource` 并把结果写入内存中的 `auth.token`
+///
+/// 在客户端构造与配置重载时各调用一次。解析结果只存在于内存，不写回磁盘；
+/// 之后的登录（[`resolve_auth_token`]）、工作连接签名与应用层加密都统一读取
+/// `auth.token`，因此无需改动这些热路径。
+fn apply_token_source(
+    config: &mut ClientConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(ts) = config.auth.token_source.clone() else {
+        return Ok(());
+    };
+    let token = match ts.r#type.as_str() {
+        "file" => {
+            let path = ts.file_path.as_deref().ok_or_else(|| {
+                "auth.tokenSource.filePath is required when type = \"file\"".to_string()
+            })?;
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("failed to read auth.tokenSource.filePath {path}: {e}"))?
+                .trim()
+                .to_string()
+        }
+        "exec" => {
+            let argv = ts.exec.as_ref().ok_or_else(|| {
+                "auth.tokenSource.exec is required when type = \"exec\"".to_string()
+            })?;
+            let (prog, args) = argv
+                .split_first()
+                .ok_or_else(|| "auth.tokenSource.exec must not be empty".to_string())?;
+            let output = std::process::Command::new(prog)
+                .args(args)
+                .output()
+                .map_err(|e| format!("failed to run auth.tokenSource.exec {prog}: {e}"))?;
+            if !output.status.success() {
+                return Err(
+                    format!("auth.tokenSource.exec {prog} exited with {}", output.status).into(),
+                );
+            }
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        other => {
+            return Err(format!(
+                "unsupported auth.tokenSource.type: {other} (expected \"file\" or \"exec\")"
+            )
+            .into());
+        }
+    };
+    if token.is_empty() {
+        return Err("auth.tokenSource produced an empty token".into());
+    }
+    log::info!(
+        "Resolved auth.tokenSource (type={}) into an in-memory token",
+        ts.r#type
+    );
+    config.auth.token = Some(token);
+    Ok(())
+}
+
 fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
     use ring::{digest, hmac};
     // encryption_key = SHA-256(token)
@@ -2671,6 +2728,10 @@ impl Client {
             config.client_id = Some(rand_id(16));
         }
 
+        // 动态令牌来源（auth.tokenSource）：必须先于 AuthManager 构造解析，
+        // 否则 method = "token" 且 token 为空会被判为缺少令牌而拒绝启动。
+        apply_token_source(&mut config).map_err(|e| e.to_string())?;
+
         let auth_manager = Arc::new(AuthManager::new(&config.auth).map_err(|e| e.to_string())?);
 
         // 先创建可变的 proxy_manager，设置 work_conn_manager，再包装成 Arc
@@ -3188,7 +3249,9 @@ impl Client {
 
     pub async fn reload_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(config_path) = &self.config_path {
-            let new_config = rust_frp_config::ConfigLoader::load_client_config(config_path)?;
+            let mut new_config = rust_frp_config::ConfigLoader::load_client_config(config_path)?;
+            // tokenSource 需在替换配置前重新解析（配置里 token 通常为空）
+            apply_token_source(&mut new_config).map_err(|e| e.to_string())?;
             self.config = Arc::new(new_config);
 
             // 重新启动所有代理
@@ -3905,5 +3968,91 @@ mod client_traffic_tests {
         mgr.record_traffic("web", 1, 2).await;
         assert_eq!(mgr.traffic_snapshot("ssh").await, Some((105, 206)));
         assert_eq!(mgr.traffic_snapshot("web").await, Some((1, 2)));
+    }
+}
+
+#[cfg(test)]
+mod token_source_tests {
+    use super::*;
+    use rust_frp_config::{ClientConfig, TokenSource};
+    use std::io::Write;
+
+    fn base_config() -> ClientConfig {
+        ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            ..Default::default()
+        }
+    }
+
+    /// type = "file"：读取文件内容（去除首尾空白）并写入内存 token
+    #[test]
+    fn applies_token_from_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("frp_tok_{}.txt", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "  file-token-123  ").unwrap();
+        drop(f);
+
+        let mut cfg = base_config();
+        cfg.auth.token_source = Some(TokenSource {
+            r#type: "file".to_string(),
+            file_path: Some(path.to_string_lossy().into_owned()),
+            exec: None,
+        });
+        apply_token_source(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.token.as_deref(), Some("file-token-123"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// type = "file"：文件缺失 → 报错而非静默空 token
+    #[test]
+    fn missing_file_is_error() {
+        let mut cfg = base_config();
+        cfg.auth.token_source = Some(TokenSource {
+            r#type: "file".to_string(),
+            file_path: Some("/nonexistent/frp/token".to_string()),
+            exec: None,
+        });
+        assert!(apply_token_source(&mut cfg).is_err());
+        assert!(cfg.auth.token.is_none());
+    }
+
+    /// type = "exec"：取 stdout（去除尾部换行）作为 token
+    #[test]
+    fn applies_token_from_exec() {
+        let mut cfg = base_config();
+        cfg.auth.token_source = Some(TokenSource {
+            r#type: "exec".to_string(),
+            file_path: None,
+            exec: Some(vec!["/bin/echo".to_string(), "exec-token-9".to_string()]),
+        });
+        apply_token_source(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.token.as_deref(), Some("exec-token-9"));
+    }
+
+    /// exec 命令非零退出 → 报错
+    #[test]
+    fn exec_failure_is_error() {
+        let mut cfg = base_config();
+        cfg.auth.token_source = Some(TokenSource {
+            r#type: "exec".to_string(),
+            file_path: None,
+            exec: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "exit 3".to_string(),
+            ]),
+        });
+        assert!(apply_token_source(&mut cfg).is_err());
+    }
+
+    /// 未配置 tokenSource 时保持原样（token 不被改写）
+    #[test]
+    fn noop_without_token_source() {
+        let mut cfg = base_config();
+        cfg.auth.token = Some("static".to_string());
+        apply_token_source(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.token.as_deref(), Some("static"));
     }
 }

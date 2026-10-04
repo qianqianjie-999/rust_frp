@@ -442,6 +442,13 @@ pub struct AuthConfig {
     /// 令牌（当 method = "token" 时使用）
     pub token: Option<String>,
 
+    /// 动态令牌来源（`method = "token"` 时可用；与静态 `token` 互斥）
+    ///
+    /// 对齐原版 frp 的 `auth.tokenSource`：避免把明文 token 写进配置文件，
+    /// 改由文件或外部命令在客户端启动（及配置重载）时提供。
+    #[serde(alias = "tokenSource")]
+    pub token_source: Option<TokenSource>,
+
     /// OIDC 配置（当 method = "oidc" 时使用）
     pub oidc: Option<OidcConfig>,
 }
@@ -451,9 +458,31 @@ impl Default for AuthConfig {
         Self {
             method: "token".to_string(),
             token: None,
+            token_source: None,
             oidc: None,
         }
     }
+}
+
+/// 动态令牌来源（对齐原版 frp 的 `auth.tokenSource`）
+///
+/// - `type = "file"`：从 `file_path` 读取令牌（去除首尾空白）
+/// - `type = "exec"`：执行 `exec`（`exec[0]` 为程序，其余为参数），取 stdout 为令牌
+///
+/// 与 `auth.token` 互斥。解析发生在客户端启动与配置重载时，解析结果只写入
+/// 内存中的 `auth.token`（不落盘），供登录、工作连接签名与应用层加密统一读取。
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
+pub struct TokenSource {
+    /// 来源类型：`"file"` 或 `"exec"`
+    pub r#type: String,
+
+    /// 令牌文件路径（`type = "file"`）
+    #[serde(alias = "filePath")]
+    pub file_path: Option<String>,
+
+    /// 命令及参数（`type = "exec"`，`exec[0]` 为可执行文件）
+    pub exec: Option<Vec<String>>,
 }
 
 /// OpenID Connect 配置
@@ -1737,6 +1766,46 @@ impl ConfigLoader {
         }
     }
 
+    /// 校验 `auth.tokenSource`：与静态 token 互斥、类型合法、必填字段到位。
+    fn validate_token_source(auth: &AuthConfig) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(ts) = auth.token_source.as_ref() else {
+            return Ok(());
+        };
+        if auth.token.as_deref().is_some_and(|t| !t.is_empty()) {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "auth.token and auth.tokenSource are mutually exclusive; set only one",
+            )));
+        }
+        match ts.r#type.as_str() {
+            "file" => {
+                if ts.file_path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "auth.tokenSource.filePath is required when type = \"file\"",
+                    )));
+                }
+            }
+            "exec" => {
+                if ts.exec.as_ref().is_none_or(|v| v.is_empty()) {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "auth.tokenSource.exec must list the program to run when type = \"exec\"",
+                    )));
+                }
+            }
+            other => {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "unsupported auth.tokenSource.type: {other} (expected \"file\" or \"exec\")"
+                    ),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// 验证客户端配置
     ///
     /// # 必填字段
@@ -1831,7 +1900,9 @@ impl ConfigLoader {
 
         // OIDC 客户端：client_credentials 需要 client_id 与绝对 http(s) 的令牌端点。
         match config.auth.method.as_str() {
-            "token" => {}
+            "token" => {
+                Self::validate_token_source(&config.auth)?;
+            }
             "oidc" => {
                 let Some(oidc) = config.auth.oidc.as_ref() else {
                     return Err(Box::new(std::io::Error::new(
@@ -2531,6 +2602,67 @@ skipIssuerCheck = false
         let err = ConfigLoader::load_server_config(&path).unwrap_err();
         assert!(
             err.to_string().contains("same UDP port"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// tokenSource：file 类型可解析，且把 token 字段留空是合法的
+    #[test]
+    fn test_token_source_file_parses() {
+        let content = "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n\
+            [auth]\nmethod = \"token\"\n\n\
+            [auth.tokenSource]\ntype = \"file\"\nfilePath = \"/run/secrets/frp_token\"\n";
+        let path = write_temp_config("frpc_tokensource_file", content);
+        let config = ConfigLoader::load_client_config(&path)
+            .expect("tokenSource(file) client config must parse");
+        let ts = config.auth.token_source.expect("token_source parsed");
+        assert_eq!(ts.r#type, "file");
+        assert_eq!(ts.file_path.as_deref(), Some("/run/secrets/frp_token"));
+        assert!(config.auth.token.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// tokenSource：type = "file" 缺少 filePath 必须被拒绝
+    #[test]
+    fn test_token_source_file_requires_path() {
+        let content = "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n\
+            [auth]\nmethod = \"token\"\n\n\
+            [auth.tokenSource]\ntype = \"file\"\n";
+        let path = write_temp_config("frpc_tokensource_nopath", content);
+        let err = ConfigLoader::load_client_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("filePath"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// tokenSource：token 与 tokenSource 同时配置必须被拒绝（互斥）
+    #[test]
+    fn test_token_source_mutually_exclusive_with_token() {
+        let content = "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n\
+            [auth]\nmethod = \"token\"\ntoken = \"static\"\n\n\
+            [auth.tokenSource]\ntype = \"exec\"\nexec = [\"/usr/bin/vault\", \"read\"]\n";
+        let path = write_temp_config("frpc_tokensource_both", content);
+        let err = ConfigLoader::load_client_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// tokenSource：未知 type 必须被拒绝
+    #[test]
+    fn test_token_source_unsupported_type_rejected() {
+        let content = "serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n\
+            [auth]\nmethod = \"token\"\n\n\
+            [auth.tokenSource]\ntype = \"vault\"\n";
+        let path = write_temp_config("frpc_tokensource_bad", content);
+        let err = ConfigLoader::load_client_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("tokenSource.type"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_file(&path);

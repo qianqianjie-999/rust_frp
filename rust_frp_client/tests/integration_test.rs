@@ -684,6 +684,7 @@ fn test_auth_config_oidc_method() {
     let config = AuthConfig {
         method: "oidc".to_string(),
         token: None,
+        token_source: None,
         oidc: Some(OidcConfig {
             issuer: "https://auth.example.com".to_string(),
             audience: "frp-app".to_string(),
@@ -706,6 +707,7 @@ fn test_oidc_auth_manager_creation() {
     let config = AuthConfig {
         method: "oidc".to_string(),
         token: None,
+        token_source: None,
         oidc: Some(OidcConfig {
             issuer: "https://auth.example.com".to_string(),
             audience: "frp-app".to_string(),
@@ -725,6 +727,7 @@ fn test_oidc_auth_manager_missing_config() {
         method: "oidc".to_string(),
         token: None,
         oidc: None,
+        token_source: None,
     };
     let result = AuthManager::new(&config);
     assert!(result.is_err());
