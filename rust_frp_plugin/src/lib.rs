@@ -85,9 +85,14 @@ pub mod server_plugin;
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
 
-/// 常量时间字符串比较，避免 Basic 凭据比对出现时序侧信道
+/// 常量时间字节比较，避免凭据比对出现时序侧信道
+fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
+}
+
+/// 常量时间字符串比较
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    ring::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
+    constant_time_eq_bytes(a.as_bytes(), b.as_bytes())
 }
 
 /// 根据文件扩展名推断 Content-Type
@@ -398,9 +403,12 @@ impl Plugin for StaticFilePlugin {
     }
 }
 
-/// HTTP 代理插件
-// 功能脚手架：http_user/http_password 尚未在 handle 流程消费（插件级认证待实现）
-#[allow(dead_code)]
+/// HTTP 代理插件（HTTP CONNECT 隧道）
+///
+/// 访客按 `CONNECT host:port` 语义建立隧道并双向转发。
+/// 配置了 `http_user` / `http_password` 时强制校验 `Proxy-Authorization: Basic`
+/// 请求头；校验在解析目标之前进行，未通过一律 407（不暴露代理行为）。
+/// 已知限制：仅支持 CONNECT，普通 HTTP 转发未实现（见 README）。
 pub struct HttpProxyPlugin {
     http_user: Option<String>,
     http_password: Option<String>,
@@ -412,6 +420,49 @@ impl HttpProxyPlugin {
             http_user: config.http_user.clone(),
             http_password: config.http_password.clone(),
         })
+    }
+
+    /// 校验代理认证（`Proxy-Authorization: Basic`）
+    ///
+    /// 未配置 `http_user` / `http_password` 时视为匿名代理直接放行；
+    /// 配置后必须提供匹配凭据（常量时间比较），否则返回 `false`。
+    fn check_proxy_auth(&self, lines: &[&str]) -> bool {
+        if self.http_user.is_none() && self.http_password.is_none() {
+            return true;
+        }
+        let expected_user = self.http_user.as_deref().unwrap_or("");
+        let expected_password = self.http_password.as_deref().unwrap_or("");
+
+        let header = lines.iter().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("proxy-authorization") {
+                Some(value.trim())
+            } else {
+                None
+            }
+        });
+
+        let Some(header) = header else {
+            return false;
+        };
+        let Some((scheme, encoded)) = header.split_once(' ') else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("basic") {
+            return false;
+        }
+
+        let Ok(decoded) = base64::decode(encoded.trim()) else {
+            return false;
+        };
+        let Ok(decoded) = String::from_utf8(decoded) else {
+            return false;
+        };
+        let Some((user, password)) = decoded.split_once(':') else {
+            return false;
+        };
+
+        constant_time_eq(user, expected_user) && constant_time_eq(password, expected_password)
     }
 
     /// 处理 HTTP 代理请求
@@ -435,18 +486,51 @@ impl HttpProxyPlugin {
 
         let first_line = lines[0];
         let parts: Vec<&str> = first_line.split_whitespace().collect();
-        if parts.len() < 3 || parts[0] != "CONNECT" {
+        if parts.len() < 3 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "invalid HTTP CONNECT request",
+                "invalid HTTP request line",
             )));
+        }
+
+        // 认证先于命令分派：未通过认证不解析目标、不暴露代理行为
+        if !self.check_proxy_auth(&lines) {
+            let response = "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                 Proxy-Authenticate: Basic realm=\"frp http proxy\"\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\r\n";
+            conn.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
+
+        if parts[0] != "CONNECT" {
+            // 本实现仅支持 CONNECT 隧道；普通 HTTP 转发（原版支持）尚未实现
+            let body = "Method Not Allowed: only CONNECT is supported";
+            let response = format!(
+                "HTTP/1.1 405 Method Not Allowed\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            conn.write_all(response.as_bytes()).await?;
+            return Ok(());
         }
 
         let target = parts[1];
 
-        // 连接到目标服务器
-        let target_addr = target.parse::<std::net::SocketAddr>()?;
-        let mut target_conn = tokio::net::TcpStream::connect(target_addr).await?;
+        // 连接到目标服务器（TcpStream::connect 支持域名解析，与原版 net.Dial 一致）
+        let mut target_conn = match tokio::net::TcpStream::connect(target).await {
+            Ok(c) => c,
+            Err(_) => {
+                let response = "HTTP/1.1 502 Bad Gateway\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n";
+                conn.write_all(response.as_bytes()).await?;
+                return Ok(());
+            }
+        };
 
         // 发送 HTTP 响应
         let response = "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -470,8 +554,9 @@ impl Plugin for HttpProxyPlugin {
 }
 
 /// SOCKS5 代理插件
-// 功能脚手架：username/password 尚未在 handle 流程消费（插件级认证待实现）
-#[allow(dead_code)]
+///
+/// 支持 `CONNECT` 命令（IPv4 / 域名 / IPv6）。配置了 `username` / `password`
+/// 时按 RFC 1929 强制用户名密码认证；未配置时使用「无认证」方法。
 pub struct Socks5Plugin {
     username: Option<String>,
     password: Option<String>,
@@ -480,9 +565,36 @@ pub struct Socks5Plugin {
 impl Socks5Plugin {
     pub fn new(config: &PluginConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Self {
-            username: config.http_user.clone(),
-            password: config.http_password.clone(),
+            username: config.username.clone(),
+            password: config.password.clone(),
         })
+    }
+
+    /// 是否需要用户名密码认证
+    fn needs_auth(&self) -> bool {
+        self.username.is_some() || self.password.is_some()
+    }
+
+    /// 从客户端提供的方法列表中选择一个
+    ///
+    /// - 需要认证：仅当客户端提供 `0x02`（用户名/密码）时选中，否则 `None`（回 0xFF）
+    /// - 无需认证：优先 `0x00`（无认证），客户端未提供时 `None`
+    fn select_method(methods: &[u8], need_auth: bool) -> Option<u8> {
+        if need_auth {
+            methods.contains(&0x02).then_some(0x02)
+        } else if methods.contains(&0x00) {
+            Some(0x00)
+        } else {
+            None
+        }
+    }
+
+    /// 按 RFC 1929 校验用户名/密码（常量时间比较）
+    fn verify_credentials(&self, user: &[u8], password: &[u8]) -> bool {
+        let expected_user = self.username.as_deref().unwrap_or("");
+        let expected_password = self.password.as_deref().unwrap_or("");
+        constant_time_eq_bytes(user, expected_user.as_bytes())
+            && constant_time_eq_bytes(password, expected_password.as_bytes())
     }
 
     /// 处理 SOCKS5 代理请求
@@ -490,103 +602,111 @@ impl Socks5Plugin {
         &self,
         mut conn: Box<dyn AsyncStream>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 读取 SOCKS5 握手请求
-        let mut buf = [0; 256];
-        let n = conn.read(&mut buf).await?;
+        // ---- 1. 方法协商（RFC 1928） ----
+        let mut head = [0u8; 2];
+        conn.read_exact(&mut head).await?;
+        if head[0] != 0x05 {
+            return Err(invalid_input("invalid SOCKS5 version"));
+        }
+        let nmethods = head[1] as usize;
+        if nmethods == 0 {
+            conn.write_all(&[0x05, 0xFF]).await?;
+            return Err(invalid_input("SOCKS5 client offered no auth methods"));
+        }
+        let mut methods = vec![0u8; nmethods];
+        conn.read_exact(&mut methods).await?;
 
-        // 验证 SOCKS5 版本
-        if n < 2 || buf[0] != 0x05 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid SOCKS5 version",
-            )));
+        let Some(method) = Self::select_method(&methods, self.needs_auth()) else {
+            conn.write_all(&[0x05, 0xFF]).await?;
+            return Err(invalid_input("no acceptable SOCKS5 auth method"));
+        };
+        conn.write_all(&[0x05, method]).await?;
+
+        // ---- 2. 用户名密码子协商（RFC 1929） ----
+        if method == 0x02 {
+            let mut auth_ver = [0u8; 1];
+            conn.read_exact(&mut auth_ver).await?;
+            let mut ulen = [0u8; 1];
+            conn.read_exact(&mut ulen).await?;
+            let mut user = vec![0u8; ulen[0] as usize];
+            conn.read_exact(&mut user).await?;
+            let mut plen = [0u8; 1];
+            conn.read_exact(&mut plen).await?;
+            let mut password = vec![0u8; plen[0] as usize];
+            conn.read_exact(&mut password).await?;
+
+            if auth_ver[0] != 0x01 {
+                conn.write_all(&[0x01, 0x01]).await?;
+                return Err(invalid_input("invalid SOCKS5 auth version"));
+            }
+            if !self.verify_credentials(&user, &password) {
+                // 认证失败：按 RFC 1929 回 status=0x01 后正常结束
+                conn.write_all(&[0x01, 0x01]).await?;
+                return Ok(());
+            }
+            conn.write_all(&[0x01, 0x00]).await?;
         }
 
-        // 发送 SOCKS5 握手响应
-        let response = [0x05, 0x00]; // 无认证
-        conn.write_all(&response).await?;
-
-        // 读取 SOCKS5 请求
-        let n = conn.read(&mut buf).await?;
-        if n < 4 || buf[0] != 0x05 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid SOCKS5 request",
-            )));
+        // ---- 3. 请求解析（RFC 1928） ----
+        let mut req = [0u8; 4];
+        conn.read_exact(&mut req).await?;
+        if req[0] != 0x05 {
+            return Err(invalid_input("invalid SOCKS5 request version"));
+        }
+        if req[1] != 0x01 {
+            // 仅支持 CONNECT（0x01）；0x07 = Command not supported
+            conn.write_all(&socks5_reply(0x07)).await?;
+            return Err(invalid_input("unsupported SOCKS5 command (only CONNECT)"));
         }
 
-        // 解析 SOCKS5 请求
-        let cmd = buf[1];
-        if cmd != 0x01 {
-            // CONNECT
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unsupported SOCKS5 command",
-            )));
-        }
-
-        // 解析目标地址
-        let addr_type = buf[3];
-        #[allow(unused_assignments)]
-        let mut target_addr = String::new();
-        #[allow(unused_assignments)]
-        let mut target_port = 0;
-
-        match addr_type {
+        let target = match req[3] {
             0x01 => {
                 // IPv4
-                if n < 10 {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "invalid SOCKS5 IPv4 address",
-                    )));
-                }
-                target_addr = format!("{}.{}.{}.{}", buf[4], buf[5], buf[6], buf[7]);
-                target_port = ((buf[8] as u16) << 8) | (buf[9] as u16);
+                let mut b = [0u8; 6];
+                conn.read_exact(&mut b).await?;
+                let port = u16::from_be_bytes([b[4], b[5]]);
+                format!("{}.{}.{}.{}:{}", b[0], b[1], b[2], b[3], port)
             }
             0x03 => {
                 // 域名
-                let len = buf[4] as usize;
-                if n < 5 + len + 2 {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "invalid SOCKS5 domain address",
-                    )));
-                }
-                target_addr = String::from_utf8_lossy(&buf[5..5 + len]).to_string();
-                target_port = ((buf[5 + len] as u16) << 8) | (buf[5 + len + 1] as u16);
+                let mut len = [0u8; 1];
+                conn.read_exact(&mut len).await?;
+                let mut domain = vec![0u8; len[0] as usize];
+                conn.read_exact(&mut domain).await?;
+                let mut port = [0u8; 2];
+                conn.read_exact(&mut port).await?;
+                format!(
+                    "{}:{}",
+                    String::from_utf8_lossy(&domain),
+                    u16::from_be_bytes(port)
+                )
             }
             0x04 => {
                 // IPv6
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "IPv6 not supported",
-                )));
+                let mut b = [0u8; 18];
+                conn.read_exact(&mut b).await?;
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&b[..16]);
+                let port = u16::from_be_bytes([b[16], b[17]]);
+                format!("[{}]:{}", std::net::Ipv6Addr::from(octets), port)
             }
             _ => {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid SOCKS5 address type",
-                )));
+                // 0x08 = Address type not supported
+                conn.write_all(&socks5_reply(0x08)).await?;
+                return Err(invalid_input("invalid SOCKS5 address type"));
             }
-        }
+        };
 
-        // 连接到目标服务器
-        let target = format!("{}:{}", target_addr, target_port);
-        let mut target_conn = tokio::net::TcpStream::connect(target).await?;
-
-        // 发送 SOCKS5 响应
-        let response = [
-            0x05, // 版本
-            0x00, // 成功
-            0x00, // 保留
-            0x01, // IPv4
-            0x00, 0x00, 0x00, 0x00, // 地址
-            0x00, 0x00, // 端口
-        ];
-        conn.write_all(&response).await?;
-
-        // 双向转发数据
+        // ---- 4. 连接目标并桥接 ----
+        let mut target_conn = match tokio::net::TcpStream::connect(target.as_str()).await {
+            Ok(c) => c,
+            Err(e) => {
+                // 0x05 = Connection refused
+                conn.write_all(&socks5_reply(0x05)).await?;
+                return Err(Box::new(e));
+            }
+        };
+        conn.write_all(&socks5_reply(0x00)).await?;
         tokio::io::copy_bidirectional(&mut conn, &mut target_conn).await?;
 
         Ok(())
@@ -716,6 +836,11 @@ fn invalid_input(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
         std::io::ErrorKind::InvalidInput,
         msg.to_string(),
     ))
+}
+
+/// 构造 SOCKS5 应答：VER=5, REP, RSV=0, ATYP=IPv4, BND.ADDR=0.0.0.0, BND.PORT=0
+fn socks5_reply(rep: u8) -> [u8; 10] {
+    [0x05, rep, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 }
 
 /// 插件管理器
@@ -955,5 +1080,266 @@ mod static_file_auth_tests {
             &plugin(Some("u"), None),
             &[basic_header("u", "anything")]
         ));
+    }
+}
+
+#[cfg(test)]
+mod proxy_plugin_auth_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ---------------- http_proxy ----------------
+
+    fn http_plugin(user: Option<&str>, password: Option<&str>) -> HttpProxyPlugin {
+        let cfg = PluginConfig {
+            r#type: "http_proxy".to_string(),
+            http_user: user.map(str::to_string),
+            http_password: password.map(str::to_string),
+            ..Default::default()
+        };
+        HttpProxyPlugin::new(&cfg).expect("http proxy build failed")
+    }
+
+    fn proxy_auth_header(user: &str, password: &str) -> String {
+        format!(
+            "Proxy-Authorization: Basic {}",
+            base64::encode(format!("{}:{}", user, password))
+        )
+    }
+
+    fn check_http(p: &HttpProxyPlugin, headers: &[String]) -> bool {
+        let mut lines: Vec<&str> = vec!["CONNECT example.com:443 HTTP/1.1", "Host: example.com"];
+        lines.extend(headers.iter().map(|s| s.as_str()));
+        p.check_proxy_auth(&lines)
+    }
+
+    /// 未配置凭据 → 匿名放行
+    #[test]
+    fn http_proxy_anonymous_when_unconfigured() {
+        assert!(check_http(&http_plugin(None, None), &[]));
+    }
+
+    /// 配置凭据但无 Proxy-Authorization → 拒绝
+    #[test]
+    fn http_proxy_missing_header_rejected() {
+        assert!(!check_http(&http_plugin(Some("u"), Some("p")), &[]));
+    }
+
+    /// 非 Basic scheme → 拒绝
+    #[test]
+    fn http_proxy_wrong_scheme_rejected() {
+        assert!(!check_http(
+            &http_plugin(Some("u"), Some("p")),
+            &["Proxy-Authorization: Bearer abc".to_string()]
+        ));
+    }
+
+    /// 非法 base64 / 无冒号 → 拒绝
+    #[test]
+    fn http_proxy_malformed_rejected() {
+        assert!(!check_http(
+            &http_plugin(Some("u"), Some("p")),
+            &["Proxy-Authorization: Basic !!!".to_string()]
+        ));
+        let h = format!("Proxy-Authorization: Basic {}", base64::encode("nocolon"));
+        assert!(!check_http(&http_plugin(Some("u"), Some("p")), &[h]));
+    }
+
+    /// 凭据比对（常量时间）：全对放行，任一错拒绝
+    #[test]
+    fn http_proxy_credential_match() {
+        assert!(check_http(
+            &http_plugin(Some("u"), Some("p")),
+            &[proxy_auth_header("u", "p")]
+        ));
+        assert!(!check_http(
+            &http_plugin(Some("u"), Some("p")),
+            &[proxy_auth_header("x", "p")]
+        ));
+        assert!(!check_http(
+            &http_plugin(Some("u"), Some("p")),
+            &[proxy_auth_header("u", "x")]
+        ));
+    }
+
+    /// 头名与 scheme 大小写不敏感
+    #[test]
+    fn http_proxy_case_insensitive() {
+        let h = format!("proxy-authorization: basic {}", base64::encode("u:p"));
+        assert!(check_http(&http_plugin(Some("u"), Some("p")), &[h]));
+    }
+
+    /// 端到端：无凭据 CONNECT 必须收到 407 + Proxy-Authenticate，且不触碰目标
+    #[tokio::test]
+    async fn http_proxy_returns_407_without_credentials() {
+        let mut plugin = http_plugin(Some("u"), Some("p"));
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let client_side = async move {
+            client
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = [0u8; 256];
+            let n = client.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        };
+        let (resp, _) = tokio::join!(client_side, plugin.handle(Box::new(server)));
+        assert!(
+            resp.starts_with("HTTP/1.1 407"),
+            "unexpected response: {resp}"
+        );
+        assert!(
+            resp.to_ascii_lowercase()
+                .contains("proxy-authenticate: basic"),
+            "missing Proxy-Authenticate: {resp}"
+        );
+    }
+
+    // ---------------- socks5 ----------------
+
+    fn socks5_plugin(user: Option<&str>, password: Option<&str>) -> Socks5Plugin {
+        let cfg = PluginConfig {
+            r#type: "socks5".to_string(),
+            username: user.map(str::to_string),
+            password: password.map(str::to_string),
+            ..Default::default()
+        };
+        Socks5Plugin::new(&cfg).expect("socks5 build failed")
+    }
+
+    #[test]
+    fn socks5_needs_auth_flag() {
+        assert!(!socks5_plugin(None, None).needs_auth());
+        assert!(socks5_plugin(Some("u"), Some("p")).needs_auth());
+        assert!(socks5_plugin(Some("u"), None).needs_auth());
+    }
+
+    #[test]
+    fn socks5_method_selection() {
+        // 需认证：仅当客户端提供 0x02 才可用
+        assert_eq!(Socks5Plugin::select_method(&[0x00], true), None);
+        assert_eq!(Socks5Plugin::select_method(&[0x00, 0x02], true), Some(0x02));
+        // 无需认证：优先 0x00
+        assert_eq!(
+            Socks5Plugin::select_method(&[0x00, 0x02], false),
+            Some(0x00)
+        );
+        assert_eq!(Socks5Plugin::select_method(&[0x02], false), None);
+    }
+
+    #[test]
+    fn socks5_verify_credentials() {
+        let p = socks5_plugin(Some("alice"), Some("s3cret"));
+        assert!(p.verify_credentials(b"alice", b"s3cret"));
+        assert!(!p.verify_credentials(b"alice", b"wrong"));
+        assert!(!p.verify_credentials(b"bob", b"s3cret"));
+    }
+
+    /// 未配置凭据 → 使用「无认证」方法（0x00）
+    #[tokio::test]
+    async fn socks5_no_auth_when_unconfigured() {
+        let mut plugin = socks5_plugin(None, None);
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let client_side = async move {
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut sel = [0u8; 2];
+            client.read_exact(&mut sel).await.unwrap();
+            sel
+        };
+        let (sel, _) = tokio::join!(client_side, plugin.handle(Box::new(server)));
+        assert_eq!(sel, [0x05, 0x00]);
+    }
+
+    /// 需认证但客户端只提供 0x00 → 回 0xFF 并拒绝
+    #[tokio::test]
+    async fn socks5_rejects_when_no_userpass_method_offered() {
+        let mut plugin = socks5_plugin(Some("u"), Some("p"));
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let client_side = async move {
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut sel = [0u8; 2];
+            client.read_exact(&mut sel).await.unwrap();
+            sel
+        };
+        let (sel, _) = tokio::join!(client_side, plugin.handle(Box::new(server)));
+        assert_eq!(sel, [0x05, 0xFF]);
+    }
+
+    /// 密码错误 → RFC 1929 回 [0x01, 0x01]
+    #[tokio::test]
+    async fn socks5_auth_failure_status_is_one() {
+        let mut plugin = socks5_plugin(Some("alice"), Some("s3cret"));
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let client_side = async move {
+            client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+            let mut sel = [0u8; 2];
+            client.read_exact(&mut sel).await.unwrap();
+            assert_eq!(sel, [0x05, 0x02]);
+            let mut auth = vec![0x01u8, 5];
+            auth.extend_from_slice(b"alice");
+            auth.push(5);
+            auth.extend_from_slice(b"wrong");
+            client.write_all(&auth).await.unwrap();
+            let mut res = [0u8; 2];
+            client.read_exact(&mut res).await.unwrap();
+            res
+        };
+        let (res, _) = tokio::join!(client_side, plugin.handle(Box::new(server)));
+        assert_eq!(res, [0x01, 0x01]);
+    }
+
+    /// 认证成功 → CONNECT 成功 → 数据双向桥接到本地 echo 服务
+    #[tokio::test]
+    async fn socks5_auth_success_then_connect_bridges() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = listener.local_addr().unwrap().port();
+
+        let echo = async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut b = [0u8; 8];
+                if let Ok(n) = s.read(&mut b).await {
+                    let _ = s.write_all(&b[..n]).await;
+                }
+            }
+        };
+
+        let mut plugin = socks5_plugin(Some("alice"), Some("s3cret"));
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let client_side = async move {
+            // 方法协商
+            client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+            let mut sel = [0u8; 2];
+            client.read_exact(&mut sel).await.unwrap();
+            assert_eq!(sel, [0x05, 0x02]);
+            // RFC 1929 认证（正确凭据）
+            let mut auth = vec![0x01u8, 5];
+            auth.extend_from_slice(b"alice");
+            auth.push(6);
+            auth.extend_from_slice(b"s3cret");
+            client.write_all(&auth).await.unwrap();
+            let mut ar = [0u8; 2];
+            client.read_exact(&mut ar).await.unwrap();
+            assert_eq!(ar, [0x01, 0x00]);
+            // CONNECT 127.0.0.1:target_port
+            let mut req = vec![0x05u8, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+            req.extend_from_slice(&target_port.to_be_bytes());
+            client.write_all(&req).await.unwrap();
+            let mut rep = [0u8; 10];
+            client.read_exact(&mut rep).await.unwrap();
+            assert_eq!(rep[1], 0x00, "connect reply: {rep:?}");
+            // 数据往返
+            client.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).await.unwrap();
+            buf
+        };
+
+        let (_, echoed, _) = tokio::join!(echo, client_side, plugin.handle(Box::new(server)));
+        assert_eq!(&echoed, b"ping");
     }
 }
