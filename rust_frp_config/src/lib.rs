@@ -1607,3 +1607,28 @@ expose_metrics = true
         assert!(config.expose_metrics);
     }
 }
+
+#[cfg(test)]
+mod example_config_tests {
+    use super::ConfigLoader;
+    use std::path::Path;
+
+    /// 示例配置文件必须始终可解析：README 引导用户复制 example 改配置，
+    /// 若字段重命名/删除后未同步 example，用户会拿到一个跑不起来的模板。
+    #[test]
+    fn test_frpc_example_toml_always_parses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../frpc.example.toml");
+        let config = ConfigLoader::load_client_config(&path)
+            .expect("frpc.example.toml must stay parseable by ConfigLoader");
+        assert!(!config.server_addr.is_empty());
+        assert!(config.server_port > 0);
+    }
+
+    #[test]
+    fn test_frps_example_toml_always_parses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../frps.example.toml");
+        let config = ConfigLoader::load_server_config(&path)
+            .expect("frps.example.toml must stay parseable by ConfigLoader");
+        assert!(config.bind_port > 0);
+    }
+}

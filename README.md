@@ -428,7 +428,8 @@ local_ip = "127.0.0.1"
 local_port = 8080
 remote_port = 9303
 
-[[proxies.health_check]]
+# 健康检查是 [[proxies]] 的子表（单表），不要写成 [[proxies.health_check]]
+[proxies.health_check]
 type = "tcp"
 interval_seconds = 10
 timeout_seconds = 3
@@ -442,7 +443,7 @@ local_ip = "127.0.0.1"
 local_port = 8080
 custom_domains = ["app.example.com"]
 
-[[proxies.health_check]]
+[proxies.health_check]
 type = "http"
 interval_seconds = 10
 timeout_seconds = 3

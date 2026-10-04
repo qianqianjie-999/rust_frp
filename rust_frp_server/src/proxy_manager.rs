@@ -888,25 +888,24 @@ impl ServerProxyManager {
             "tcp" | "udp" => 1,
             _ => 0,
         };
-        let quota_tracked = user.is_some() && ports_used > 0 && self.max_ports_per_user.is_some();
-        if quota_tracked {
-            let user = user.unwrap();
-            let limit = self.max_ports_per_user.unwrap();
-            let mut counts = self.user_port_counts.write().await;
-            let current = counts.get(user).copied().unwrap_or(0);
-            if current + ports_used > limit {
-                return Err(format!(
-                    "proxy [{}] rejected: user [{}] exceeds max_ports_per_user limit {}",
-                    config.name, user, limit
-                )
-                .into());
+        if ports_used > 0 {
+            if let (Some(user), Some(limit)) = (user, self.max_ports_per_user) {
+                let mut counts = self.user_port_counts.write().await;
+                let current = counts.get(user).copied().unwrap_or(0);
+                if current + ports_used > limit {
+                    return Err(format!(
+                        "proxy [{}] rejected: user [{}] exceeds max_ports_per_user limit {}",
+                        config.name, user, limit
+                    )
+                    .into());
+                }
+                counts.insert(user.to_string(), current + ports_used);
+                drop(counts);
+                self.proxy_user_ports
+                    .write()
+                    .await
+                    .insert(config.name.clone(), (user.to_string(), ports_used));
             }
-            counts.insert(user.to_string(), current + ports_used);
-            drop(counts);
-            self.proxy_user_ports
-                .write()
-                .await
-                .insert(config.name.clone(), (user.to_string(), ports_used));
         }
 
         // 3. 先写入 map 声明代理名，启动失败则回滚
@@ -917,7 +916,7 @@ impl ServerProxyManager {
         if let Err(e) = self.start_proxy(config).await {
             let mut proxies = self.proxies.write().await;
             proxies.remove(&config.name);
-            if quota_tracked {
+            if ports_used > 0 && self.max_ports_per_user.is_some() {
                 self.release_user_quota(&config.name).await;
             }
             log::error!(

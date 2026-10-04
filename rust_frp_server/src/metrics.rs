@@ -158,7 +158,7 @@ impl MonitorMetrics {
         let stat = std::sync::Arc::new(ProxyStat::new(name, proxy_type, remote_port));
         self.proxy_stats
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(name.to_string(), stat.clone());
         stat
     }

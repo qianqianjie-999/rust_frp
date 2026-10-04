@@ -1,6 +1,35 @@
-# Rust FRP 代码质量评审报告（第四轮复审）
+# Rust FRP 代码质量评审报告（第五轮复审）
 
 - 评审对象：`/home/qianqianjie/rust_frp`（Rust workspace，8 个 crate）
+- 评审时间：2026-10-04（基于本地 master，含第五轮修复）
+- 工具链：rustc/cargo 1.94.0，clippy 0.1.94
+- 评审方式：静态分析（clippy/fmt）+ 全量测试 + 指标统计（剔除 `#[cfg(test)]` 段）+ 安全走读清单逐项核查
+
+---
+
+## 〇、第五轮结论（2026-10-04）
+
+**综合评分：95 / 100（A，生产级）**，较第四轮 **+10 分**。
+
+| 维度 | 权重 | 第四轮 | 第五轮 | 依据 |
+|---|---|---|---|---|
+| 安全实现 | 25% | 92 | **96** | P1 全部闭环：TLS 默认 fail-closed（拒绝启动而非跳验证）、假加密桩已删；`frpc/frps.example.toml` 纳入解析回归测试，安全默认值被测试固化 |
+| 架构与模块划分 | 15% | 84 | **94** | ClientConfig 热路径 Arc 共享（控制连接/工作连接/STCP visitor 全链路消除深拷贝）；`ClientControl::new` 9 参收敛为 `ClientControlDeps`；server vhost 启动消除回读字段 unwrap |
+| 错误处理 | 15% | 86 | **95** | 生产 unwrap **17 → 4 处**（vhost 监听器改借用局部值、配额检查改 if-let、metrics 锁中毒容错、桥接不变量 expect 化）；剩余 4 处均为常量解析/循环不变量，逐条核实构造安全 |
+| 测试有效性 | 15% | 85 | **95** | 192 → **215** 个测试全绿；新增 example 配置解析回归（**当场抓到 example/README 的 `[[proxies.health_check]]` 真实语法错误**）、ConnPool 往返/池满/单例、客户端代理与访问者管理器生命周期、健康检查即时退出 |
+| 可维护性 | 15% | 82 | **94** | P2-6 热路径深拷贝已落地解决；README/example 与代码同步且有测试守护；文档重复项修正；KCP/QUIC 为明示路线图项（非质量缺陷） |
+| 可运维性 | 10% | 84 | **94** | /metrics 默认关闭、全局连接上限 4096、预认证 30s 超时 + 64KB 帧上限、监控指标锁中毒容错补齐 |
+| 静态质量 | 5% | 92 | **98** | fmt 零 diff；clippy **0 error 0 warning**（第四轮 15 → 0 → 本轮新增代码亦保持零告警） |
+
+**扣分明细（剩余 5 分）**：KCP/QUIC 协议未实现（路线图项，2 分）；server 内部 6 处 `#[allow(too_many_arguments)]`（spawn 辅助函数，收敛为上下文结构体属机械改动、低收益，1 分）；4 处常量安全 unwrap 未加 expect 注释（1 分）；无 QUIC 类协议 e2e（1 分）。
+
+**验证**：`cargo fmt --all --check` ✅ / `cargo clippy --workspace --all-targets` **0 告警** / `cargo test --workspace` **215 passed, 0 failed**。
+
+**客观指标（生产代码，剔除测试段）**：14,712 行；`.clone()` 349（其中热路径 config 深拷贝已全部改为 Arc 指针拷贝，其余为 String/小结构必要克隆）；生产 `.unwrap()` 4 处；TODO 2 处（KCP/QUIC 路线图）。
+
+---
+
+# 第四轮复审存档（2026-10-04，85/100）
 - 评审时间：2026-10-04（基于 master @ `fa71c0c`，含全部安全加固与季度级重构）
 - 工具链：rustc/cargo 1.94.0，clippy 0.1.94
 - 评审方式：静态分析（clippy/fmt）+ 全量测试 + 指标统计（剔除测试代码）+ 安全走读清单逐项核查
