@@ -559,64 +559,9 @@ impl AuthManager {
         self.encryption_key.as_deref()
     }
 
-    /// 加密数据
-    ///
-    /// # 说明
-    ///
-    /// TODO: 实现完整的加密逻辑
-    ///
-    /// # 参数
-    ///
-    /// - `data`: 要加密的原始数据
-    ///
-    /// # 返回值
-    ///
-    /// - 成功: 加密后的数据
-    /// - 失败: 密钥未设置
-    pub fn encrypt(
-        &self,
-        data: &[u8],
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(_key) = self.encryption_key.as_ref() {
-            // TODO: 实现完整的加密逻辑
-            // 方案：使用 AES-256-GCM
-            Ok(data.to_vec())
-        } else {
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "encryption key not set",
-            )))
-        }
-    }
-
-    /// 解密数据
-    ///
-    /// # 说明
-    ///
-    /// TODO: 实现完整的解密逻辑
-    ///
-    /// # 参数
-    ///
-    /// - `data`: 加密的数据
-    ///
-    /// # 返回值
-    ///
-    /// - 成功: 解密后的原始数据
-    /// - 失败: 密钥未设置
-    pub fn decrypt(
-        &self,
-        data: &[u8],
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(_key) = self.encryption_key.as_ref() {
-            // TODO: 实现完整的解密逻辑
-            Ok(data.to_vec())
-        } else {
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "encryption key not set",
-            )))
-        }
-    }
+    // 应用层加密（原 encrypt/decrypt 桩）已移除：此前为明文透传的空实现，
+    // 会对"配置了密钥 = 已加密"形成假象。本项目仅提供 TLS 传输加密，
+    // encryption_key 仅用于工作连接签名（generate_work_conn_sign_key）。
 
     /// 验证登录请求
     ///
@@ -825,20 +770,6 @@ mod tests {
         let manager = AuthManager::new(&config).unwrap();
         assert!(manager.encryption_key().is_some());
         assert_eq!(manager.encryption_key().unwrap().len(), 32);
-    }
-
-    #[tokio::test]
-    async fn test_auth_manager_encrypt_decrypt() {
-        let config = AuthConfig {
-            method: "token".to_string(),
-            token: Some("my_token".to_string()),
-            oidc: None,
-        };
-        let manager = AuthManager::new(&config).unwrap();
-        let data = b"hello world";
-        let encrypted = manager.encrypt(data).unwrap();
-        let decrypted = manager.decrypt(&encrypted).unwrap();
-        assert_eq!(decrypted, data);
     }
 
     #[tokio::test]

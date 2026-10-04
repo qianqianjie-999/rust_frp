@@ -533,34 +533,41 @@ impl VisitorManager for ClientVisitorManager {
 /// 构建客户端 TLS 配置（供控制连接与工作连接复用）
 ///
 /// - 配置了 `trusted_ca_file` → 使用 CA 证书验证（推荐）
-/// - 未配置 `trusted_ca_file` → 跳过证书验证
+/// - `trusted_ca_file` 已配置 → 用该 CA 验证服务器证书
+/// - `trusted_ca_file` 未配置且 `skip_verify = true` → 跳过证书验证（仅加密，不认证）
+/// - `trusted_ca_file` 未配置且 `skip_verify = false`（默认）→ **报错拒绝启动**（fail-closed），
+///   避免在用户不知情时静默退化为"只加密不认证"
 ///
 /// # ⚠️ 安全提示
 ///
-/// 「未配置 CA 即跳过校验」与仓库内置的自签名证书/私钥叠加后，TLS 只提供
-/// **加密**而不提供**身份认证**：任何拿到仓库内置私钥的人都可以冒充服务端。
+/// `skip_verify = true` 意味着任何中间人都可以冒充服务端，仅应在测试环境使用。
 /// 生产环境请务必配置 `transport.tls.trusted_ca_file`，并在服务端换用自建证书。
 fn build_client_tls_config(
     config: &rust_frp_config::ClientConfig,
 ) -> Result<Option<TlsConfig>, Box<dyn std::error::Error>> {
-    Ok(if let Some(tls) = &config.transport.tls {
-        if tls.enable {
-            if let Some(ref ca_file) = tls.trusted_ca_file {
-                Some(TlsConfig::new_client_with_ca_file(ca_file)?)
-            } else {
-                log::warn!(
-                    "TLS is enabled but transport.tls.trusted_ca_file is not set: \
-                     the server certificate will NOT be verified. This provides encryption \
-                     only, NOT authentication. Set trusted_ca_file to pin the server CA."
-                );
-                Some(TlsConfig::new_client_insecure()?)
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    })
+    let Some(tls) = &config.transport.tls else {
+        return Ok(None);
+    };
+    if !tls.enable {
+        return Ok(None);
+    }
+    if let Some(ref ca_file) = tls.trusted_ca_file {
+        return Ok(Some(TlsConfig::new_client_with_ca_file(ca_file)?));
+    }
+    if tls.skip_verify {
+        log::warn!(
+            "TLS enabled with transport.tls.skip_verify = true: the server certificate \
+             will NOT be verified. This provides encryption only, NOT authentication."
+        );
+        return Ok(Some(TlsConfig::new_client_insecure()?));
+    }
+    Err(
+        "TLS is enabled but transport.tls.trusted_ca_file is not set and \
+         transport.tls.skip_verify is false: refusing to connect with unverified server \
+         certificate (fail-closed). Set trusted_ca_file to pin the server CA, or set \
+         skip_verify = true to explicitly accept the risk (encryption only, no authentication)."
+            .into(),
+    )
 }
 
 /// 计算服务器工作连接端口（frps.toml 的 work_conn_port，默认 server_port + 1000）
@@ -696,6 +703,8 @@ pub struct ClientControl {
 }
 
 impl ClientControl {
+    // 参数收敛为上下文结构体属结构性重构，另行立项（评审 P2 备注）
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conn: ControlConn,
         run_id: String,
@@ -2236,19 +2245,69 @@ impl Client {
     }
 }
 
-impl Clone for Client {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            control: None,
-            proxy_manager: self.proxy_manager.clone(),
-            visitor_manager: self.visitor_manager.clone(),
-            auth_manager: self.auth_manager.clone(),
-            work_conn_manager: self.work_conn_manager.clone(),
-            connector: Connector::new(self.config.clone()).unwrap(),
-            web_server: None,
-            config_path: self.config_path.clone(),
-            health_check_handles: Vec::new(),
-        }
+// 注意：Client 不实现 Clone——Connector::new 依赖配置构造 TLS 连接管理器，可能失败，
+// 而 Clone 无法传播错误（旧实现里 unwrap 会 panic）。全仓库也没有克隆 Client 的需求。
+
+#[cfg(test)]
+mod tls_config_tests {
+    use super::*;
+    use rust_frp_config::{ClientConfig, TlsConfig};
+
+    fn config_with_tls(tls: TlsConfig) -> ClientConfig {
+        let mut c = ClientConfig::default();
+        c.transport.tls = Some(tls);
+        c
+    }
+
+    /// TLS 关闭 → 不建 TLS 配置
+    #[test]
+    fn test_tls_disabled_returns_none() {
+        let cfg = config_with_tls(TlsConfig {
+            enable: false,
+            ..TlsConfig::default()
+        });
+        assert!(build_client_tls_config(&cfg).unwrap().is_none());
+    }
+
+    /// 配置了 trusted_ca_file → CA 验证模式
+    #[test]
+    fn test_tls_with_ca_file() {
+        let cfg = config_with_tls(TlsConfig {
+            enable: true,
+            trusted_ca_file: Some("/nonexistent/ca.crt".to_string()),
+            ..TlsConfig::default()
+        });
+        // CA 文件不存在时返回 Err（读文件失败），但绝不能静默退化为 insecure
+        let r = build_client_tls_config(&cfg);
+        assert!(r.is_err(), "missing CA file must not fall back to insecure");
+    }
+
+    /// skip_verify = true → 显式跳过（insecure）
+    #[test]
+    fn test_tls_skip_verify_explicit() {
+        let cfg = config_with_tls(TlsConfig {
+            enable: true,
+            skip_verify: true,
+            ..TlsConfig::default()
+        });
+        assert!(build_client_tls_config(&cfg).unwrap().is_some());
+    }
+
+    /// 默认（无 CA、skip_verify = false）→ fail-closed 拒绝启动
+    #[test]
+    fn test_tls_default_fail_closed() {
+        let cfg = config_with_tls(TlsConfig {
+            enable: true,
+            ..TlsConfig::default()
+        });
+        let err = match build_client_tls_config(&cfg) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("default TLS config must be rejected (fail-closed)"),
+        };
+        assert!(
+            err.contains("fail-closed") || err.contains("skip_verify"),
+            "{}",
+            err
+        );
     }
 }

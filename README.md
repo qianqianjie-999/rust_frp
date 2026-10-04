@@ -53,7 +53,8 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 事项 | 现状 | 建议 |
 |------|------|------|
 | 运行时自签证书 | 服务端未配置证书时，启动时在**内存中生成**自签证书（不落盘、不入库，每次启动更换），只能加密、**不能认证服务端身份** | 生产环境用 `transport.tls.cert_file/key_file` 指定自建证书；客户端配置 `trusted_ca_file` |
-| 客户端证书校验 | 未配置 `trusted_ca_file` 时**默认不校验服务端证书**（启动会打印 WARN） | 显式配置 `trusted_ca_file`，否则无法防范中间人攻击 |
+| 客户端证书校验 | **fail-closed**：配置了 TLS 但既无 `trusted_ca_file` 又未显式 `skip_verify = true` 时，客户端**拒绝启动**；`skip_verify = true` 为显式跳过（打印 WARN） | 生产环境配置 `trusted_ca_file`；自签名测试环境才用 `skip_verify = true` |
+| 应用层加密 | **不支持**（frp 的 `use_encryption` 特性未实现；仅提供 TLS 传输加密） | 依赖 TLS 即可，勿期待应用层加密字段生效 |
 | Dashboard 凭据 | `web_server.user/password` 必须成对配置且非空，否则服务端拒绝启动；未配置则鉴权关闭并告警 | 用强密码，只监听 `127.0.0.1` 并前置 Nginx 提供 HTTPS |
 | 会话机制 | 随机会话令牌 + 服务端存储 + 8 小时过期 + `HttpOnly; SameSite=Strict` | 反向代理声明 `X-Forwarded-Proto: https` 时会自动附加 `Secure` |
 | 配置文件 | `frpc.toml` / `frps.toml` 已被 `.gitignore` 忽略，仅提供 `*.example.toml` | 不要把含 token/密码的配置提交进版本库 |
@@ -397,9 +398,9 @@ token = "your_secure_token"
 [transport]
 protocol = "tcp"
 bandwidth_limit = "10MB"  # 全局带宽限制
-tls = { enable = true }  # 默认已启用，与原版 frp 行为一致：默认跳过证书验证
+tls = { enable = true, skip_verify = true }  # 自签名环境：显式跳过证书验证（默认 skip_verify = false 时未配 CA 会拒绝启动）
 
-# 可选：配置自定义 CA 证书进行验证（防止中间人攻击）
+# 可选：配置自定义 CA 证书进行验证（防止中间人攻击，生产推荐）
 # tls = { enable = true, trusted_ca_file = "/path/to/ca.crt" }
 
 # HTTP 代理
@@ -929,10 +930,11 @@ process_work_conn          get_work_conn (访客到达时)
   - 配置用户名密码认证
   - 通过 Nginx 反向代理提供 HTTPS 访问
   - 不要直接暴露在公网
-- **TLS 证书验证**：
-  - 默认模式：客户端**跳过证书验证**（与原版 frp 行为一致），开箱即用，无需额外配置
-  - 自定义 CA 验证模式（`trusted_ca_file = "/path/to/ca.crt"`）：使用自定义 CA 证书验证服务器证书，可有效防止中间人攻击
-  - **安全建议**：公网生产环境建议配置 `trusted_ca_file` 使用自签名证书验证，内网环境可使用默认配置
+- **TLS 证书验证**（fail-closed 设计）：
+  - 配置了 TLS 但既无 `trusted_ca_file` 又未显式 `skip_verify = true` 时，客户端**拒绝启动**
+  - 自定义 CA 验证模式（`trusted_ca_file = "/path/to/ca.crt"`）：使用自定义 CA 证书验证服务器证书，可有效防止中间人攻击（生产推荐）
+  - 显式跳过模式（`skip_verify = true`）：仅加密、不认证，任何中间人可冒充服务端，仅限测试环境
+  - **安全建议**：公网生产环境配置 `trusted_ca_file` 使用自签名证书验证
 - **Token 认证**：所有连接必须通过 token 验证，即使绕过 TLS 证书验证，攻击者也无法通过认证
 
 ---
