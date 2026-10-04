@@ -137,6 +137,11 @@ pub struct Server {
 }
 
 impl Server {
+    /// 只读访问服务端配置（管理端 API 构造 serverinfo 用）
+    pub(crate) fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
     /// 打包共享管理器集合（全部为 Arc 克隆，代价 O(1)）
     pub(crate) fn managers(&self) -> ServerManagers {
         ServerManagers {

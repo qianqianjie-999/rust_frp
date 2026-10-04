@@ -209,10 +209,61 @@ fn create_routes(
 
     let app = axum::Router::new()
         .route("/health", axum::routing::get(health_handler))
+        .route("/healthz", axum::routing::get(health_handler))
         .merge(metrics_routes)
         .route("/api/metrics", axum::routing::get(metrics_handler))
         .route("/api/controllers", axum::routing::get(controllers_handler))
-        .route("/api/proxies", axum::routing::get(proxies_handler))
+        // 管理端 API（v1，对齐原版 frps server/api_router.go）
+        .route("/api/serverinfo", axum::routing::get(serverinfo_handler))
+        .route("/api/clients", axum::routing::get(clients_handler))
+        .route(
+            "/api/clients/:key",
+            axum::routing::get(client_detail_handler),
+        )
+        .route(
+            "/api/proxy/:type",
+            axum::routing::get(proxy_by_type_handler),
+        )
+        .route(
+            "/api/proxy/:type/:name",
+            axum::routing::get(proxy_by_type_and_name_handler),
+        )
+        .route(
+            "/api/proxies",
+            axum::routing::get(proxies_handler).delete(delete_proxies_handler),
+        )
+        .route(
+            "/api/proxies/:name",
+            axum::routing::get(proxy_by_name_handler),
+        )
+        .route(
+            "/api/traffic/:name",
+            axum::routing::get(proxy_traffic_handler),
+        )
+        // 管理端 API（v2，统一 {code,msg,data} 信封）
+        .route("/api/v2/users", axum::routing::get(v2_users_handler))
+        .route(
+            "/api/v2/system/info",
+            axum::routing::get(v2_system_info_handler),
+        )
+        .route(
+            "/api/v2/system/prune",
+            axum::routing::post(v2_system_prune_handler),
+        )
+        .route("/api/v2/clients", axum::routing::get(v2_clients_handler))
+        .route(
+            "/api/v2/clients/:key",
+            axum::routing::get(v2_client_detail_handler),
+        )
+        .route("/api/v2/proxies", axum::routing::get(v2_proxies_handler))
+        .route(
+            "/api/v2/proxies/:name",
+            axum::routing::get(v2_proxy_detail_handler),
+        )
+        .route(
+            "/api/v2/proxies/:name/traffic",
+            axum::routing::get(v2_proxy_traffic_handler),
+        )
         .route("/", axum::routing::get(index_handler))
         .route("/index.html", axum::routing::get(index_handler))
         .route("/login", axum::routing::get(login_handler))
@@ -235,6 +286,7 @@ fn create_routes(
                     // /metrics 仅在 expose_metrics 开启时存在且免鉴权（P1-4）。
                     if path == "/login"
                         || path == "/health"
+                        || path == "/healthz"
                         || (expose_metrics && path == "/metrics")
                     {
                         return next.run(request).await;

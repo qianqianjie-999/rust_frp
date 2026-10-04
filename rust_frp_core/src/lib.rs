@@ -908,6 +908,15 @@ pub trait ProxyManager {
         self.add_proxy(config).await
     }
 
+    /// 查询已注册代理的配置
+    ///
+    /// 供服务端管理端 API 构造离线代理历史/统计视图使用；
+    /// 默认返回 `None`（客户端实现无需感知）。
+    async fn get_proxy_config(&self, name: &str) -> Option<rust_frp_config::ProxyConfig> {
+        let _ = name;
+        None
+    }
+
     /// 移除代理
     ///
     /// # 参数
