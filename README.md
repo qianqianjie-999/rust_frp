@@ -21,7 +21,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **环境变量**：配置文件支持 `${VAR_NAME}` 环境变量替换
 - **多格式配置**：支持 TOML、YAML、JSON 配置格式；**兼容原版 frp 的 camelCase 字段名**（`serverAddr`/`localIP`/`bindPort` 等可直接使用），原版配置文件可直接复用；无法识别的字段（如原版 `log.to`）加载时打印 WARN 但不拒绝启动
 - **优雅关闭**：客户端 SIGINT/SIGTERM 优雅退出；服务端 SIGINT/SIGTERM 停止接收新连接并按 10s 上限排空存量连接（不再硬 `exit(0)`）
-- **OIDC 认证**：支持 OpenID Connect 认证，集成企业身份系统
+- **OIDC 认证**：服务端拉取 issuer 的 Discovery + JWKS 并校验 RS256/ES256 签名（拒绝 `none`/`HS*`，防算法混淆）；客户端支持 `client_credentials` 换取访问令牌
 - **配置热重载**：支持 SIGHUP 信号、文件监听、API 触发三种方式重载配置
 - **应用层压缩**：per-proxy `use_compression`，工作连接 snappy 压缩（对齐原版语义）
 - **服务端 HTTP 插件**：`[[http_plugins]]` 配置外部 HTTP 服务，在 Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn 六类事件回调，支持拒绝（reject）与内容覆写（unchange）
@@ -47,7 +47,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | tcpmux 代理 | ✅ | HTTP CONNECT 复用：服务器在 `tcpmux_http_connect_port` 单端口按域名（+ 可选 `route_by_http_user` / `http_user` / `http_password`）路由，多个 tcpmux 代理共享同一端口 |
 | sudp 代理 | ✅ | 安全 UDP：经 STCP 隧道承载 UDP 报文（`secret_key` 签名校验与 STCP 一致），代理端/访问端各自监听本地 UDP |
 | 服务端 HTTP 插件 | ✅ | `[[http_plugins]]`：六类事件回调（Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn），支持 `reject` 拒绝 + `unchange` 覆写；https 地址可用 `tls_verify` 控制证书校验 |
-| OIDC 认证 | ✅ | 支持 HS256 JWT 验证 |
+| OIDC 认证 | ✅ | 服务端：issuer Discovery + JWKS 拉取 + RS256/ES256 验签（按 `kid` 选钥、支持密钥轮转）；客户端：`client_credentials` 换取 `access_token` |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
@@ -429,16 +429,16 @@ pool_count = 10
 # method = "token"
 # token = "your_secure_token"
 
-# 认证配置 - OIDC 方式
+# 认证配置 - OIDC 方式（服务端只验签，不需要 client_secret）
 [auth]
 method = "oidc"
 
 [auth.oidc]
-issuer = "https://your-oidc-provider.com"
-audience = "frp-server"
-client_id = "your-client-id"
-client_secret = "your-client-secret"
-token_endpoint_url = "https://your-oidc-provider.com/token"
+issuer = "https://your-oidc-provider.com"   # 必填
+audience = "frp-server"                      # 为空则跳过 aud 校验
+skipExpiryCheck = false
+skipIssuerCheck = false
+# trustedCaFile = "/etc/ssl/idp-ca.pem"      # IdP 使用私有 CA 时
 ```
 
 ---
@@ -969,21 +969,30 @@ pub struct KcpListener {
 
 ### OIDC 认证
 
-**JWT 验证流程**：
+**服务端验签流程**（`rust_frp_auth::OidcAuthVerifier`）：
 
 ```text
-1. 客户端从 OIDC Provider 获取 ID Token
-2. 登录时发送 LoginMsg { token: "<id_token>" }
-3. 服务端 OidcAuthVerifier.verify_token():
-   a. 解析 JWT 三部分（header.payload.signature）
-   b. 使用 HMAC-SHA256（HS256）验证签名
-   c. 验证 issuer (iss claim)
-   d. 验证 audience (aud claim)  
-   e. 验证过期时间 (exp claim)
-4. 验证通过后允许登录
+1. 客户端携带令牌登录：LoginMsg { token: "<access_token / id_token>" }
+2. frps 首次校验时拉取 Discovery：
+     GET {issuer}/.well-known/openid-configuration → jwks_uri
+   （并比对文档声明的 issuer 与配置一致）
+3. GET {jwks_uri} 取 JWKS，按 JWT header 的 kid 选公钥
+   （缓存 1 小时；遇到未知 kid 立即刷新，支持 IdP 轮转签名密钥）
+4. 用 ring 验签：RS256（RSA PKCS#1 v1.5 + SHA-256）或 ES256（P-256 + SHA-256）
+5. 校验 iss / aud / exp / nbf（skipIssuerCheck / skipExpiryCheck 可跳过）
+6. 通过后记录 subject；工作连接复核 subject 必须与登录一致
 ```
 
-**支持的 JWT 算法**：HS256（HMAC-SHA256），使用 `client_secret` 作为对称密钥
+**安全要点**：**只接受非对称签名（RS256 / ES256）**，显式拒绝 `none` 与 `HS*`——
+否则攻击者把 `alg` 改成 `HS256`、拿公开的 RSA 公钥当 HMAC 密钥即可伪造令牌。
+
+**客户端取令牌**（`rust_frp_auth::OidcClientCredentials`）：以 `client_credentials`
+向 `token_endpoint_url` 发起 `POST`（`grant_type=client_credentials` + `client_id`
++ `client_secret`，可选 `audience` / `scope` / `additionalEndpointParams`），
+把返回的 `access_token` 作为登录令牌；每次登录/重连都会重新获取。
+
+**已知限制**：尚未实现 `auth.additionalScopes`（原版会在心跳 / 新工作连接上
+追加刷新令牌）；工作连接的认证依赖服务端签发的 `run_id` 会话绑定。
 
 ### 配置热重载
 

@@ -1090,6 +1090,7 @@ dependencies = [
  "log",
  "ring 0.16.20",
  "rust_frp_config",
+ "rust_frp_net",
  "rust_frp_util",
  "serde",
  "serde_json",

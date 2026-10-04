@@ -748,6 +748,9 @@ pub mod pool;
 pub mod compress;
 pub mod crypto;
 
+/// 极简 HTTP/1.1 客户端（OIDC 拉取 issuer/JWKS/token、插件回调共用）
+pub mod http;
+
 // 重新导出连接池类型
 
 /// KCP 协议的输出适配器，将 KCP 输出通过 channel 传递给异步 UDP 写任务

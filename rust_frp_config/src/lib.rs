@@ -460,13 +460,27 @@ impl Default for AuthConfig {
 /// # 说明
 ///
 /// OIDC 是一种基于 OAuth 2.0 的身份认证协议，适用于企业 SSO 场景。
+/// 客户端与服务端共用同一结构：服务端用 `issuer`（发现 + JWKS 验签），
+/// 客户端用 `client_id` / `client_secret` / `token_endpoint_url`（取令牌）。
+///
+/// # 服务端（`issuer` 侧）
+///
+/// - `issuer`：用于拉取 `{issuer}/.well-known/openid-configuration` 并比对 `iss` 声明
+/// - `audience`：为空时跳过 `aud` 校验
+/// - `skip_issuer_check` / `skip_expiry_check`：分别跳过 `iss` / `exp` 校验
+///
+/// # 客户端（取令牌侧）
+///
+/// - `client_id` / `client_secret`：`client_credentials` 凭据
+/// - `token_endpoint_url`：令牌端点
+/// - `scope` / `additional_endpoint_params`：附加的授权范围与端点参数
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct OidcConfig {
-    /// 发行者 URL
+    /// 发行者 URL（服务端必填；客户端可选，仅用于比对 `iss`）
     pub issuer: String,
 
-    /// 受众
+    /// 受众（token 的 `aud` 声明；为空时服务端跳过校验）
     pub audience: String,
 
     /// OAuth 客户端 ID
@@ -480,6 +494,29 @@ pub struct OidcConfig {
     /// Token 端点 URL
     #[serde(alias = "tokenEndpointURL")]
     pub token_endpoint_url: String,
+
+    /// 请求令牌时申请的授权范围（`scope`）
+    pub scope: String,
+
+    /// 请求令牌时附加的端点参数（如 `resource`、`audience`）
+    #[serde(alias = "additionalEndpointParams")]
+    pub additional_endpoint_params: std::collections::HashMap<String, String>,
+
+    /// 校验 OIDC 端点 TLS 证书所用的根 CA 文件
+    #[serde(alias = "trustedCaFile")]
+    pub trusted_ca_file: String,
+
+    /// 是否跳过 OIDC 端点的证书校验（**仅调试用**）
+    #[serde(alias = "insecureSkipVerify")]
+    pub insecure_skip_verify: bool,
+
+    /// 服务端：是否跳过 token 过期时间（`exp`）校验
+    #[serde(alias = "skipExpiryCheck")]
+    pub skip_expiry_check: bool,
+
+    /// 服务端：是否跳过 token 发行者（`iss`）校验
+    #[serde(alias = "skipIssuerCheck")]
+    pub skip_issuer_check: bool,
 }
 
 /// 传输层配置 - 定义网络传输相关选项
@@ -1565,7 +1602,52 @@ impl ConfigLoader {
             }
         }
 
+        // OIDC：服务端必须配置 issuer —— 它是发现文档与 JWKS 的入口，
+        // 缺失会导致「配了 oidc 却无法验签」。鉴权方法本身也要合法。
+        match config.auth.method.as_str() {
+            "token" => {}
+            "oidc" => {
+                let Some(oidc) = config.auth.oidc.as_ref() else {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "auth.oidc is required when auth.method = \"oidc\"",
+                    )));
+                };
+                if oidc.issuer.trim().is_empty() {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "auth.oidc.issuer is required for server-side OIDC token verification",
+                    )));
+                }
+            }
+            other => {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsupported auth.method: {other} (expected \"token\" or \"oidc\")"),
+                )));
+            }
+        }
+
         Ok(())
+    }
+
+    /// 校验一个绝对的 http/https URL（含非空 host）
+    fn validate_absolute_http_url(
+        value: &str,
+        field: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for scheme in ["http://", "https://"] {
+            if let Some(rest) = value.strip_prefix(scheme) {
+                let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+                if !host.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{field} = \"{value}\" must be an absolute http or https URL"),
+        )))
     }
 
     /// 校验带宽限制字符串
@@ -1668,6 +1750,51 @@ impl ConfigLoader {
                         ),
                     )));
                 }
+            }
+        }
+
+        // OIDC 客户端：client_credentials 需要 client_id 与绝对 http(s) 的令牌端点。
+        match config.auth.method.as_str() {
+            "token" => {}
+            "oidc" => {
+                let Some(oidc) = config.auth.oidc.as_ref() else {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "auth.oidc is required when auth.method = \"oidc\"",
+                    )));
+                };
+                if oidc.client_id.trim().is_empty() {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "auth.oidc.client_id is required for OIDC client credentials",
+                    )));
+                }
+                Self::validate_absolute_http_url(
+                    oidc.token_endpoint_url.trim(),
+                    "auth.oidc.token_endpoint_url",
+                )?;
+                if oidc.additional_endpoint_params.contains_key("scope") {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "auth.oidc.additional_endpoint_params.scope is not allowed; \
+                         use auth.oidc.scope instead",
+                    )));
+                }
+                if !oidc.audience.is_empty()
+                    && oidc.additional_endpoint_params.contains_key("audience")
+                {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "cannot specify both auth.oidc.audience and \
+                         auth.oidc.additional_endpoint_params.audience",
+                    )));
+                }
+            }
+            other => {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsupported auth.method: {other} (expected \"token\" or \"oidc\")"),
+                )));
             }
         }
 
@@ -2105,6 +2232,192 @@ ops = ["Login", "NotAnOp"]
         assert!(
             err.to_string().contains("unknown op"),
             "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 服务端 [[http_plugins]]（canonical snake_case）同样可解析，
+    /// 且不得被未知字段检查误报（compat 已知键集回归）。
+    #[test]
+    fn test_snake_case_http_plugins_config_parses() {
+        let path = write_temp_config(
+            "frps_plugins_snake",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[[http_plugins]]
+name = "local"
+addr = "http://127.0.0.1:9100"
+ops = ["Login"]
+
+[webServer]
+port = 7500
+user = "admin"
+password = "pw"
+"#,
+        );
+        let config = ConfigLoader::load_server_config(&path).expect("http_plugins must parse");
+        assert_eq!(config.http_plugins.len(), 1);
+        assert_eq!(config.http_plugins[0].name, "local");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 客户端 OIDC：原版 camelCase 字段（clientID/clientSecret/tokenEndpointURL）
+    /// 与新增字段（scope/additionalEndpointParams/trustedCaFile/insecureSkipVerify）
+    /// 必须全部正确落到配置结构。
+    #[test]
+    fn test_upstream_oidc_client_config_parses() {
+        let path = write_temp_config(
+            "frpc_oidc",
+            r#"
+serverAddr = "203.0.113.10"
+serverPort = 7000
+
+[auth]
+method = "oidc"
+
+[auth.oidc]
+issuer = "https://idp.example.com"
+audience = "frp-server"
+clientID = "frp-client"
+clientSecret = "s3cret"
+tokenEndpointURL = "https://idp.example.com/token"
+scope = "openid profile"
+trustedCaFile = "/etc/ssl/idp-ca.pem"
+insecureSkipVerify = true
+
+[auth.oidc.additionalEndpointParams]
+resource = "https://api.example.com"
+"#,
+        );
+        let config = ConfigLoader::load_client_config(&path).expect("oidc config must parse");
+        let oidc = config.auth.oidc.as_ref().expect("oidc present");
+        assert_eq!(config.auth.method, "oidc");
+        assert_eq!(oidc.client_id, "frp-client");
+        assert_eq!(oidc.client_secret, "s3cret");
+        assert_eq!(oidc.token_endpoint_url, "https://idp.example.com/token");
+        assert_eq!(oidc.scope, "openid profile");
+        assert_eq!(oidc.trusted_ca_file, "/etc/ssl/idp-ca.pem");
+        assert!(oidc.insecure_skip_verify);
+        assert_eq!(
+            oidc.additional_endpoint_params
+                .get("resource")
+                .map(String::as_str),
+            Some("https://api.example.com")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 服务端 OIDC：必须配置 issuer，否则启动即失败；配了则解析出 skip* 开关。
+    #[test]
+    fn test_server_oidc_requires_issuer() {
+        let path = write_temp_config(
+            "frps_oidc_missing_issuer",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[auth]
+method = "oidc"
+
+[auth.oidc]
+audience = "frp-server"
+"#,
+        );
+        let err = ConfigLoader::load_server_config(&path).unwrap_err();
+        assert!(err.to_string().contains("issuer"), "unexpected: {err}");
+        let _ = std::fs::remove_file(&path);
+
+        let path = write_temp_config(
+            "frps_oidc_no_config",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[auth]
+method = "oidc"
+"#,
+        );
+        let err = ConfigLoader::load_server_config(&path).unwrap_err();
+        assert!(err.to_string().contains("auth.oidc"), "unexpected: {err}");
+        let _ = std::fs::remove_file(&path);
+
+        let path = write_temp_config(
+            "frps_oidc_ok",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[auth]
+method = "oidc"
+
+[auth.oidc]
+issuer = "https://idp.example.com"
+audience = "frp-server"
+skipExpiryCheck = true
+skipIssuerCheck = false
+"#,
+        );
+        let config = ConfigLoader::load_server_config(&path).expect("server oidc must parse");
+        let oidc = config.auth.oidc.expect("oidc present");
+        assert_eq!(oidc.issuer, "https://idp.example.com");
+        assert!(oidc.skip_expiry_check);
+        assert!(!oidc.skip_issuer_check);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 客户端 OIDC 的非法配置必须被拒绝：缺 client_id、端点 URL 非绝对 http(s)、
+    /// 以及 additionalEndpointParams 里塞 scope。
+    #[test]
+    fn test_client_oidc_validation_errors() {
+        let cases = [
+            (
+                "frpc_oidc_no_client",
+                "[auth.oidc]\ntokenEndpointURL = \"https://idp.example.com/token\"\n",
+                "client_id",
+            ),
+            (
+                "frpc_oidc_bad_url",
+                "[auth.oidc]\nclientID = \"c\"\ntokenEndpointURL = \"idp.example.com/token\"\n",
+                "absolute http",
+            ),
+            (
+                "frpc_oidc_scope_param",
+                "[auth.oidc]\nclientID = \"c\"\ntokenEndpointURL = \"https://idp.example.com/token\"\n\
+                 \n[auth.oidc.additionalEndpointParams]\nscope = \"openid\"\n",
+                "additional_endpoint_params.scope",
+            ),
+        ];
+        for (name, tail, needle) in cases {
+            let content = format!("serverAddr = \"1.2.3.4\"\nserverPort = 7000\n\n[auth]\nmethod = \"oidc\"\n\n{tail}");
+            let path = write_temp_config(name, &content);
+            let err = ConfigLoader::load_client_config(&path).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "case {name}: expected {needle:?}, got {err}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// 未知的 auth.method 必须被拒绝（避免「配了个不认识的方法却静默放行」）。
+    #[test]
+    fn test_unsupported_auth_method_rejected() {
+        let path = write_temp_config(
+            "frps_bad_auth",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[auth]
+method = "ldap"
+"#,
+        );
+        let err = ConfigLoader::load_server_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported auth.method"),
+            "unexpected: {err}"
         );
         let _ = std::fs::remove_file(&path);
     }

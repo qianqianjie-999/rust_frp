@@ -690,6 +690,7 @@ fn test_auth_config_oidc_method() {
             client_id: "my-client".to_string(),
             client_secret: "my-secret".to_string(),
             token_endpoint_url: "https://auth.example.com/token".to_string(),
+            ..Default::default()
         }),
     };
     assert_eq!(config.method, "oidc");
@@ -711,6 +712,7 @@ fn test_oidc_auth_manager_creation() {
             client_id: "my-client".to_string(),
             client_secret: "my-secret".to_string(),
             token_endpoint_url: "https://auth.example.com/token".to_string(),
+            ..Default::default()
         }),
     };
     let result = AuthManager::new(&config);
