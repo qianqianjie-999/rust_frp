@@ -29,7 +29,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~322 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 能力覆盖率 | **≈ 82%（60/73）** ｜ 数据面 **92%（24/26）**、控制/运维面 **77%（36/47）** | 100%（基线） | 见第二节 |
+| 能力覆盖率 | **≈ 85%（62/73）** ｜ 数据面 **92%（24/26）**、控制/运维面 **81%（38/47）** | 100%（基线） | 见第二节 |
 | 配置字段兼容 | ⚠️ 双向 alias 兼容，但**约 25+ 个原版字段未支持**（解析成功 + WARN） | camelCase + 严格模式 | 原版配置**可加载**但部分字段不生效 |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify / reload / status / stop / nathole / 每类代理与访客 / `--config_dir` | reload / status / stop / verify / nathole / 每类代理 | rust 已基本对齐 |
@@ -38,7 +38,7 @@
 
 **一句话结论**：rust_frp 的**数据面（data plane）已基本对齐**（代理类型、TLS/KCP/QUIC/WebSocket
 传输、应用层加密与压缩、STCP/XTCP 打洞、负载均衡、限速、连接池、热重载、优雅关闭全部可用）；
-**控制面/运维面（控制 API、CLI、插件覆盖面、认证扩展、配置字段）覆盖约 77%**，
+**控制面/运维面（控制 API、CLI、插件覆盖面、认证扩展、配置字段）覆盖约 81%**，
 缺口集中在「运维丰富度」与「少数生态特性」，而非「能不能用」。
 
 ---
@@ -51,21 +51,21 @@
 | 传输协议 | **5/5** | 100% | —（`wss` 已落地，见 五、传输与协议对照） |
 | 内部线协议 | **1/2** | 50% | wire protocol v2（魔数分帧 + AEAD + 能力协商） |
 | 数据面能力 | **10/11** | 91% | PROXY protocol v2（rust 仅 v1 布尔开关） |
-| 客户端插件 | **7/10** | 70% | `http2http`、`http2https`、`virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 仍仅支持 CONNECT） |
+| 客户端插件 | **9/10** | 90% | `virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 仍仅支持 CONNECT） |
 | 服务端插件 | **1/2** | 50% | tracer 链路追踪 |
 | 认证与安全 | **4/7** | 57% | `additionalScopes`、SSH 隧道网关、FeatureGate/`--allow-unsafe` |
 | frps 管理 API | **9/9** | 100% | —（v1 serverinfo/clients/按类型名称查询/流量 + v2 套件/分页/prune/users + DELETE offline 全部落地） |
 | frpc 管理 API | **3/5** | 60% | `/api/stop`、Store 源代理 CRUD |
 | CLI | **7/8** | 88% | `--strict_config`（rust 为 WARN 模式） |
 | 配置体系 | **4/6** | 67% | Store 配置源、FeatureGates |
-| **合计** | **60/73** | **≈82%** | — |
+| **合计** | **62/73** | **≈85%** | — |
 
 **分组小结**：
 
 | 分组 | 覆盖 | 说明 |
 |------|:----:|------|
 | 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **24/26（92%）** | 转发链路基本对齐 |
-| 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **36/47（77%）** | 剩余差距集中在插件/认证/配置字段 |
+| 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **38/47（81%）** | 剩余差距集中在个别插件/认证/配置字段 |
 
 > 计分口径：一项能力「确实可用且与原版等价（或更强）」记 1 分；缺失 / 仅占位 / 显著弱化 / 未强制记 0 分。
 
@@ -152,8 +152,8 @@
 | https2http | ✅（`TlsOffloadPlugin`） | ✅ | 等价 |
 | tls2raw | ✅（与 https2http 同实现） | ✅ | 等价 |
 | https2https | ✅（`TlsBridgePlugin`） | ✅ | 等价 |
-| **http2http** | ❌ | ✅ | 接受 h2c 访客 → 本地 HTTP/1.1 |
-| **http2https** | ❌ | ✅ | 接受 h2c 访客 → 本地 HTTPS |
+| **http2http** | ✅ | ✅ | 明文 HTTP 接入 → 解析并重写请求 → 本地 HTTP（`hostHeaderRewrite` + `requestHeaders.set`） |
+| **http2https** | ✅ | ✅ | 明文 HTTP 接入 → 本地 HTTPS（本地侧跳过证书校验，仅加密不认证） |
 | **virtual_net** | ❌ | ✅（配合 pkg/vnet） | 虚拟网络插件 |
 
 > ✅ **已修复**：`http_proxy` / `socks5` 的插件级认证**已强制**（凭据常量时间比较），
@@ -304,10 +304,14 @@
 | 17 | **wire protocol v2** | ❌ 线协议仍为 v1 等价实现 |
 
 ### P2 — 生态 / 增强项（非必需）
-`http2http`、`http2https`、`virtual_net`（vnet）、`pkg/sdk` 进程内嵌库、SSH 隧道网关、
+`virtual_net`（vnet）、`pkg/sdk` 进程内嵌库、SSH 隧道网关、
 Store 配置源 + StoreProxy CRUD、FeatureGates、`--strict_config`、端口保留（断线 24h）、
 PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start`、
 `udpPacketSize`、`metadatas` 之外的元数据、服务端带宽限制模式、legacy INI 配置。
+
+> ✅ 已落地（原 P2 项）：`http2http`、`http2https` 客户端插件 —— 明文 HTTP 接入，
+> 解析并重写请求后转发到本地 HTTP / HTTPS（支持 `hostHeaderRewrite` 与
+> `requestHeaders.set`；`Content-Length` / `chunked` 报文体、访客侧 keep-alive 复用）。
 
 ---
 
@@ -323,12 +327,13 @@ PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start
 1. ~~**`wss` 传输**~~ —— ✅ 已完成（复用 websocket+TLS 代码 + 服务端嗅探升级）。
 2. ~~**frps API 补齐**（serverinfo、按类型/名称查询、clients、DELETE offline）~~ —— ✅ 已完成（v1 + v2 套件、分页信封、离线历史）。
 3. ~~**frpc CLI 补齐**（`stop`、`--config_dir`）~~ —— ✅ 已完成（另含 `nathole discover`、9 类代理/3 类 visitor 快速启动、`--api-timeout`）。
-4. **`http2http` / `http2https` 插件** —— 引入 `h2`，自包含在插件 crate。
+4. ~~**`http2http` / `http2https` 插件**~~ —— ✅ 已完成（手写 HTTP/1.1 反代桥接，零新依赖）。
 5. **`http_proxy` 普通 HTTP 转发** —— 补齐与原版的最后一处插件语义差异。
 6. **wire protocol v2** —— 最大项，改线格式、回归风险高，建议放最后。
 
 > ✅ 已完成：`http_proxy` / `socks5` 插件级认证；`wss` 传输（原建议路线第 1 项）；
-> **frps 管理 API 补齐**（第 2 项）；**frpc CLI 补齐**（第 3 项）。
+> **frps 管理 API 补齐**（第 2 项）；**frpc CLI 补齐**（第 3 项）；
+> **`http2http` / `http2https` 插件**（第 4 项）。
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关、FeatureGates——
 属原版「生态扩展」，除非有明确场景，否则投入产出比低。

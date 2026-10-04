@@ -50,6 +50,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 应用层压缩 | ✅ | `use_compression`：工作连接 snappy 压缩（**需两端配置一致**；与 `use_encryption` 可叠加，顺序为先压缩后加密） |
 | tcpmux 代理 | ✅ | HTTP CONNECT 复用：服务器在 `tcpmux_http_connect_port` 单端口按域名（+ 可选 `route_by_http_user` / `http_user` / `http_password`）路由，多个 tcpmux 代理共享同一端口 |
 | sudp 代理 | ✅ | 安全 UDP：经 STCP 隧道承载 UDP 报文（`secret_key` 签名校验与 STCP 一致），代理端/访问端各自监听本地 UDP |
+| 客户端插件 | ✅ | `unix_domain_socket`、`static_file`（路径遍历防护）、`http_proxy`（仅 CONNECT）、`socks5`、`https2http`/`tls2raw`、`https2https`、`http2http`、`http2https`（Host 改写 + 请求头注入）；认证类凭据常量时间比较 |
 | 服务端 HTTP 插件 | ✅ | `[[http_plugins]]`：六类事件回调（Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn），支持 `reject` 拒绝 + `unchange` 覆写；https 地址可用 `tls_verify` 控制证书校验 |
 | 客户端插件认证 | ✅ | `http_proxy` 校验 `Proxy-Authorization: Basic`（失败 407）；`socks5` 按 RFC 1929 校验 `username`/`password`（失败回 `0x01/0x01`）；未配置凭据时为匿名 / 无认证（与原版一致） |
 | OIDC 认证 | ✅ | 服务端：issuer Discovery + JWKS 拉取 + RS256/ES256 验签（按 `kid` 选钥、支持密钥轮转）；客户端：`client_credentials` 换取 `access_token` |
@@ -63,8 +64,8 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 流量统计 | ✅ | 桥接结束累加双向字节：服务端 `/api/proxies`（`traffic_in/out`）+ Prometheus per-proxy 指标；客户端 `frpc status`（`traffic_down/up`） |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
-> **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 77%。尚未支持的主要项：
-> wire protocol v2、客户端插件 `http2http` / `http2https` / `virtual_net`
+> **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 81%。尚未支持的主要项：
+> wire protocol v2、客户端插件 `virtual_net`
 > （另：`http_proxy` 仅支持 `CONNECT` 隧道，普通 HTTP 转发未实现）、服务端 tracer、
 > `auth.additionalScopes`、SSH 隧道网关、`--strict_config`、Store 配置源等。
 > 逐项源码级对照与本项目更严格的安全默认值，见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md)。
@@ -1011,6 +1012,8 @@ ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewWorkConn", "NewUserConn"]
 | `socks5` | SOCKS5 代理（CONNECT，支持 IPv4 / 域名 / IPv6） | `username` / `password`：按 RFC 1929 强制认证，失败回 `0x01/0x01` |
 | `https2http` / `tls2raw` | 访客 TLS 接入 → 终止 TLS → 明文桥接本地服务 | `local_addr`；`crt_path` / `key_path`（缺省内置自签证书，仅加密不认证） |
 | `https2https` | 访客 TLS 接入 → 终止 TLS → 再次 TLS 连接本地服务 | 同上 |
+| `http2http` | 访客明文 HTTP → 解析并重写请求 → 转发本地 **HTTP** 服务 | `local_addr`；`host_header_rewrite`；`request_headers.set.*` |
+| `http2https` | 访客明文 HTTP → 解析并重写请求 → 转发本地 **HTTPS** 服务 | 同上（本地侧跳过证书校验，仅加密不认证） |
 
 ```toml
 [[proxies]]
@@ -1023,8 +1026,23 @@ username = "alice"
 password = "CHANGE_ME_SOCKS5"
 ```
 
+```toml
+# http2https：把 vhost HTTP 请求改写 Host 后转发到本地 HTTPS 服务
+[[proxies]]
+name = "web-tls-backend"
+type = "http"
+custom_domains = ["test.example.com"]
+[proxies.plugin]
+type = "http2https"
+local_addr = "127.0.0.1:443"
+host_header_rewrite = "127.0.0.1"
+request_headers.set.x-from-where = "frp"
+```
+
 > 认证凭据一律**常量时间比较**；未配置凭据时保持匿名（`http_proxy`）/ 无认证（`socks5`）语义，与原版一致。
 > `http_proxy` 当前仅实现 `CONNECT`（HTTPS 隧道），非 CONNECT 请求返回 `405`（普通 HTTP 转发未实现）。
+> `http2http` / `http2https` 支持 `Content-Length` 与 `chunked` 报文体、访客侧 keep-alive 复用；
+> 到本地服务的连接按「每请求一条」建立（不做上游连接池复用），与原版行为有性能差异但语义一致。
 
 ---
 
