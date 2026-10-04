@@ -12,14 +12,14 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~217 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 功能点覆盖率 | **约 86%**（44 项能力点中 38 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计、优雅关闭、tcpmux、sudp 已于 2026-10-04 落地） | 100%（基线） | — |
+| 功能点覆盖率 | **约 88%**（44 项能力点中 39 项等价或更强；配置兼容、CLI、配置管理 API、应用层压缩、流量统计、优雅关闭、tcpmux、sudp、服务端 HTTP 插件已于 2026-10-04 落地） | 100%（基线） | — |
 | 配置字段兼容 | ✅ 双向兼容（alias） | camelCase | 原版配置可直接复用（2026-10-04 起） |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify/reload/status | reload/status/stop/verify/… | reload/status/verify 已补齐 |
 | 安全默认值 | ✅ 更保守（见第九节） | 一般 | **rust 更严** |
 | 运行时依赖 | rustls/ring（无 OpenSSL） | golib/quic-go/kcp-go | 均为单二进制 |
 
-**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型主体、TLS/KCP/WebSocket 传输、应用层加密、STCP/XTCP 真打洞、负载均衡、限速、连接池），但**「周边工程化能力」缺口明显**——QUIC、完整 OIDC、tcpmux/sudp、服务端插件等 8 项未落地或仅占位。**它现在是一个「内核达标、周边偏瘦」的实现**。
+**一句话结论**：rust_frp 已把「核心转发链路」做得和原版等价甚至更安全（代理类型全覆盖、TLS/KCP/WebSocket 传输、应用层加密与压缩、STCP/XTCP 真打洞、负载均衡、限速、连接池、tcpmux/sudp、服务端 HTTP 插件回调），**剩余缺口集中在「企业级与协议前沿」**——QUIC、完整 OIDC 实联、http2http/http2https、virtual_net 等 5 项。**它现在是一个「内核达标、周边接近补齐」的实现**。
 
 ---
 
@@ -29,12 +29,12 @@
 |------|:----:|:------:|----------|
 | 代理类型 | 9/9 | 100% | — |
 | 传输与协议 | 7/8 | 88% | QUIC、wss |
-| 插件体系 | 6/8 | 75% | http2http、http2https、virtual_net、服务端插件 |
+| 插件体系 | 7/8 | 88% | http2http、http2https、virtual_net |
 | 配置兼容 | 4/5 | 80% | 严格未知字段校验（现为 WARN 告警模式，见 P0-2） |
 | 认证与安全 | 4/7 | 57% | 完整 OIDC、tokenSource、SSH 隧道 |
 | 管理 API | 4/4 | 100% | — |
 | CLI 运维 | 3/3 | 100% | — |
-| **合计** | **38/44** | **86%** | — |
+| **合计** | **39/44** | **88%** | — |
 
 > 计分口径：一项能力「等价或更强」记 1 分；缺失 / 仅占位 / 显著弱化记 0 分。
 
@@ -129,11 +129,11 @@
 
 | 能力 | rust_frp | frp 0.71 |
 |------|:--------:|:--------:|
-| 独立服务端插件机制 | ❌ 无 | ✅ `plugin/server/manager` |
-| 通用 HTTP 回调插件 | ❌ | ✅ 六类钩子：Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn |
+| 独立服务端插件机制 | ✅ `rust_frp_plugin::server_plugin`（2026-10-04） | ✅ `plugin/server/manager` |
+| 通用 HTTP 回调插件 | ✅ 六类钩子：Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn（含 reject / unchange 覆写语义） | ✅ 同名六类钩子 |
 | 链路追踪 tracer | ❌ | ✅ |
 
-> 差异性质：rust 的插件是**代理级**（客户端侧替代 local_ip），原版是**注册式 + 六类操作钩子 + 外部 HTTP 回调**，可扩展性高一个量级。
+> 差异性质：rust 的插件现在同时覆盖**数据面**（代理级本地插件）与**控制面**（服务端 HTTP 回调，六类钩子 + reject/覆写语义），仅缺链路追踪 tracer。
 
 ---
 
@@ -202,7 +202,7 @@
 | 7 | OIDC 完整流程 | 仅本地 HS256 验签，不连 issuer |
 | 8 | ~~tcpmux 代理~~ | ✅ 已实现（2026-10-04）：HTTP CONNECT 复用 + 域名/HTTP 用户路由 |
 | 9 | ~~sudp 代理~~ | ✅ 已实现（2026-10-04）：UDP over STCP 隧道（代理/访客两端） |
-| 10 | 服务端插件机制 | 无（含 HTTP 回调插件） |
+| 10 | ~~服务端插件机制~~ | ✅ 已实现（2026-10-04）：六类 HTTP 回调钩子（Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn），支持 reject 拒绝与 unchange 覆写；`[[http_plugins]]` 配置 |
 | 11 | ~~优雅关闭~~ | ✅ 已实现（2026-10-04）：SIGINT/SIGTERM 停止 accept + 排空存量连接（10s 上限），客户端另有 graceful_shutdown |
 | 12 | ~~流量统计 / 客户端详情 API~~ | ✅ 已实现（2026-10-04）：桥接结束累加双向字节，服务端 `/api/proxies` + Prometheus、客户端 `frpc status` 暴露 |
 
@@ -213,7 +213,7 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 
 ## 十一、结论与建议
 
-**定位判断**：rust_frp 的**数据面（data plane）已达标**——TCP/UDP/HTTP/HTTPS/STCP/XTCP 转发、TLS/KCP/WebSocket 传输、AES-256-GCM 应用层加密、STUN 真打洞、负载均衡、健康检查、限速、连接池、配置热重载全部可用且经 217 个单测覆盖。短板集中在**控制面与运维面（control / ops plane）**。
+**定位判断**：rust_frp 的**数据面（data plane）已达标**——TCP/UDP/HTTP/HTTPS/STCP/XTCP/tcpmux/sudp 转发、TLS/KCP/WebSocket 传输、AES-256-GCM 应用层加密、snappy 压缩、STUN 真打洞、负载均衡、健康检查、限速、连接池、配置热重载全部可用，并经 285 个单测覆盖。**控制面**（CLI、配置管理 API、服务端 HTTP 插件回调、流量统计、优雅关闭）已接近补齐，剩余短板集中在**协议前沿与企业级认证（QUIC、完整 OIDC 实联、wire protocol v2）**。
 
 **建议路线（按投入产出排序）**：
 1. ~~**配置兼容层**（P0-1/2）~~ ✅ 已落地（2026-10-04）：serde `alias` 双向兼容 + 未知字段 WARN 告警，新增 `rust_frp_config::compat` 模块与原版风格配置回归测试。
@@ -222,7 +222,8 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 4. **use_compression**（P1-6）：字段已就绪，接入 snappy/zstd 成本低，可与 `use_encryption` 对称实现。
 5. ~~**优雅关闭**（P1-11）~~：✅ 已落地（2026-10-04），SIGINT/SIGTERM → 停止 accept → 排空（10s 上限）。
 6. ~~**tcpmux / sudp**（P1-8/9）~~ ✅ 已落地（2026-10-04）：代理类型 9/9 全覆盖，tcpmux 支持域名 + HTTP 用户路由，sudp 为 UDP over STCP 隧道。
-7. **OIDC / QUIC**（P1）：按业务是否需要企业 SSO、弱网再排期；**服务端插件机制**（六类 HTTP 回调钩子）是扩展性上的主要短板。
+7. ~~**服务端插件机制**（P1-10）~~ ✅ 已落地（2026-10-04）：六类 HTTP 回调钩子，支持 reject / 覆写，扩展性问题已解决。
+8. **OIDC / QUIC**（P1）：按业务是否需要企业 SSO、弱网再排期；两项均为"引入外部依赖 + 影响面大"的项。
 
 **不建议盲目对齐的项**：vnet 虚拟网络、in-process SDK、SSH 隧道网关——这些是原版的「生态扩展」，除非有明确场景，否则投入产出比低。
 
@@ -232,3 +233,5 @@ vnet 虚拟网络、`pkg/virtual` 进程内嵌库、SDK（`pkg/sdk`）、SSH 隧
 
 - `README.md` 功能实现状态表：新增「应用层加密 ✅」「应用层压缩 🚧」「tcpmux 代理 🚧」「sudp 代理 ❌」四行。
 - `README.md` 安全说明表：原「应用层加密 **不支持**」为过时描述（该功能已于 `5d91934` 落地），已改为 **✅ 已实现（AES-256-GCM，仅加密不认证）**。
+- 2026-10-04（tcpmux/sudp 轮）：上述「应用层压缩 / tcpmux / sudp」三行均已更新为 ✅（tcpmux/sudp 本轮落地）。
+- 2026-10-04（服务端插件轮）：新增「服务端 HTTP 插件 ✅」一行；插件体系覆盖 7/8，合计覆盖率 86% → **88%（39/44）**。

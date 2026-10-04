@@ -190,6 +190,45 @@ pub(crate) struct TcpVisitorDeps {
     pub work_conn_manager: Arc<ServerWorkConnManager>,
     pub plugin_config: Option<rust_frp_config::PluginConfig>,
     pub group_registry: Arc<GroupRegistry>,
+    pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
+}
+
+/// 触发 NewUserConn 插件回调；返回 `Err` 表示本次外部接入被拒绝。
+///
+/// 供 TCP / WebSocket / HTTP(S) vhost / tcpmux 各用户连接入口共用：
+/// 通过 `proxy_owners` 反查代理归属的 run_id，再取用户名填充 UserInfo。
+pub(crate) async fn notify_new_user_conn(
+    plugin_manager: &rust_frp_plugin::server_plugin::Manager,
+    control_manager: &ControlManager,
+    proxy_owners: &RwLock<std::collections::HashMap<String, String>>,
+    proxy_name: &str,
+    proxy_type: &str,
+    remote_addr: &str,
+) -> Result<(), String> {
+    if plugin_manager.is_empty() {
+        return Ok(());
+    }
+    let run_id = proxy_owners
+        .read()
+        .await
+        .get(proxy_name)
+        .cloned()
+        .unwrap_or_default();
+    let user = if run_id.is_empty() {
+        String::new()
+    } else {
+        control_manager
+            .get_user_by_run_id(&run_id)
+            .await
+            .unwrap_or_default()
+    };
+    let content = serde_json::json!({
+        "user": { "user": user, "run_id": run_id, "metas": {} },
+        "proxy_name": proxy_name,
+        "proxy_type": proxy_type,
+        "remote_addr": remote_addr,
+    });
+    plugin_manager.new_user_conn(&content).await
 }
 
 pub struct ServerProxyManager {
@@ -219,6 +258,20 @@ pub struct ServerProxyManager {
     tcpmux_router: Arc<TcpMuxRouter>,
     /// tcpmux 复用端口（None = 未启用，注册 tcpmux 代理时告警）
     tcpmux_port: Option<u16>,
+    /// 服务端 HTTP 插件管理器（控制面回调；未配置插件时为空管理器）
+    plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
+}
+
+/// [`ServerProxyManager::new`] 的可选配置项（收敛参数列表，避免超长签名）
+pub struct ProxyManagerOptions {
+    /// 允许的端口范围（空 = 默认拒绝所有 TCP/UDP 代理端口）
+    pub allow_ports: Vec<rust_frp_config::PortRange>,
+    /// 单用户最大端口数
+    pub max_ports_per_user: Option<usize>,
+    /// tcpmux HTTP CONNECT 复用端口
+    pub tcpmux_port: Option<u16>,
+    /// 服务端 HTTP 插件管理器
+    pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
 }
 
 /// 检查端口是否在允许列表中
@@ -259,10 +312,14 @@ impl ServerProxyManager {
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
-        allow_ports: Vec<rust_frp_config::PortRange>,
-        max_ports_per_user: Option<usize>,
-        tcpmux_port: Option<u16>,
+        options: ProxyManagerOptions,
     ) -> Self {
+        let ProxyManagerOptions {
+            allow_ports,
+            max_ports_per_user,
+            tcpmux_port,
+            plugin_manager,
+        } = options;
         if allow_ports.is_empty() {
             log::warn!(
                 "allow_ports is empty, all TCP proxy ports will be rejected. \
@@ -285,7 +342,13 @@ impl ServerProxyManager {
             group_registry: Arc::new(GroupRegistry::new()),
             tcpmux_router: Arc::new(TcpMuxRouter::new()),
             tcpmux_port,
+            plugin_manager,
         }
+    }
+
+    /// 服务端 HTTP 插件管理器（供 vhost / tcpmux 等用户连接入口回调）
+    pub fn plugin_manager(&self) -> Arc<rust_frp_plugin::server_plugin::Manager> {
+        self.plugin_manager.clone()
     }
 
     pub async fn start_proxy(
@@ -414,6 +477,7 @@ impl ServerProxyManager {
             let plugin_config = config.plugin.clone();
             // 分组分发：accept 循环内 round-robin 选取成员
             let group_registry = self.group_registry.clone();
+            let plugin_manager = self.plugin_manager.clone();
             let handle = tokio::spawn(async move {
                 while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     match listener_clone.accept().await {
@@ -431,6 +495,7 @@ impl ServerProxyManager {
                                 work_conn_manager: work_conn_manager.clone(),
                                 plugin_config: plugin_config.clone(),
                                 group_registry: group_registry.clone(),
+                                plugin_manager: plugin_manager.clone(),
                             };
                             tokio::spawn(ServerProxyManager::serve_tcp_visitor(
                                 proxy_name_clone,
@@ -591,6 +656,7 @@ impl ServerProxyManager {
             let proxy_owners = self.proxy_owners.clone();
             let control_manager = self.control_manager.clone();
             let work_conn_manager = self.work_conn_manager.clone();
+            let plugin_manager = self.plugin_manager.clone();
             let handle = tokio::spawn(async move {
                 while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     match listener_clone.accept().await {
@@ -605,6 +671,7 @@ impl ServerProxyManager {
                             let proxy_owners = proxy_owners.clone();
                             let control_manager = control_manager.clone();
                             let work_conn_manager = work_conn_manager.clone();
+                            let plugin_manager = plugin_manager.clone();
 
                             tokio::spawn(ServerProxyManager::serve_websocket_visitor(
                                 proxy_name_clone,
@@ -613,6 +680,7 @@ impl ServerProxyManager {
                                 proxy_owners,
                                 control_manager,
                                 work_conn_manager,
+                                plugin_manager,
                             ));
                         }
                         Err(e) => {
@@ -646,6 +714,7 @@ impl ServerProxyManager {
             work_conn_manager,
             plugin_config,
             group_registry,
+            plugin_manager,
         } = deps;
         log::debug!("开始处理外部连接: proxy={}", proxy_name_clone);
 
@@ -675,6 +744,26 @@ impl ServerProxyManager {
         let _conn_guard = global_metrics()
             .get_proxy_stat(&target_name)
             .map(ProxyConnGuard::acquire);
+
+        // 服务端插件回调：NewUserConn（可拒绝本次外部接入）
+        if let Err(reason) = notify_new_user_conn(
+            &plugin_manager,
+            &control_manager,
+            &proxy_owners,
+            target_name.as_str(),
+            "tcp",
+            &visitor_addr.to_string(),
+        )
+        .await
+        {
+            log::warn!(
+                "User conn from {} for proxy [{}] rejected by http plugin: {}",
+                visitor_addr,
+                target_name,
+                reason
+            );
+            return;
+        }
 
         // 检查是否有插件配置（插件直接处理访问者连接，不需要工作连接）
         if let Some(ref pconf) = plugin_config {
@@ -771,11 +860,32 @@ impl ServerProxyManager {
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
+        plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
     ) {
         // per-proxy 连接统计守卫（drop 时自动减一）
         let _conn_guard = global_metrics()
             .get_proxy_stat(&proxy_name_clone)
             .map(ProxyConnGuard::acquire);
+
+        // 服务端插件回调：NewUserConn（可拒绝本次外部接入）
+        if let Err(reason) = notify_new_user_conn(
+            &plugin_manager,
+            &control_manager,
+            &proxy_owners,
+            proxy_name_clone.as_str(),
+            "websocket",
+            &visitor_addr.to_string(),
+        )
+        .await
+        {
+            log::warn!(
+                "WebSocket user conn from {} for proxy [{}] rejected by http plugin: {}",
+                visitor_addr,
+                proxy_name_clone,
+                reason
+            );
+            return;
+        }
         let ws_stream = match accept_async(visitor_conn).await {
             Ok(ws) => ws,
             Err(e) => {

@@ -24,6 +24,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **OIDC 认证**：支持 OpenID Connect 认证，集成企业身份系统
 - **配置热重载**：支持 SIGHUP 信号、文件监听、API 触发三种方式重载配置
 - **应用层压缩**：per-proxy `use_compression`，工作连接 snappy 压缩（对齐原版语义）
+- **服务端 HTTP 插件**：`[[http_plugins]]` 配置外部 HTTP 服务，在 Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn 六类事件回调，支持拒绝（reject）与内容覆写（unchange）
 - **健康检查**：支持 TCP 和 HTTP 健康检查，自动检测后端服务状态
 - **带宽限制**：支持代理级和全局级带宽限制，基于令牌桶算法
 
@@ -45,6 +46,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 应用层压缩 | ✅ | `use_compression`：工作连接 snappy 压缩（**需两端配置一致**；与 `use_encryption` 可叠加，顺序为先压缩后加密） |
 | tcpmux 代理 | ✅ | HTTP CONNECT 复用：服务器在 `tcpmux_http_connect_port` 单端口按域名（+ 可选 `route_by_http_user` / `http_user` / `http_password`）路由，多个 tcpmux 代理共享同一端口 |
 | sudp 代理 | ✅ | 安全 UDP：经 STCP 隧道承载 UDP 报文（`secret_key` 签名校验与 STCP 一致），代理端/访问端各自监听本地 UDP |
+| 服务端 HTTP 插件 | ✅ | `[[http_plugins]]`：六类事件回调（Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn），支持 `reject` 拒绝 + `unchange` 覆写；https 地址可用 `tls_verify` 控制证书校验 |
 | OIDC 认证 | ✅ | 支持 HS256 JWT 验证 |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
@@ -814,6 +816,52 @@ bind_port = 5353              # 本地 UDP 监听端口
 > **会话模型**：访问端每个本地 UDP 源地址占用一条独立隧道，代理端按访问者地址
 > 建立独立的本地 UDP 会话（保证回包准确）；代理端每 30s 发送心跳，访问端
 > 连续 60s 无消息即回收该会话。
+
+### 服务端 HTTP 插件
+
+frps 在处理**控制面事件**时，向外部 HTTP 服务发起同步回调，用于接入统一的
+用户 / 权限 / 审计系统（对应原版 `[[httpPlugins]]`）。
+
+**服务器端配置**：
+
+```toml
+[[http_plugins]]
+name = "user-manager"
+addr = "http://127.0.0.1:9000"       # 未带 scheme 时按 http:// 处理
+path = "/handler"
+ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewWorkConn", "NewUserConn"]
+# https 地址是否校验证书（默认 false，与原版 tlsVerify 一致）
+# tls_verify = false
+```
+
+**回调协议**：frps 向 `{addr}{path}?version=0.1.0&op={Op}` 发 `POST`，
+请求体为 `{"version":"0.1.0","op":"Op","content":{...}}`，并附 `X-Frp-Reqid` 头；
+插件须返回 `200` 与 JSON：
+
+```json
+{ "reject": false, "reject_reason": "", "unchange": true, "content": null }
+```
+
+- `reject = true`：拒绝本次操作，`reject_reason` 回传客户端
+  （登录 / 注册失败即拒绝；心跳被拒 → 客户端重连；用户连接被拒 → 直接断开 / 502）；
+- `unchange = false`：用 `content` 覆写内容（Login 可注入 `metas`、
+  NewProxy 可改写代理配置）。
+
+**六类事件**：
+
+| op | 触发时机 | 可拒绝 | 可覆写 |
+|----|----------|:------:|:------:|
+| `Login` | 客户端通过 token 鉴权后 | ✅ | ✅ |
+| `NewProxy` | 客户端注册代理时 | ✅ | ✅ |
+| `CloseProxy` | 代理被移除时（单向通知） | ❌ | ❌ |
+| `Ping` | 收到客户端心跳时 | ✅ | ✅ |
+| `NewWorkConn` | 工作连接建立时 | ✅ | ✅ |
+| `NewUserConn` | TCP / WebSocket / HTTP(S) / tcpmux 外部接入时 | ✅ | ❌ |
+
+> **失败语义**：回调网络 / 协议失败与显式拒绝同样视为「操作失败」（fail-closed），
+> 登录失败即断开、注册失败即回执错误；`CloseProxy` 为通知类，失败只记日志。
+> `ops` 中出现未知操作名会导致配置校验失败（拒绝启动），避免「配了插件却静默不回调」。
+> 安全：登录回调**不向插件暴露客户端 token**。
 
 ---
 

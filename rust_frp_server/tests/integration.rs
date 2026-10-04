@@ -125,7 +125,9 @@ fn test_global_metrics_singleton() {
 
 // ============ P0-2 max_ports_per_user 配额 + add_proxy 回滚 ============
 
-use rust_frp_server::{ControlManager, HttpVhostRouter, ServerProxyManager, ServerWorkConnManager};
+use rust_frp_server::{
+    ControlManager, HttpVhostRouter, ProxyManagerOptions, ServerProxyManager, ServerWorkConnManager,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -140,9 +142,12 @@ fn build_manager(
         Arc::new(RwLock::new(HashMap::new())),
         Arc::new(ControlManager::new()),
         Arc::new(ServerWorkConnManager::new(4)),
-        allow_ports,
-        max_ports_per_user,
-        None,
+        ProxyManagerOptions {
+            allow_ports,
+            max_ports_per_user,
+            tcpmux_port: None,
+            plugin_manager: Arc::new(rust_frp_plugin::server_plugin::Manager::default()),
+        },
     )
 }
 

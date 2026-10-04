@@ -300,6 +300,7 @@ pub struct TcpMuxDeps {
     pub proxy_owners: Arc<RwLock<HashMap<String, String>>>,
     pub control_manager: Arc<ControlManager>,
     pub work_conn_manager: Arc<ServerWorkConnManager>,
+    pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
 }
 
 /// tcpmux 监听循环：`shutdown` 通知后退出（监听器随作用域结束关闭）
@@ -324,6 +325,7 @@ pub async fn run_tcpmux_listener(
                     proxy_owners: deps.proxy_owners.clone(),
                     control_manager: deps.control_manager.clone(),
                     work_conn_manager: deps.work_conn_manager.clone(),
+                    plugin_manager: deps.plugin_manager.clone(),
                 };
                 tokio::spawn(serve_conn(conn, peer, deps));
             }
@@ -381,6 +383,27 @@ async fn serve_conn(mut conn: TcpStream, peer: SocketAddr, deps: TcpMuxDeps) {
     let _conn_guard = global_metrics()
         .get_proxy_stat(&route.proxy_name)
         .map(ProxyConnGuard::acquire);
+
+    // 服务端插件回调：NewUserConn（可拒绝本次外部接入）
+    if let Err(reason) = crate::proxy_manager::notify_new_user_conn(
+        &deps.plugin_manager,
+        &deps.control_manager,
+        &deps.proxy_owners,
+        route.proxy_name.as_str(),
+        "tcpmux",
+        &peer.to_string(),
+    )
+    .await
+    {
+        log::warn!(
+            "tcpmux: user conn from {} for proxy [{}] rejected by http plugin: {}",
+            peer,
+            route.proxy_name,
+            reason
+        );
+        let _ = conn.write_all(RESP_BAD_GATEWAY).await;
+        return;
+    }
 
     let run_id = {
         let owners = deps.proxy_owners.read().await;
@@ -620,6 +643,7 @@ mod tests {
             proxy_owners: Arc::new(RwLock::new(HashMap::new())),
             control_manager: Arc::new(ControlManager::new()),
             work_conn_manager: Arc::new(ServerWorkConnManager::new(1)),
+            plugin_manager: Arc::new(rust_frp_plugin::server_plugin::Manager::default()),
         };
         tokio::spawn(run_tcpmux_listener(
             listener,

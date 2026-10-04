@@ -72,6 +72,7 @@ pub(crate) struct ServerManagers {
     pub xtcp_visitors: Arc<RwLock<std::collections::HashMap<String, String>>>,
     pub stcp_bridge_manager: Arc<StcpBridgeManager>,
     pub work_conn_manager: Arc<ServerWorkConnManager>,
+    pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
 }
 
 /// 服务器服务
@@ -111,6 +112,8 @@ pub struct Server {
     pub(crate) reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
     /// 优雅关闭通知（控制连接 accept 循环据此退出并按超时排空存量连接）
     shutdown_notify: Arc<tokio::sync::Notify>,
+    /// 服务端 HTTP 插件管理器（控制面回调）
+    plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
 }
 
 impl Server {
@@ -125,6 +128,7 @@ impl Server {
             xtcp_visitors: self.xtcp_visitors.clone(),
             stcp_bridge_manager: self.stcp_bridge_manager.clone(),
             work_conn_manager: self.work_conn_manager.clone(),
+            plugin_manager: self.plugin_manager.clone(),
         }
     }
 
@@ -139,14 +143,21 @@ impl Server {
             config.transport.pool_count as usize,
         ));
         let proxy_owners = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        // 服务端 HTTP 插件管理器（未配置 http_plugins 时为空管理器，回调直接短路）
+        let plugin_manager = Arc::new(rust_frp_plugin::server_plugin::Manager::from_configs(
+            &config.http_plugins,
+        ));
         let proxy_manager = Arc::new(ServerProxyManager::new(
             http_vhost_router,
             proxy_owners.clone(),
             control_manager.clone(),
             work_conn_manager.clone(),
-            config.allow_ports.clone(),
-            config.max_ports_per_user,
-            config.tcpmux_http_connect_port,
+            ProxyManagerOptions {
+                allow_ports: config.allow_ports.clone(),
+                max_ports_per_user: config.max_ports_per_user,
+                tcpmux_port: config.tcpmux_http_connect_port,
+                plugin_manager: plugin_manager.clone(),
+            },
         ));
         let visitor_manager = Arc::new(ServerVisitorManager::new());
         let metrics = Arc::new(MonitorMetrics::new());
@@ -207,6 +218,7 @@ impl Server {
             reload_rx: None,
             reload_tx: None,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            plugin_manager,
         })
     }
 
@@ -282,6 +294,7 @@ impl Server {
                 proxy_owners: self.proxy_owners.clone(),
                 control_manager: self.control_manager.clone(),
                 work_conn_manager: self.work_conn_manager.clone(),
+                plugin_manager: self.plugin_manager.clone(),
             };
             // 监听器交由复用任务持有；关闭信号到达时随任务结束释放
             tokio::spawn(run_tcpmux_listener(
@@ -310,17 +323,11 @@ impl Server {
         // tls_only 时拒绝一切明文工作连接
         let work_conn_tls_config = self.conn_manager.get_tls_config().cloned();
         let work_conn_tls_only = self.config.transport.tls_only;
-        let control_manager = self.control_manager.clone();
-        let work_conn_manager = self.work_conn_manager.clone();
-        let auth_manager = self.auth_manager.clone();
-        let stcp_bridge_manager_work = self.stcp_bridge_manager.clone();
+        let work_conn_managers = self.managers();
         tokio::spawn(async move {
             Self::handle_work_connections(
                 work_conn_listener_clone,
-                control_manager,
-                work_conn_manager,
-                auth_manager,
-                stcp_bridge_manager_work,
+                work_conn_managers,
                 work_conn_tls_config,
                 work_conn_tls_only,
             )
@@ -349,6 +356,7 @@ impl Server {
             let work_conn_manager = self.work_conn_manager.clone();
             let stcp_bridge_manager = self.stcp_bridge_manager.clone();
             let xtcp_visitors = self.xtcp_visitors.clone();
+            let plugin_manager = self.plugin_manager.clone();
             let kcp_work_conn_tls = self.conn_manager.get_tls_config().is_some();
             let kcp_listener = KcpListener::bind(
                 format!(
@@ -377,6 +385,7 @@ impl Server {
                                 xtcp_visitors: xtcp_visitors.clone(),
                                 stcp_bridge_manager: stcp_bridge_manager.clone(),
                                 work_conn_manager: work_conn_manager.clone(),
+                                plugin_manager: plugin_manager.clone(),
                             };
                             let m = metrics.clone();
 
@@ -410,13 +419,18 @@ impl Server {
     /// 处理工作连接（支持 TLS/明文混跑 + tls_only 强制）
     async fn handle_work_connections(
         listener: tokio::net::TcpListener,
-        control_manager: Arc<ControlManager>,
-        work_conn_manager: Arc<ServerWorkConnManager>,
-        auth_manager: Arc<AuthManager>,
-        stcp_bridge_manager: Arc<StcpBridgeManager>,
+        managers: ServerManagers,
         tls_config: Option<TlsConfig>,
         tls_only: bool,
     ) {
+        let ServerManagers {
+            control_manager,
+            work_conn_manager,
+            auth_manager,
+            stcp_bridge_manager,
+            plugin_manager,
+            ..
+        } = managers;
         log::info!(
             "Work connection handler started (tls: {}, tls_only: {})",
             tls_config.is_some(),
@@ -442,6 +456,7 @@ impl Server {
                     let wcm = work_conn_manager.clone();
                     let am = auth_manager.clone();
                     let sbm = stcp_bridge_manager.clone();
+                    let pm = plugin_manager.clone();
                     let tls_config = tls_config.clone();
 
                     tokio::spawn(async move {
@@ -487,6 +502,7 @@ impl Server {
                                             wcm,
                                             am,
                                             sbm,
+                                            pm,
                                         )
                                         .await
                                         {
@@ -502,7 +518,8 @@ impl Server {
                             WorkConnClass::Plain => {
                                 log::info!("New work connection from: {:?}", addr);
                                 if let Err(e) =
-                                    Self::process_work_conn(Box::new(conn), cm, wcm, am, sbm).await
+                                    Self::process_work_conn(Box::new(conn), cm, wcm, am, sbm, pm)
+                                        .await
                                 {
                                     log_work_conn_error(e.as_ref());
                                 }
@@ -536,6 +553,7 @@ impl Server {
         work_conn_manager: Arc<ServerWorkConnManager>,
         auth_manager: Arc<AuthManager>,
         stcp_bridge_manager: Arc<StcpBridgeManager>,
+        plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取客户端发送的 NewWorkConn 消息
         //
@@ -627,6 +645,38 @@ impl Server {
                         write_message_with_timeout(&mut conn, &resp).await?;
                         return Err("Sign key mismatch".into());
                     }
+                }
+
+                // 服务端插件回调：NewWorkConn（可拒绝该工作连接）
+                let work_user = control_manager
+                    .get_user_by_run_id(&work_msg.run_id)
+                    .await
+                    .unwrap_or_default();
+                let mut plugin_content = serde_json::json!({
+                    "user": {
+                        "user": work_user,
+                        "run_id": work_msg.run_id,
+                        "metas": {},
+                    },
+                    "proxy_name": work_msg.proxy_name.clone(),
+                    "run_id": work_msg.run_id.clone(),
+                    "timestamp": work_msg.timestamp,
+                });
+                if let Err(reason) = plugin_manager.new_work_conn(&mut plugin_content).await {
+                    log::warn!(
+                        "Work conn for proxy [{}] rejected by http plugin: {}",
+                        work_msg.proxy_name,
+                        reason
+                    );
+                    let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
+                        error: format!("work conn rejected by plugin: {}", reason),
+                        src_addr: String::new(),
+                        src_port: 0,
+                        dst_addr: String::new(),
+                        dst_port: 0,
+                    });
+                    write_message_with_timeout(&mut conn, &resp).await?;
+                    return Err("work conn rejected by plugin".into());
                 }
 
                 // 应用层压缩：包装在验签后、入池/桥接前，池与 STCP 桥接路径
@@ -724,6 +774,7 @@ impl Server {
         let control_manager = self.control_manager.clone();
         let work_conn_manager = self.work_conn_manager.clone();
         let auth_manager = self.auth_manager.clone();
+        let plugin_manager = self.plugin_manager.clone();
 
         tokio::spawn(async move {
             loop {
@@ -737,11 +788,13 @@ impl Server {
                         let cm = control_manager.clone();
                         let wcm = work_conn_manager.clone();
                         let am = auth_manager.clone();
+                        let pm = plugin_manager.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                Self::handle_http_vhost_connection(conn, router, po, cm, wcm, am)
-                                    .await
+                            if let Err(e) = Self::handle_http_vhost_connection(
+                                conn, router, po, cm, wcm, am, pm,
+                            )
+                            .await
                             {
                                 if e.to_string().to_lowercase().contains("connection reset")
                                     || e.to_string().to_lowercase().contains("connection aborted")
@@ -780,7 +833,7 @@ impl Server {
         let proxy_owners = self.proxy_owners.clone();
         let control_manager = self.control_manager.clone();
         let work_conn_manager = self.work_conn_manager.clone();
-        let auth_manager = self.auth_manager.clone();
+        let plugin_manager = self.plugin_manager.clone();
 
         tokio::spawn(async move {
             loop {
@@ -794,14 +847,14 @@ impl Server {
                         let po = proxy_owners.clone();
                         let cm = control_manager.clone();
                         let wcm = work_conn_manager.clone();
-                        let am = auth_manager.clone();
+                        let pm = plugin_manager.clone();
 
                         tokio::spawn(async move {
                             // 先进行 TLS 握手
                             match tls_config.accept(conn).await {
                                 Ok(tls_conn) => {
                                     if let Err(e) = Self::handle_https_vhost_connection(
-                                        tls_conn, router, po, cm, wcm, am, addr,
+                                        tls_conn, router, po, cm, wcm, addr, pm,
                                     )
                                     .await
                                     {
@@ -845,6 +898,7 @@ impl Server {
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
         _auth_manager: Arc<AuthManager>,
+        plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 读取 HTTP 请求头
         let mut buf = [0u8; 4096];
@@ -896,6 +950,32 @@ impl Server {
         let _conn_guard = global_metrics()
             .get_proxy_stat(&proxy_name)
             .map(ProxyConnGuard::acquire);
+
+        // 服务端插件回调：NewUserConn（可拒绝本次外部接入）
+        let visitor_peer = conn
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "0.0.0.0:0".to_string());
+        if let Err(reason) = crate::proxy_manager::notify_new_user_conn(
+            &plugin_manager,
+            &control_manager,
+            &proxy_owners,
+            proxy_name.as_str(),
+            "http",
+            &visitor_peer,
+        )
+        .await
+        {
+            log::warn!(
+                "HTTP user conn from {} for proxy [{}] rejected by http plugin: {}",
+                visitor_peer,
+                proxy_name,
+                reason
+            );
+            let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+            conn.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
 
         // 查找代理对应的 run_id
         let run_id = {
@@ -971,8 +1051,8 @@ impl Server {
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
-        _auth_manager: Arc<AuthManager>,
         visitor_addr: std::net::SocketAddr,
+        plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1027,6 +1107,29 @@ impl Server {
         let _conn_guard = global_metrics()
             .get_proxy_stat(&proxy_name)
             .map(ProxyConnGuard::acquire);
+
+        // 服务端插件回调：NewUserConn（可拒绝本次外部接入）
+        let visitor_peer = visitor_addr.to_string();
+        if let Err(reason) = crate::proxy_manager::notify_new_user_conn(
+            &plugin_manager,
+            &control_manager,
+            &proxy_owners,
+            proxy_name.as_str(),
+            "https",
+            &visitor_peer,
+        )
+        .await
+        {
+            log::warn!(
+                "HTTPS user conn from {} for proxy [{}] rejected by http plugin: {}",
+                visitor_peer,
+                proxy_name,
+                reason
+            );
+            let response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+            conn.write_all(response.as_bytes()).await?;
+            return Ok(());
+        }
 
         // 查找代理对应的 run_id
         let run_id = {
@@ -1246,6 +1349,7 @@ impl Server {
             xtcp_visitors,
             stcp_bridge_manager,
             work_conn_manager,
+            plugin_manager,
         } = managers;
         // 首字节嗅探：TCP_MUX_MAGIC = tcp_mux 客户端（多路复用路径）
         // 安全：入口嗅探与 TLS 握手都必须受握手超时约束（P0-1），
@@ -1283,6 +1387,7 @@ impl Server {
                     xtcp_visitors,
                     stcp_bridge_manager,
                     work_conn_manager,
+                    plugin_manager,
                 },
                 tls_config,
             )
@@ -1324,6 +1429,7 @@ impl Server {
                 xtcp_visitors,
                 stcp_bridge_manager,
                 work_conn_manager,
+                plugin_manager,
             },
             work_conn_tls,
         );
@@ -1347,6 +1453,7 @@ impl Server {
             xtcp_visitors,
             stcp_bridge_manager,
             work_conn_manager,
+            plugin_manager,
             ..
         } = managers;
         // 创建登录通知通道
@@ -1374,6 +1481,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
+            plugin_manager,
         });
 
         // 克隆 msg_tx 用于注册
@@ -1427,6 +1535,7 @@ impl Server {
             xtcp_visitors,
             stcp_bridge_manager,
             work_conn_manager,
+            plugin_manager,
         } = managers;
         // 工作连接 TLS 协商标志（mux 下工作连接为会话流，TLS 在会话层；
         // 保持与 LoginResp 协商一致性）
@@ -1455,6 +1564,7 @@ impl Server {
         let sbm = stcp_bridge_manager.clone();
         let cm = control_manager.clone();
         let wcm = work_conn_manager.clone();
+        let pm = plugin_manager.clone();
         let control_handle = Self::spawn_control(
             ControlConn::new(control_stream),
             ServerManagers {
@@ -1466,6 +1576,7 @@ impl Server {
                 xtcp_visitors,
                 stcp_bridge_manager,
                 work_conn_manager,
+                plugin_manager,
             },
             work_conn_tls,
         );
@@ -1479,8 +1590,9 @@ impl Server {
                 let wcm = wcm.clone();
                 let am = am.clone();
                 let sbm = sbm.clone();
+                let pm = pm.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = Server::process_work_conn(stream, cm, wcm, am, sbm).await {
+                    if let Err(e) = Server::process_work_conn(stream, cm, wcm, am, sbm, pm).await {
                         log_work_conn_error(e.as_ref());
                     }
                 });
@@ -1513,6 +1625,7 @@ impl Server {
             xtcp_visitors,
             stcp_bridge_manager,
             work_conn_manager,
+            plugin_manager,
             ..
         } = managers;
         let conn = ControlConn::new(Box::new(kcp_conn));
@@ -1537,6 +1650,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
+            plugin_manager,
         });
 
         let msg_tx_clone = control.msg_tx.clone();
@@ -1661,6 +1775,7 @@ impl Clone for Server {
             reload_rx: None,
             reload_tx: self.reload_tx.clone(),
             shutdown_notify: self.shutdown_notify.clone(),
+            plugin_manager: self.plugin_manager.clone(),
         }
     }
 }
@@ -1726,9 +1841,12 @@ mod graceful_shutdown_tests {
                 Arc::new(RwLock::new(std::collections::HashMap::new())),
                 Arc::new(ControlManager::new()),
                 Arc::new(ServerWorkConnManager::new(1)),
-                Vec::new(),
-                None,
-                None,
+                ProxyManagerOptions {
+                    allow_ports: Vec::new(),
+                    max_ports_per_user: None,
+                    tcpmux_port: None,
+                    plugin_manager: Arc::new(rust_frp_plugin::server_plugin::Manager::default()),
+                },
             )),
             visitor_manager: Arc::new(ServerVisitorManager::new()),
             auth_manager: Arc::new(AuthManager::new(&config.auth).expect("default auth is valid")),
@@ -1748,6 +1866,7 @@ mod graceful_shutdown_tests {
             reload_rx: None,
             reload_tx: None,
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            plugin_manager: Arc::new(rust_frp_plugin::server_plugin::Manager::default()),
             config,
         }
     }
