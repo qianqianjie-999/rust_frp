@@ -289,6 +289,34 @@ RUST_LOG=debug ./target/release/rust_frpc -c /opt/rust_frp/conf/frpc.toml
 > （`[webServer] port > 0`）；配置了 `user` + `password` 时自动附带
 > Basic 认证。建议 `addr` 仅监听 `127.0.0.1`。
 
+### frpc 管理 API（运行时配置 CRUD）
+
+管理端口除上述端点外，提供对齐原版 frp 的配置管理 API：
+
+| 端点 | 说明 |
+|------|------|
+| `GET /config` | 返回配置文件原文（text/plain） |
+| `PUT /config` | 校验请求体为新配置 → 原子覆写配置文件 → 自动触发热重载 |
+| `POST /reload` | 仅触发热重载（重读磁盘上的配置文件） |
+| `GET /status` | 代理/访客运行状态 |
+
+`PUT /config` 语义：**校验失败返回 400 且不落盘**（原文件保持不动）；
+写盘成功返回 200 后异步重载，运行中的代理按新配置重新注册。
+
+```bash
+# 读取当前配置
+curl -u admin:PASSWORD http://127.0.0.1:7400/config
+
+# 运行时更新配置（改完即生效）
+curl -u admin:PASSWORD -X PUT --data-binary @new-frpc.toml \
+  http://127.0.0.1:7400/config
+```
+
+> ⚠️ **安全约束**：`GET/PUT /config` 涉及 auth token 等敏感内容与配置
+> 文件覆写，**未配置 `[webServer] user/password` 时直接 403 禁用**
+> （fail-closed）。启用后也建议仅监听 `127.0.0.1`（Basic 认证为明文
+> HTTP 传输）。
+
 ### 日志级别说明
 
 | 级别 | 说明 | 使用场景 |

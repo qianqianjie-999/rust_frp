@@ -1040,6 +1040,20 @@ impl ConfigLoader {
         Ok(config)
     }
 
+    /// 校验配置内容（不读文件、不落盘）
+    ///
+    /// 供客户端管理 API（`PUT /config`）使用：完整走「解析 → 归并 → 校验」
+    /// 链路，任何一步失败都返回 Err。注意不处理 `includes`（相对路径解析
+    /// 依赖配置文件所在目录，留待随后的 reload 从磁盘加载时处理）。
+    pub fn validate_client_config_content(
+        content: &str,
+    ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+        let mut config = Self::parse_config::<ClientConfig>(content, ConfigKind::Client)?;
+        Self::normalize_client_config(&mut config);
+        Self::validate_client_config(&config)?;
+        Ok(config)
+    }
+
     /// 从文件加载配置（通用方法）
     ///
     /// # 格式检测

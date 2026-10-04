@@ -1650,9 +1650,13 @@ async fn handle_stcp_visitor_conn(
 /// - `GET  /visitors` 访客配置列表
 /// - `GET  /status`   代理/访客运行状态（`frpc status` 使用）
 /// - `POST /reload`   触发配置热重载（`frpc reload` 使用）
+/// - `GET  /config`   读取配置文件原文（对齐原版 `GET /api/config`）
+/// - `PUT  /config`   校验并原子覆写配置文件 + 触发热重载（对齐原版 `PUT /api/config`）
 ///
 /// 配置了 `webServer.user` + `webServer.password` 时全部端点要求
 /// Basic 认证（常量时间比较）；未配置则保持开放（向后兼容）。
+/// `/config` 读写端点因涉及 token 等敏感内容与配置文件覆写，在未配置
+/// 认证时直接 403 禁用（fail-closed）。
 pub struct WebServer {
     addr: SocketAddr,
     /// Basic 认证凭据（user, password），None 表示不启用
@@ -1667,6 +1671,10 @@ struct WebServerState {
     visitor_manager: Arc<ClientVisitorManager>,
     /// reload 端点通过该 Notify 通知 Client 主循环执行 reload_config
     reload_notify: Arc<tokio::sync::Notify>,
+    /// 配置文件路径（PUT /config 原子落盘的目标；None 表示管理端不可用）
+    config_path: Option<String>,
+    /// webServer 是否配置了 user/password（config 端点在 false 时直接 403）
+    auth_enabled: bool,
 }
 
 impl WebServer {
@@ -1693,6 +1701,8 @@ impl WebServer {
             proxy_manager: client.proxy_manager.clone(),
             visitor_manager: client.visitor_manager.clone(),
             reload_notify: client.reload_notify.clone(),
+            config_path: client.config_path.clone(),
+            auth_enabled: self.auth.is_some(),
         });
 
         let auth = self.auth.clone();
@@ -1702,6 +1712,7 @@ impl WebServer {
             .route("/visitors", get(visitors_handler))
             .route("/status", get(status_handler))
             .route("/reload", post(reload_handler))
+            .route("/config", get(get_config_handler).put(put_config_handler))
             .with_state(state)
             .layer(middleware::from_fn(move |req, next| {
                 basic_auth_middleware(req, next, auth.clone())
@@ -1828,6 +1839,99 @@ async fn reload_handler(State(state): State<Arc<WebServerState>>) -> Json<serde_
         "msg": "reload signal sent",
         "code": 200,
     }))
+}
+
+/// config 端点的前置守卫：未启用认证或未提供配置路径时拒绝
+fn config_endpoint_guard(state: &WebServerState) -> Result<String, Box<Response>> {
+    if !state.auth_enabled {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                "config API is disabled: configure webServer.user/password first \
+                 (config content contains auth token)"
+                    .to_string(),
+            )
+                .into_response(),
+        ));
+    }
+    let Some(path) = state.config_path.clone() else {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                "config API is unavailable: frpc was started without a config file path"
+                    .to_string(),
+            )
+                .into_response(),
+        ));
+    };
+    Ok(path)
+}
+
+/// `GET /config`：返回配置文件原文（text/plain）
+async fn get_config_handler(State(state): State<Arc<WebServerState>>) -> Response {
+    let path = match config_endpoint_guard(&state) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            content,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read config failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /config`：校验请求体为新配置 → 原子覆写配置文件 → 触发热重载。
+///
+/// 语义对齐原版 frp 的 `PUT /api/config`：写盘成功即返回 200，重载由
+/// reload 通道异步完成；校验失败返回 400 且不落盘（原文件保持不动）。
+async fn put_config_handler(State(state): State<Arc<WebServerState>>, body: String) -> Response {
+    let path = match config_endpoint_guard(&state) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
+    // 先整体校验（解析 + 归并 + 规则校验），失败不落盘
+    if let Err(e) = rust_frp_config::ConfigLoader::validate_client_config_content(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("config validation failed: {e}"),
+        )
+            .into_response();
+    }
+
+    // 原子写：临时文件 + rename，避免写一半崩溃留下残缺配置
+    let tmp_path = format!("{}.tmp-{}", path, rand_id(8));
+    if let Err(e) = tokio::fs::write(&tmp_path, &body).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write config failed: {e}"),
+        )
+            .into_response();
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+        // rename 失败时清理临时文件，避免残留
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("rename config failed: {e}"),
+        )
+            .into_response();
+    }
+
+    log::info!("config updated via admin API, triggering reload");
+    state.reload_notify.notify_one();
+    Json(serde_json::json!({
+        "msg": "config updated, reload triggered",
+        "code": 200,
+    }))
+    .into_response()
 }
 
 /// 健康检查器
@@ -2714,7 +2818,17 @@ mod web_admin_tests {
             proxy_manager: Arc::new(ClientProxyManager::new()),
             visitor_manager: Arc::new(ClientVisitorManager::new()),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
+            config_path: None,
+            auth_enabled: false,
         })
+    }
+
+    fn temp_config_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir();
+        dir.join(format!(
+            "frpc_admin_test_{tag}_{}",
+            rust_frp_util::rand_id(8)
+        ))
     }
 
     fn app_with_auth(auth: Option<(String, String)>) -> Router {
@@ -2845,6 +2959,8 @@ mod web_admin_tests {
             proxy_manager: Arc::new(mgr),
             visitor_manager: Arc::new(ClientVisitorManager::new()),
             reload_notify: Arc::new(tokio::sync::Notify::new()),
+            config_path: None,
+            auth_enabled: false,
         });
         state
             .proxy_manager
@@ -2896,5 +3012,152 @@ mod web_admin_tests {
             parse_basic_credentials(&format!("Basic {}", base64::encode("nocolon"))),
             None
         );
+    }
+    fn config_app(state: Arc<WebServerState>, auth: Option<(String, String)>) -> Router {
+        Router::new()
+            .route("/config", get(get_config_handler).put(put_config_handler))
+            .with_state(state)
+            .layer(middleware::from_fn(move |req, next| {
+                let auth = auth.clone();
+                basic_auth_middleware(req, next, auth)
+            }))
+    }
+
+    const VALID_CONFIG: &str = "server_addr = \"127.0.0.1\"\nserver_port = 9300\n\n[auth]\nmethod = \"token\"\ntoken = \"abc\"\n";
+
+    #[tokio::test]
+    async fn test_config_endpoints_forbidden_without_auth() {
+        // 未配置 webServer user/password：GET/PUT /config 一律 403（fail-closed）
+        let state = test_state();
+        let app = config_app(state, None);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/config")
+                    .body(Body::from("server_addr = \"x\""))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+    }
+
+    fn state_with_config(
+        path: &std::path::Path,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Arc<WebServerState> {
+        Arc::new(WebServerState {
+            proxy_manager: Arc::new(ClientProxyManager::new()),
+            visitor_manager: Arc::new(ClientVisitorManager::new()),
+            reload_notify: notify,
+            config_path: Some(path.to_string_lossy().into_owned()),
+            auth_enabled: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_config_returns_file_content() {
+        let path = temp_config_path("get");
+        std::fs::write(&path, VALID_CONFIG).unwrap();
+
+        let state = state_with_config(&path, Arc::new(tokio::sync::Notify::new()));
+        let app = config_app(state, Some(("admin".into(), "secret".into())));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/config")
+                    .header(header::AUTHORIZATION, auth_header("admin", "secret"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body, VALID_CONFIG);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_valid_writes_and_notifies() {
+        let path = temp_config_path("put");
+        std::fs::write(
+            &path,
+            "server_addr = \"old\"\nserver_port = 1\n[auth]\nmethod = \"token\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let state = state_with_config(&path, notify.clone());
+        let app = config_app(state, Some(("admin".into(), "secret".into())));
+
+        let waiter = tokio::spawn(async move { notify.notified().await });
+        tokio::task::yield_now().await;
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/config")
+                    .header(header::AUTHORIZATION, auth_header("admin", "secret"))
+                    .body(Body::from(VALID_CONFIG))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // 文件已被原子覆写为新内容，且 reload 通知已发出
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, VALID_CONFIG);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("PUT /config should trigger reload notify")
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_put_config_invalid_rejected_without_touching_file() {
+        let path = temp_config_path("put_invalid");
+        std::fs::write(&path, VALID_CONFIG).unwrap();
+
+        let state = state_with_config(&path, Arc::new(tokio::sync::Notify::new()));
+        let app = config_app(state, Some(("admin".into(), "secret".into())));
+
+        // 缺 auth 段的非法配置 -> 400 且原文件不动
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/config")
+                    .header(header::AUTHORIZATION, auth_header("admin", "secret"))
+                    .body(Body::from(
+                        "server_addr = \"127.0.0.1\"\nserver_port = 99999\n",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), VALID_CONFIG);
+        let _ = std::fs::remove_file(&path);
     }
 }
