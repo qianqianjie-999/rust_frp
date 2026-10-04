@@ -12,7 +12,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~217 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 功能点覆盖率 | **约 73%**（44 项能力点中 32 项等价或更强；配置兼容层与 CLI 子命令已于 2026-10-04 落地） | 100%（基线） | — |
+| 功能点覆盖率 | **约 75%**（44 项能力点中 33 项等价或更强；配置兼容层、CLI 子命令与配置管理 API 已于 2026-10-04 落地） | 100%（基线） | — |
 | 配置字段兼容 | ✅ 双向兼容（alias） | camelCase | 原版配置可直接复用（2026-10-04 起） |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify/reload/status | reload/status/stop/verify/… | reload/status/verify 已补齐 |
@@ -32,9 +32,9 @@
 | 插件体系 | 6/8 | 75% | http2http、http2https、virtual_net、服务端插件 |
 | 配置兼容 | 4/5 | 80% | 严格未知字段校验（现为 WARN 告警模式，见 P0-2） |
 | 认证与安全 | 4/7 | 57% | 完整 OIDC、tokenSource、SSH 隧道 |
-| 管理 API | 2/4 | 50% | 流量/详情统计、代理 CRUD |
+| 管理 API | 3/4 | 75% | 流量/详情统计 |
 | CLI 运维 | 3/3 | 100% | — |
-| **合计** | **32/44** | **73%** | — |
+| **合计** | **33/44** | **75%** | — |
 
 > 计分口径：一项能力「等价或更强」记 1 分；缺失 / 仅占位 / 显著弱化记 0 分。
 
@@ -150,14 +150,14 @@
 | **代理详情 / 流量统计** | ❌ | ✅ `/api/traffic/{name}`、`/api/v2/proxies/{name}/traffic` |
 | 客户端列表 / 详情 | ⚠️ `/api/controllers`（简版） | ✅ `/api/clients`、`/api/v2/clients/{key}` |
 | 离线代理清理 | ❌ | ✅ `DELETE /api/proxies?status=offline` |
-| **运行时增删代理（CRUD）** | ❌ 只有 reload | ✅ 通过 frpc `PUT /api/config` |
+| **运行时增删代理（CRUD）** | ✅ `PUT /config`（校验+原子落盘+自动重载，未配认证时 403 禁用） | ✅ 通过 frpc `PUT /api/config` |
 | 用户管理 | ❌ | ✅ `/api/v2/users` |
 
 **frpc 侧管理 API**
 
 | 端点 | rust_frp | frp 0.71 |
 |------|:--------:|:--------:|
-| reload / stop / status / config | ✅ reload（POST /reload）、status（GET /status）；❌ stop/config | ✅ `/api/reload`、`/api/stop`、`/api/status`、`GET/PUT /api/config` |
+| reload / stop / status / config | ✅ reload、status、GET/PUT /config；❌ stop | ✅ `/api/reload`、`/api/stop`、`/api/status`、`GET/PUT /api/config` |
 | Store 源代理 CRUD | ❌ | ✅ Create/Update/Delete StoreProxy |
 
 **CLI 子命令**
@@ -192,7 +192,7 @@
 | 1 | 配置字段命名 snake_case（原版 camelCase） | ✅ **已落地**（2026-10-04）：全部结构体加 serde `alias`，snake_case/camelCase 双向兼容，原版配置可直接复用 |
 | 2 | 未启用 `deny_unknown_fields` | ⚠️ **以 WARN 告警模式落地**（2026-10-04）：未知字段逐条 WARN 不拒绝——硬拒绝会误杀原版配置中本项目暂不支持的字段（`log.*`、`loginFailExit` 等），告警是兼容性取舍 |
 | 3 | ~~无 `frpc reload/status/verify` CLI~~ | ✅ 已实现（2026-10-04）：verify 本地校验；reload/status 走 frpc 管理端口（Basic Auth 保护） |
-| 4 | **无代理 CRUD / frpc 管理 API** | ❌ 待实现：无法运行时动态增删代理（原版 `PUT /api/config`） |
+| 4 | ~~无代理 CRUD / frpc 管理 API~~ | ✅ 已实现（2026-10-04）：`GET/PUT /config` + `POST /reload` + `GET /status`；config 端点未配认证时 403 禁用 |
 
 ### P1 — 能力缺口（功能对不齐）
 | # | 缺口 | 现状 |
