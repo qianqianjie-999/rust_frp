@@ -273,7 +273,7 @@ pub fn classify_work_conn(first_byte: u8, tls_available: bool, tls_only: bool) -
 }
 
 /// 工作连接错误日志（对端断开类错误降级为 debug，避免日志噪音）
-pub(crate) fn log_work_conn_error(e: &Box<dyn std::error::Error + Send + Sync>) {
+pub(crate) fn log_work_conn_error(e: &(dyn std::error::Error + Send + Sync)) {
     let msg = e.to_string().to_lowercase();
     if msg.contains("connection reset")
         || msg.contains("connection aborted")

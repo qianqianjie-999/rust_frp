@@ -1,6 +1,5 @@
 //! 代理管理：注册、端口分配、监听器生命周期与分组
 
-use rust_frp_auth::AuthManager;
 use rust_frp_core::{Message, ProxyManager};
 use rust_frp_net::WebSocketConn;
 use std::net::SocketAddr;
@@ -195,8 +194,6 @@ pub struct ServerProxyManager {
     control_manager: Arc<ControlManager>,
     /// 工作连接管理器
     work_conn_manager: Arc<ServerWorkConnManager>,
-    /// 认证管理器（用于生成 sign_key）
-    auth_manager: Arc<AuthManager>,
     /// 允许的端口列表（空列表 = 默认拒绝所有）
     allow_ports: Vec<rust_frp_config::PortRange>,
     /// 单用户最大端口配额（None = 不限制，对应 max_ports_per_user 配置）
@@ -241,7 +238,6 @@ impl ServerProxyManager {
         proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
         control_manager: Arc<ControlManager>,
         work_conn_manager: Arc<ServerWorkConnManager>,
-        auth_manager: Arc<AuthManager>,
         allow_ports: Vec<rust_frp_config::PortRange>,
         max_ports_per_user: Option<usize>,
     ) -> Self {
@@ -259,7 +255,6 @@ impl ServerProxyManager {
             proxy_owners,
             control_manager,
             work_conn_manager,
-            auth_manager,
             allow_ports,
             max_ports_per_user,
             user_port_counts: RwLock::new(std::collections::HashMap::new()),
@@ -274,505 +269,487 @@ impl ServerProxyManager {
         config: &rust_frp_config::ProxyConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match config.r#type.as_str() {
-            "tcp" => {
-                if let Some(remote_port) = config.remote_port {
-                    // 检查端口是否在允许列表中（空列表 = 默认拒绝所有）
-                    if !port_allowed(remote_port, &self.allow_ports) {
-                        return Err(format!(
-                            "Port {} is not in the allowed ports list",
-                            remote_port
-                        )
-                        .into());
-                    }
-
-                    // 负载均衡分组：加入组；首成员绑定端口，后续成员共享监听器
-                    let group_port = if let Some(ref group) = config.group {
-                        let group_key = config.group_key.clone().unwrap_or_default();
-                        let first = self
-                            .group_registry
-                            .join(group, &group_key, remote_port, &config.name)
-                            .await
-                            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                                e.into()
-                            })?;
-                        if !first {
-                            // 共享已有监听器，本成员无需绑定
-                            return Ok(());
-                        }
-                        Some(remote_port)
-                    } else {
-                        None
-                    };
-
-                    let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
-                    let listener = tokio::net::TcpListener::bind(&addr).await?;
-                    let proxy_name = config.name.clone();
-                    let listeners = self.listeners.clone();
-
-                    // 使用Arc来共享listener
-                    let listener_arc = std::sync::Arc::new(listener);
-                    let listener_clone = listener_arc.clone();
-
-                    // 创建一个原子布尔值来控制任务的运行
-                    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-                    let running_clone = running.clone();
-
-                    // 共享状态用于工作连接协议
-                    let proxy_owners = self.proxy_owners.clone();
-                    let control_manager = self.control_manager.clone();
-                    let work_conn_manager = self.work_conn_manager.clone();
-                    let auth_manager = self.auth_manager.clone();
-                    let plugin_config = config.plugin.clone();
-                    // 分组分发：accept 循环内 round-robin 选取成员
-                    let group_registry = self.group_registry.clone();
-
-                    let handle = tokio::spawn(async move {
-                        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                            match listener_clone.accept().await {
-                                Ok((visitor_conn, visitor_addr)) => {
-                                    log::info!(
-                                        "new TCP connection for proxy {} from {}",
-                                        proxy_name,
-                                        visitor_addr
-                                    );
-
-                                    let proxy_name_clone = proxy_name.clone();
-                                    let proxy_owners = proxy_owners.clone();
-                                    let control_manager = control_manager.clone();
-                                    let work_conn_manager = work_conn_manager.clone();
-                                    let auth_manager = auth_manager.clone();
-                                    let _ = &auth_manager;
-                                    let plugin_config = plugin_config.clone();
-                                    let group_registry = group_registry.clone();
-
-                                    tokio::spawn(async move {
-                                        log::debug!("开始处理外部连接: proxy={}", proxy_name_clone);
-
-                                        // 负载均衡分组：round-robin 选取实际处理连接的成员
-                                        let target_name = if let Some(port) = group_port {
-                                            match group_registry.pick(port).await {
-                                                Some(name) => {
-                                                    log::debug!(
-                                                        "group port {} picked member [{}] (connection from {})",
-                                                        port,
-                                                        name,
-                                                        visitor_addr
-                                                    );
-                                                    name
-                                                }
-                                                None => {
-                                                    log::error!(
-                                                        "group on port {} has no available members",
-                                                        port
-                                                    );
-                                                    let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 29\r\n\r\nNo available group members");
-                                                    return;
-                                                }
-                                            }
-                                        } else {
-                                            proxy_name_clone.clone()
-                                        };
-
-                                        // per-proxy 连接统计守卫（drop 时自动减一，按实际服务成员计）
-                                        let _conn_guard = global_metrics()
-                                            .get_proxy_stat(&target_name)
-                                            .map(ProxyConnGuard::acquire);
-
-                                        // 检查是否有插件配置（插件直接处理访问者连接，不需要工作连接）
-                                        if let Some(ref pconf) = plugin_config {
-                                            log::debug!(
-                                                "使用插件处理连接: proxy={}",
-                                                proxy_name_clone
-                                            );
-                                            let plugin_mgr = rust_frp_plugin::PluginManager::new();
-                                            match plugin_mgr.create_plugin(pconf) {
-                                                Ok(mut plugin) => {
-                                                    if let Err(e) =
-                                                        plugin.handle(Box::new(visitor_conn)).await
-                                                    {
-                                                        log::error!("Plugin handle error for proxy {}: {:?}", proxy_name_clone, e);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    log::error!("Failed to create plugin for proxy {}: {:?}", proxy_name_clone, e);
-                                                }
-                                            }
-                                            return;
-                                        }
-
-                                        log::debug!("使用工作连接协议处理: proxy={}", target_name);
-
-                                        // 1. 查找代理对应的 run_id
-                                        let run_id = {
-                                            let owners = proxy_owners.read().await;
-                                            owners.get(&target_name).cloned()
-                                        };
-
-                                        log::debug!(
-                                            "查找代理所有者: proxy={}, found={}",
-                                            target_name,
-                                            run_id.is_some()
-                                        );
-
-                                        let run_id = match run_id {
-                                            Some(id) => id,
-                                            None => {
-                                                log::error!(
-                                                    "No owner found for proxy: {}",
-                                                    target_name
-                                                );
-                                                let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 30\r\n\r\nProxy not registered by any client");
-                                                return;
-                                            }
-                                        };
-
-                                        log::debug!(
-                                            "找到代理所有者: proxy={}, run_id={}",
-                                            target_name,
-                                            run_id
-                                        );
-
-                                        // 2. 获取对应的消息通道
-                                        let msg_tx = match control_manager.get_msg_tx(&run_id).await
-                                        {
-                                            Some(tx) => tx,
-                                            None => {
-                                                log::error!(
-                                                    "Message channel not found for run_id: {}",
-                                                    run_id
-                                                );
-                                                let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 37\r\n\r\nMessage channel not found");
-                                                return;
-                                            }
-                                        };
-
-                                        log::debug!(
-                                            "找到消息通道: proxy={}, run_id={}",
-                                            target_name,
-                                            run_id
-                                        );
-
-                                        // 3. 从池中获取工作连接（池为空时会自动请求）
-                                        match work_conn_manager
-                                            .get_work_conn(
-                                                &target_name,
-                                                &msg_tx,
-                                                Duration::from_secs(30),
-                                                visitor_addr,
-                                            )
-                                            .await
-                                        {
-                                            Ok(work_conn) => {
-                                                log::info!("Got work conn for proxy {}, bridging with visitor", target_name);
-                                                if let Err(e) = rust_frp_util::bridge_streams(
-                                                    visitor_conn,
-                                                    work_conn,
-                                                )
-                                                .await
-                                                {
-                                                    log::error!(
-                                                        "Bridge error for proxy {}: {:?}",
-                                                        target_name,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "Failed to get work conn for {}: {}",
-                                                    target_name,
-                                                    e
-                                                );
-                                                let _ = visitor_conn.try_write(
-                                                    b"HTTP/1.1 504 Gateway Timeout\r\n\r\n",
-                                                );
-                                            }
-                                        }
-                                    });
-                                }
-                                Err(e) => {
-                                    log::error!("accept TCP connection error: {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                        log::info!("TCP proxy {} stopped", proxy_name);
-                    });
-
-                    // 分组代理的监听器按组端口键存储（与代理名空间隔离，
-                    // 成员进出不影响共享监听器；组空时由 stop_proxy 清理）
-                    let listener_key = match group_port {
-                        Some(port) => group_listener_key(port),
-                        None => config.name.clone(),
-                    };
-                    let mut listeners = listeners.write().await;
-                    listeners.insert(listener_key.clone(), (listener_arc, running));
-                    let mut handles = self.accept_handles.write().await;
-                    handles.insert(listener_key, handle);
-                }
-            }
-            "http" => {
-                // HTTP 代理 - 注册到虚拟主机路由器
-                let mut domains = Vec::new();
-
-                // 添加自定义域名
-                if let Some(custom_domains) = &config.custom_domains {
-                    domains.extend(custom_domains.clone());
-                }
-
-                // 添加子域名
-                if let Some(subdomain) = &config.subdomain {
-                    // 这里可以配置基础域名，例如: subdomain.example.com
-                    domains.push(subdomain.clone());
-                }
-
-                if !domains.is_empty() {
-                    self.http_vhost_router
-                        .register_proxy(config.name.clone(), domains, config.clone())
-                        .await;
-                    log::info!(
-                        "HTTP proxy {} registered with domains: {:?}",
-                        config.name,
-                        config.custom_domains
-                    );
-                } else {
-                    log::warn!("HTTP proxy {} has no domains configured", config.name);
-                }
-            }
-            "https" => {
-                // HTTPS 代理 - 类似于 HTTP，但需要 TLS 处理
-                let mut domains = Vec::new();
-
-                if let Some(custom_domains) = &config.custom_domains {
-                    domains.extend(custom_domains.clone());
-                }
-
-                if let Some(subdomain) = &config.subdomain {
-                    domains.push(subdomain.clone());
-                }
-
-                if !domains.is_empty() {
-                    self.http_vhost_router
-                        .register_proxy(config.name.clone(), domains, config.clone())
-                        .await;
-                    log::info!(
-                        "HTTPS proxy {} registered with domains: {:?}",
-                        config.name,
-                        config.custom_domains
-                    );
-                }
-            }
-            "udp" => {
-                if let Some(remote_port) = config.remote_port {
-                    if !port_allowed(remote_port, &self.allow_ports) {
-                        return Err(format!(
-                            "Port {} is not in the allowed ports list",
-                            remote_port
-                        )
-                        .into());
-                    }
-                    let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
-                    let socket = tokio::net::UdpSocket::bind(&addr).await?;
-                    let socket = Arc::new(socket);
-                    let socket_clone = socket.clone();
-                    let proxy_name = config.name.clone();
-                    let proxy_owners = self.proxy_owners.clone();
-                    let control_manager = self.control_manager.clone();
-                    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-                    let running_clone = running.clone();
-
-                    self.udp_sessions.write().await.insert(
-                        config.name.clone(),
-                        UdpProxySession {
-                            socket: socket.clone(),
-                            running: running.clone(),
-                        },
-                    );
-
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 65535];
-                        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(1),
-                                socket_clone.recv_from(&mut buf),
-                            )
-                            .await
-                            {
-                                Ok(Ok((n, src_addr))) => {
-                                    let data = buf[..n].to_vec();
-                                    let run_id = {
-                                        let owners = proxy_owners.read().await;
-                                        owners.get(&proxy_name).cloned()
-                                    };
-                                    if let Some(run_id) = run_id {
-                                        if let Some(msg_tx) =
-                                            control_manager.get_msg_tx(&run_id).await
-                                        {
-                                            let udp_msg = rust_frp_core::UdpPacketMsg {
-                                                proxy_name: proxy_name.clone(),
-                                                data,
-                                                client_addr: Some(src_addr.to_string()),
-                                            };
-                                            let _ = msg_tx.send(Message::UdpPacket(udp_msg)).await;
-                                        }
-                                    }
-                                }
-                                Ok(Err(e)) => {
-                                    log::error!("UDP recv error for proxy {}: {:?}", proxy_name, e);
-                                    break;
-                                }
-                                Err(_) => {
-                                    continue;
-                                }
-                            }
-                        }
-                        log::info!("UDP proxy {} stopped", proxy_name);
-                    });
-
-                    log::info!("UDP proxy {} listening on {}", config.name, addr);
-                } else {
-                    return Err("UDP proxy requires remote_port".into());
-                }
-            }
-            "websocket" => {
-                if let Some(remote_port) = config.remote_port {
-                    if !port_allowed(remote_port, &self.allow_ports) {
-                        return Err(format!(
-                            "Port {} is not in the allowed ports list",
-                            remote_port
-                        )
-                        .into());
-                    }
-                    let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
-                    let listener = tokio::net::TcpListener::bind(&addr).await?;
-                    let proxy_name = config.name.clone();
-                    let listeners = self.listeners.clone();
-                    let listener_arc = std::sync::Arc::new(listener);
-                    let listener_clone = listener_arc.clone();
-                    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-                    let running_clone = running.clone();
-                    let proxy_owners = self.proxy_owners.clone();
-                    let control_manager = self.control_manager.clone();
-                    let work_conn_manager = self.work_conn_manager.clone();
-                    let auth_manager = self.auth_manager.clone();
-
-                    let handle = tokio::spawn(async move {
-                        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                            match listener_clone.accept().await {
-                                Ok((visitor_conn, visitor_addr)) => {
-                                    log::info!(
-                                        "new WebSocket connection for proxy {} from {}",
-                                        proxy_name,
-                                        visitor_addr
-                                    );
-
-                                    let proxy_name_clone = proxy_name.clone();
-                                    let proxy_owners = proxy_owners.clone();
-                                    let control_manager = control_manager.clone();
-                                    let work_conn_manager = work_conn_manager.clone();
-                                    let _auth_manager = auth_manager.clone();
-
-                                    tokio::spawn(async move {
-                                        // per-proxy 连接统计守卫（drop 时自动减一）
-                                        let _conn_guard = global_metrics()
-                                            .get_proxy_stat(&proxy_name_clone)
-                                            .map(ProxyConnGuard::acquire);
-                                        let ws_stream = match accept_async(visitor_conn).await {
-                                            Ok(ws) => ws,
-                                            Err(e) => {
-                                                log::error!(
-                                                    "WebSocket upgrade failed for proxy {}: {:?}",
-                                                    proxy_name_clone,
-                                                    e
-                                                );
-                                                return;
-                                            }
-                                        };
-
-                                        let run_id = {
-                                            let owners = proxy_owners.read().await;
-                                            owners.get(&proxy_name_clone).cloned()
-                                        };
-
-                                        let run_id = match run_id {
-                                            Some(id) => id,
-                                            None => {
-                                                log::error!(
-                                                    "No owner found for proxy: {}",
-                                                    proxy_name_clone
-                                                );
-                                                return;
-                                            }
-                                        };
-
-                                        let msg_tx = match control_manager.get_msg_tx(&run_id).await
-                                        {
-                                            Some(tx) => tx,
-                                            None => {
-                                                log::error!(
-                                                    "Message channel not found for run_id: {}",
-                                                    run_id
-                                                );
-                                                return;
-                                            }
-                                        };
-
-                                        // 从池中获取工作连接
-                                        match work_conn_manager
-                                            .get_work_conn(
-                                                &proxy_name_clone,
-                                                &msg_tx,
-                                                Duration::from_secs(30),
-                                                visitor_addr,
-                                            )
-                                            .await
-                                        {
-                                            Ok(work_conn) => {
-                                                log::info!("Got work conn for WebSocket proxy {}, bridging", proxy_name_clone);
-                                                let ws_conn =
-                                                    WebSocketConn::new(ws_stream, visitor_addr);
-                                                if let Err(e) = rust_frp_util::bridge_streams(
-                                                    ws_conn, work_conn,
-                                                )
-                                                .await
-                                                {
-                                                    log::error!(
-                                                        "WebSocket bridge error for proxy {}: {:?}",
-                                                        proxy_name_clone,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "Failed to get work conn for {}: {}",
-                                                    proxy_name_clone,
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    });
-                                }
-                                Err(e) => {
-                                    log::error!("accept WebSocket connection error: {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                        log::info!("WebSocket proxy {} stopped", proxy_name);
-                    });
-
-                    let mut listeners = listeners.write().await;
-                    listeners.insert(config.name.clone(), (listener_arc, running));
-                    let mut handles = self.accept_handles.write().await;
-                    handles.insert(config.name.clone(), handle);
-                }
-            }
+            "tcp" => self.start_tcp_proxy(config).await?,
+            "http" => self.register_vhost_proxy(config, "HTTP").await?,
+            "https" => self.register_vhost_proxy(config, "HTTPS").await?,
+            "udp" => self.start_udp_proxy(config).await?,
+            "websocket" => self.start_websocket_proxy(config).await?,
             _ => {
                 log::warn!("unsupported proxy type: {}", config.r#type);
             }
         }
         Ok(())
+    }
+
+    /// TCP 代理：绑定远端端口，accept 循环（分组分发 / 插件 / 工作连接桥接）
+    async fn start_tcp_proxy(
+        &self,
+        config: &rust_frp_config::ProxyConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(remote_port) = config.remote_port {
+            // 检查端口是否在允许列表中（空列表 = 默认拒绝所有）
+            if !port_allowed(remote_port, &self.allow_ports) {
+                return Err(
+                    format!("Port {} is not in the allowed ports list", remote_port).into(),
+                );
+            }
+
+            // 负载均衡分组：加入组；首成员绑定端口，后续成员共享监听器
+            let group_port = if let Some(ref group) = config.group {
+                let group_key = config.group_key.clone().unwrap_or_default();
+                let first = self
+                    .group_registry
+                    .join(group, &group_key, remote_port, &config.name)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                if !first {
+                    // 共享已有监听器，本成员无需绑定
+                    return Ok(());
+                }
+                Some(remote_port)
+            } else {
+                None
+            };
+
+            let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            let proxy_name = config.name.clone();
+            let listeners = self.listeners.clone();
+
+            // 使用Arc来共享listener
+            let listener_arc = std::sync::Arc::new(listener);
+            let listener_clone = listener_arc.clone();
+
+            // 创建一个原子布尔值来控制任务的运行
+            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let running_clone = running.clone();
+
+            // 共享状态用于工作连接协议
+            let proxy_owners = self.proxy_owners.clone();
+            let control_manager = self.control_manager.clone();
+            let work_conn_manager = self.work_conn_manager.clone();
+            let plugin_config = config.plugin.clone();
+            // 分组分发：accept 循环内 round-robin 选取成员
+            let group_registry = self.group_registry.clone();
+            let handle = tokio::spawn(async move {
+                while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    match listener_clone.accept().await {
+                        Ok((visitor_conn, visitor_addr)) => {
+                            log::info!(
+                                "new TCP connection for proxy {} from {}",
+                                proxy_name,
+                                visitor_addr
+                            );
+
+                            let proxy_name_clone = proxy_name.clone();
+                            let proxy_owners = proxy_owners.clone();
+                            let control_manager = control_manager.clone();
+                            let work_conn_manager = work_conn_manager.clone();
+                            let plugin_config = plugin_config.clone();
+                            let group_registry = group_registry.clone();
+                            tokio::spawn(ServerProxyManager::serve_tcp_visitor(
+                                proxy_name_clone,
+                                group_port,
+                                visitor_conn,
+                                visitor_addr,
+                                proxy_owners,
+                                control_manager,
+                                work_conn_manager,
+                                plugin_config,
+                                group_registry,
+                            ));
+                        }
+                        Err(e) => {
+                            log::error!("accept TCP connection error: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+                log::info!("TCP proxy {} stopped", proxy_name);
+            });
+
+            // 分组代理的监听器按组端口键存储（与代理名空间隔离，
+            // 成员进出不影响共享监听器；组空时由 stop_proxy 清理）
+            let listener_key = match group_port {
+                Some(port) => group_listener_key(port),
+                None => config.name.clone(),
+            };
+            let mut listeners = listeners.write().await;
+            listeners.insert(listener_key.clone(), (listener_arc, running));
+            let mut handles = self.accept_handles.write().await;
+            handles.insert(listener_key, handle);
+        }
+        Ok(())
+    }
+
+    /// HTTP/HTTPS 代理：注册到虚拟主机路由器（custom_domains + subdomain）
+    async fn register_vhost_proxy(
+        &self,
+        config: &rust_frp_config::ProxyConfig,
+        kind: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut domains = Vec::new();
+
+        if let Some(custom_domains) = &config.custom_domains {
+            domains.extend(custom_domains.clone());
+        }
+
+        if let Some(subdomain) = &config.subdomain {
+            domains.push(subdomain.clone());
+        }
+
+        if !domains.is_empty() {
+            self.http_vhost_router
+                .register_proxy(config.name.clone(), domains, config.clone())
+                .await;
+            log::info!(
+                "{} proxy {} registered with domains: {:?}",
+                kind,
+                config.name,
+                config.custom_domains
+            );
+        } else {
+            log::warn!("{} proxy {} has no domains configured", kind, config.name);
+        }
+        Ok(())
+    }
+
+    /// UDP 代理：绑定远端端口，收包转 UdpPacket 消息给对应客户端
+    async fn start_udp_proxy(
+        &self,
+        config: &rust_frp_config::ProxyConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(remote_port) = config.remote_port {
+            if !port_allowed(remote_port, &self.allow_ports) {
+                return Err(
+                    format!("Port {} is not in the allowed ports list", remote_port).into(),
+                );
+            }
+            let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
+            let socket = tokio::net::UdpSocket::bind(&addr).await?;
+            let socket = Arc::new(socket);
+            let socket_clone = socket.clone();
+            let proxy_name = config.name.clone();
+            let proxy_owners = self.proxy_owners.clone();
+            let control_manager = self.control_manager.clone();
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let running_clone = running.clone();
+
+            self.udp_sessions.write().await.insert(
+                config.name.clone(),
+                UdpProxySession {
+                    socket: socket.clone(),
+                    running: running.clone(),
+                },
+            );
+
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        socket_clone.recv_from(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok((n, src_addr))) => {
+                            let data = buf[..n].to_vec();
+                            let run_id = {
+                                let owners = proxy_owners.read().await;
+                                owners.get(&proxy_name).cloned()
+                            };
+                            if let Some(run_id) = run_id {
+                                if let Some(msg_tx) = control_manager.get_msg_tx(&run_id).await {
+                                    let udp_msg = rust_frp_core::UdpPacketMsg {
+                                        proxy_name: proxy_name.clone(),
+                                        data,
+                                        client_addr: Some(src_addr.to_string()),
+                                    };
+                                    let _ = msg_tx.send(Message::UdpPacket(udp_msg)).await;
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            log::error!("UDP recv error for proxy {}: {:?}", proxy_name, e);
+                            break;
+                        }
+                        Err(_) => {
+                            continue;
+                        }
+                    }
+                }
+                log::info!("UDP proxy {} stopped", proxy_name);
+            });
+
+            log::info!("UDP proxy {} listening on {}", config.name, addr);
+        } else {
+            return Err("UDP proxy requires remote_port".into());
+        }
+        Ok(())
+    }
+
+    /// WebSocket 代理：绑定远端端口，accept 循环（WS 升级 + 工作连接桥接）
+    async fn start_websocket_proxy(
+        &self,
+        config: &rust_frp_config::ProxyConfig,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(remote_port) = config.remote_port {
+            if !port_allowed(remote_port, &self.allow_ports) {
+                return Err(
+                    format!("Port {} is not in the allowed ports list", remote_port).into(),
+                );
+            }
+            let addr = format!("0.0.0.0:{}", remote_port).parse::<SocketAddr>()?;
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            let proxy_name = config.name.clone();
+            let listeners = self.listeners.clone();
+            let listener_arc = std::sync::Arc::new(listener);
+            let listener_clone = listener_arc.clone();
+            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let running_clone = running.clone();
+            let proxy_owners = self.proxy_owners.clone();
+            let control_manager = self.control_manager.clone();
+            let work_conn_manager = self.work_conn_manager.clone();
+            let handle = tokio::spawn(async move {
+                while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    match listener_clone.accept().await {
+                        Ok((visitor_conn, visitor_addr)) => {
+                            log::info!(
+                                "new WebSocket connection for proxy {} from {}",
+                                proxy_name,
+                                visitor_addr
+                            );
+
+                            let proxy_name_clone = proxy_name.clone();
+                            let proxy_owners = proxy_owners.clone();
+                            let control_manager = control_manager.clone();
+                            let work_conn_manager = work_conn_manager.clone();
+
+                            tokio::spawn(ServerProxyManager::serve_websocket_visitor(
+                                proxy_name_clone,
+                                visitor_conn,
+                                visitor_addr,
+                                proxy_owners,
+                                control_manager,
+                                work_conn_manager,
+                            ));
+                        }
+                        Err(e) => {
+                            log::error!("accept WebSocket connection error: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+                log::info!("WebSocket proxy {} stopped", proxy_name);
+            });
+
+            let mut listeners = listeners.write().await;
+            listeners.insert(config.name.clone(), (listener_arc, running));
+            let mut handles = self.accept_handles.write().await;
+            handles.insert(config.name.clone(), handle);
+        }
+        Ok(())
+    }
+
+    /// 处理单个 TCP 访客连接：分组分发 / 插件处理 / 工作连接桥接（由 accept 循环 spawn）
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_tcp_visitor(
+        proxy_name_clone: String,
+        group_port: Option<u16>,
+        visitor_conn: tokio::net::TcpStream,
+        visitor_addr: SocketAddr,
+        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        control_manager: Arc<ControlManager>,
+        work_conn_manager: Arc<ServerWorkConnManager>,
+        plugin_config: Option<rust_frp_config::PluginConfig>,
+        group_registry: Arc<GroupRegistry>,
+    ) {
+        log::debug!("开始处理外部连接: proxy={}", proxy_name_clone);
+
+        // 负载均衡分组：round-robin 选取实际处理连接的成员
+        let target_name = if let Some(port) = group_port {
+            match group_registry.pick(port).await {
+                Some(name) => {
+                    log::debug!(
+                        "group port {} picked member [{}] (connection from {})",
+                        port,
+                        name,
+                        visitor_addr
+                    );
+                    name
+                }
+                None => {
+                    log::error!("group on port {} has no available members", port);
+                    let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 29\r\n\r\nNo available group members");
+                    return;
+                }
+            }
+        } else {
+            proxy_name_clone.clone()
+        };
+
+        // per-proxy 连接统计守卫（drop 时自动减一，按实际服务成员计）
+        let _conn_guard = global_metrics()
+            .get_proxy_stat(&target_name)
+            .map(ProxyConnGuard::acquire);
+
+        // 检查是否有插件配置（插件直接处理访问者连接，不需要工作连接）
+        if let Some(ref pconf) = plugin_config {
+            log::debug!("使用插件处理连接: proxy={}", proxy_name_clone);
+            let plugin_mgr = rust_frp_plugin::PluginManager::new();
+            match plugin_mgr.create_plugin(pconf) {
+                Ok(mut plugin) => {
+                    if let Err(e) = plugin.handle(Box::new(visitor_conn)).await {
+                        log::error!(
+                            "Plugin handle error for proxy {}: {:?}",
+                            proxy_name_clone,
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to create plugin for proxy {}: {:?}",
+                        proxy_name_clone,
+                        e
+                    );
+                }
+            }
+            return;
+        }
+
+        log::debug!("使用工作连接协议处理: proxy={}", target_name);
+
+        // 1. 查找代理对应的 run_id
+        let run_id = {
+            let owners = proxy_owners.read().await;
+            owners.get(&target_name).cloned()
+        };
+
+        log::debug!(
+            "查找代理所有者: proxy={}, found={}",
+            target_name,
+            run_id.is_some()
+        );
+
+        let run_id = match run_id {
+            Some(id) => id,
+            None => {
+                log::error!("No owner found for proxy: {}", target_name);
+                let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 30\r\n\r\nProxy not registered by any client");
+                return;
+            }
+        };
+
+        log::debug!("找到代理所有者: proxy={}, run_id={}", target_name, run_id);
+
+        // 2. 获取对应的消息通道
+        let msg_tx = match control_manager.get_msg_tx(&run_id).await {
+            Some(tx) => tx,
+            None => {
+                log::error!("Message channel not found for run_id: {}", run_id);
+                let _ = visitor_conn.try_write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 37\r\n\r\nMessage channel not found");
+                return;
+            }
+        };
+
+        log::debug!("找到消息通道: proxy={}, run_id={}", target_name, run_id);
+
+        // 3. 从池中获取工作连接（池为空时会自动请求）
+        match work_conn_manager
+            .get_work_conn(&target_name, &msg_tx, Duration::from_secs(30), visitor_addr)
+            .await
+        {
+            Ok(work_conn) => {
+                log::info!(
+                    "Got work conn for proxy {}, bridging with visitor",
+                    target_name
+                );
+                if let Err(e) = rust_frp_util::bridge_streams(visitor_conn, work_conn).await {
+                    log::error!("Bridge error for proxy {}: {:?}", target_name, e);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to get work conn for {}: {}", target_name, e);
+                let _ = visitor_conn.try_write(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n");
+            }
+        }
+    }
+
+    /// 处理单个 WebSocket 访客连接：升级 + 工作连接桥接（由 accept 循环 spawn）
+    async fn serve_websocket_visitor(
+        proxy_name_clone: String,
+        visitor_conn: tokio::net::TcpStream,
+        visitor_addr: SocketAddr,
+        proxy_owners: Arc<RwLock<std::collections::HashMap<String, String>>>,
+        control_manager: Arc<ControlManager>,
+        work_conn_manager: Arc<ServerWorkConnManager>,
+    ) {
+        // per-proxy 连接统计守卫（drop 时自动减一）
+        let _conn_guard = global_metrics()
+            .get_proxy_stat(&proxy_name_clone)
+            .map(ProxyConnGuard::acquire);
+        let ws_stream = match accept_async(visitor_conn).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                log::error!(
+                    "WebSocket upgrade failed for proxy {}: {:?}",
+                    proxy_name_clone,
+                    e
+                );
+                return;
+            }
+        };
+
+        let run_id = {
+            let owners = proxy_owners.read().await;
+            owners.get(&proxy_name_clone).cloned()
+        };
+
+        let run_id = match run_id {
+            Some(id) => id,
+            None => {
+                log::error!("No owner found for proxy: {}", proxy_name_clone);
+                return;
+            }
+        };
+
+        let msg_tx = match control_manager.get_msg_tx(&run_id).await {
+            Some(tx) => tx,
+            None => {
+                log::error!("Message channel not found for run_id: {}", run_id);
+                return;
+            }
+        };
+
+        // 从池中获取工作连接
+        match work_conn_manager
+            .get_work_conn(
+                &proxy_name_clone,
+                &msg_tx,
+                Duration::from_secs(30),
+                visitor_addr,
+            )
+            .await
+        {
+            Ok(work_conn) => {
+                log::info!(
+                    "Got work conn for WebSocket proxy {}, bridging",
+                    proxy_name_clone
+                );
+                let ws_conn = WebSocketConn::new(ws_stream, visitor_addr);
+                if let Err(e) = rust_frp_util::bridge_streams(ws_conn, work_conn).await {
+                    log::error!(
+                        "WebSocket bridge error for proxy {}: {:?}",
+                        proxy_name_clone,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to get work conn for {}: {}", proxy_name_clone, e);
+            }
+        }
     }
 
     pub async fn stop_proxy(

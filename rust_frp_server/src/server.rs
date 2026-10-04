@@ -110,7 +110,6 @@ impl Server {
             proxy_owners.clone(),
             control_manager.clone(),
             work_conn_manager.clone(),
-            auth_manager.clone(),
             config.allow_ports.clone(),
             config.max_ports_per_user,
         ));
@@ -442,7 +441,7 @@ impl Server {
                                         )
                                         .await
                                         {
-                                            log_work_conn_error(&e);
+                                            log_work_conn_error(e.as_ref());
                                         }
                                     }
                                     Err(e) => {
@@ -456,7 +455,7 @@ impl Server {
                                 if let Err(e) =
                                     Self::process_work_conn(Box::new(conn), cm, wcm, am, sbm).await
                                 {
-                                    log_work_conn_error(&e);
+                                    log_work_conn_error(e.as_ref());
                                 }
                             }
                             WorkConnClass::Reject => {
@@ -1008,8 +1007,8 @@ impl Server {
                     metrics_data["total_connections"],
                     metrics_data["current_proxies"],
                     metrics_data["total_proxies"],
-                    metrics_data["bytes_sent"].as_u64().unwrap() / 1024,
-                    metrics_data["bytes_received"].as_u64().unwrap() / 1024
+                    metrics_data["bytes_sent"].as_u64().unwrap_or(0) / 1024,
+                    metrics_data["bytes_received"].as_u64().unwrap_or(0) / 1024
                 );
             }
         });
@@ -1382,24 +1381,17 @@ impl Server {
         let cm = control_manager.clone();
         let wcm = work_conn_manager.clone();
         let dispatch = tokio::spawn(async move {
-            loop {
-                match dispatch_session.accept_stream().await {
-                    Ok(stream) => {
-                        log::info!("New mux work stream");
-                        let cm = cm.clone();
-                        let wcm = wcm.clone();
-                        let am = am.clone();
-                        let sbm = sbm.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                Server::process_work_conn(stream, cm, wcm, am, sbm).await
-                            {
-                                log_work_conn_error(&e);
-                            }
-                        });
+            while let Ok(stream) = dispatch_session.accept_stream().await {
+                log::info!("New mux work stream");
+                let cm = cm.clone();
+                let wcm = wcm.clone();
+                let am = am.clone();
+                let sbm = sbm.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = Server::process_work_conn(stream, cm, wcm, am, sbm).await {
+                        log_work_conn_error(e.as_ref());
                     }
-                    Err(_) => break, // 会话关闭
-                }
+                });
             }
             log::info!("Mux dispatch loop stopped");
         });

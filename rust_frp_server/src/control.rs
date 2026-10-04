@@ -235,84 +235,13 @@ impl Control {
                                         Ok(Ok(msg)) => {
                                             match msg {
                                                 Message::Ping(ping_msg) => {
-                                                    self.last_heartbeat = Instant::now();
-                                                    let pong_msg = rust_frp_core::PongMsg {
-                                                        timestamp: ping_msg.timestamp,
-                                                    };
-                                                    if let Err(e) = self.write_msg(&Message::Pong(pong_msg)).await {
-                                                        log::error!("Failed to send pong message: {:?}", e);
-                                                        self.cleanup_proxies().await;
-                                                        return Err(e);
-                                                    }
+                                                    self.handle_ping(ping_msg).await?;
                                                 }
                                                 Message::RegisterProxy(register_proxy_msg) => {
-                                                    let proxy = register_proxy_msg.proxy;
-                                                    let proxy_name = proxy.name.clone();
-                                                    let proxy_type = proxy.r#type.clone();
-                                                    let proxy_remote_port = proxy.remote_port;
-                                                    let proxy_secret_key = proxy.secret_key.clone();
-                                                    let result = self
-                                                        .proxy_manager
-                                                        .add_proxy_for_user(proxy, &self.user)
-                                                        .await;
-
-                                                    let error_msg = match result {
-                                                        Ok(_) => {
-                                                            self.registered_proxies.push(proxy_name.clone());
-                                                            self.proxy_owners.write().await.insert(proxy_name.clone(), self.run_id.clone());
-                                                            // stcp/xtcp 代理登记共享密钥，供访问者签名校验（fail-closed）
-                                                            if matches!(proxy_type.as_str(), "stcp" | "xtcp") {
-                                                                match proxy_secret_key.as_deref() {
-                                                                    Some(sk) if !sk.is_empty() => {
-                                                                        global_proxy_secrets().register(&proxy_name, sk);
-                                                                        log::info!("secret_key registered for {} proxy: {}", proxy_type, proxy_name);
-                                                                    }
-                                                                    _ => {
-                                                                        log::warn!(
-                                                                            "stcp/xtcp proxy {} has no secret_key configured; visitor access will be rejected",
-                                                                            proxy_name
-                                                                        );
-                                                                    }
-                                                                }
-                                                            }
-                                                            global_metrics().register_proxy_stat(&proxy_name, &proxy_type, proxy_remote_port);
-                                                            "".to_string()
-                                                        },
-                                                        Err(e) => format!("{:?}", e),
-                                                    };
-
-                                                    let resp = rust_frp_core::RegisterProxyRespMsg {
-                                                        name: proxy_name.clone(),
-                                                        error: error_msg.clone(),
-                                                    };
-
-                                                    if let Err(e) = self.write_msg(&Message::RegisterProxyResp(resp)).await {
-                                                        log::error!("Failed to send register proxy response: {:?}", e);
-                                                        self.cleanup_proxies().await;
-                                                        return Err(e);
-                                                    }
-
-                                                    if error_msg.is_empty() {
-                                                        log::info!("proxy registered: {}", proxy_name);
-                                                        // 初始化工作连接池（不做预填充，由 get_work_conn 的取后补充自然填充）
-                                                        self.work_conn_manager.init_pool(&proxy_name).await;
-                                                    } else {
-                                                        log::error!("failed to register proxy {}: {}", proxy_name, error_msg);
-                                                    }
+                                                    self.handle_register_proxy(register_proxy_msg).await?;
                                                 }
                                                 Message::ProxyStatus(proxy_status_msg) => {
-                                                    let status = self.proxy_manager.get_proxy_status(&proxy_status_msg.name).await
-                                                        .map_err(|e| format!("{:?}", e))?;
-                                                    let resp = rust_frp_core::ProxyStatusRespMsg {
-                                                        name: proxy_status_msg.name,
-                                                        status: status.unwrap_or_else(|| "unknown".to_string()),
-                                                        error: "".to_string(),
-                                                    };
-                                                    if let Err(e) = self.write_msg(&Message::ProxyStatusResp(resp)).await {
-                                                        log::error!("Failed to send proxy status response: {:?}", e);
-                                                        self.cleanup_proxies().await;
-                                                        return Err(e);
-                                                    }
+                                                    self.handle_proxy_status(proxy_status_msg).await?;
                                                 }
                                                 Message::Disconnect(disconnect_msg) => {
                                                     log::info!("Received disconnect message from client: reason={}", disconnect_msg.reason);
@@ -320,227 +249,23 @@ impl Control {
                                                     log::info!("Control::run finished (graceful disconnect)");
                                                     return Ok(());
                                                 }
+
                                                 Message::UdpPacket(udp_msg) => {
-                                                    if let Some(addr) = &udp_msg.client_addr {
-                                                        if let Err(e) = self.proxy_manager.send_udp_packet(
-                                                            &udp_msg.proxy_name,
-                                                            &udp_msg.data,
-                                                            addr,
-                                                        ).await {
-                                                            log::error!("Failed to send UDP packet to visitor: {:?}", e);
-                                                        }
-                                                    }
+                                                    self.handle_udp_packet(udp_msg).await;
                                                 }
                                                 Message::StcpVisitor(stcp_msg) => {
-                                                    log::info!(
-                                                        "Received STCP visitor request for proxy {} from client {}",
-                                                        stcp_msg.proxy_name,
-                                                        self.run_id
-                                                    );
-
-                                                    let proxy_name = stcp_msg.proxy_name.clone();
-                                                    let visitor_run_id = self.run_id.clone();
-
-                                                    // 查代理所有者与注册的共享密钥（先取值再 await，避免跨 await 持锁）
-                                                    let (proxy_run_id, registered_secret) = {
-                                                        let owners = self.proxy_owners.read().await;
-                                                        let owner = owners.get(&proxy_name).cloned();
-                                                        let secret = global_proxy_secrets().get(&proxy_name);
-                                                        (owner, secret)
-                                                    };
-
-                                                    // fail-closed：代理不存在、未登记 secret_key、签名不匹配均拒绝
-                                                    let rejection = match (&proxy_run_id, &registered_secret) {
-                                                        (None, _) => Some("proxy not found".to_string()),
-                                                        (Some(_), None) => {
-                                                            log::error!(
-                                                                "STCP proxy {} has no secret_key registered; rejecting visitor {}",
-                                                                proxy_name,
-                                                                visitor_run_id
-                                                            );
-                                                            Some("proxy secret_key not configured".to_string())
-                                                        }
-                                                        (Some(_), Some(secret)) => {
-                                                            if verify_stcp_visitor_sign(
-                                                                secret,
-                                                                &proxy_name,
-                                                                stcp_msg.timestamp,
-                                                                &stcp_msg.sign_key,
-                                                            ) {
-                                                                None
-                                                            } else {
-                                                                log::error!(
-                                                                    "STCP visitor sign verification failed for proxy {} (visitor {})",
-                                                                    proxy_name,
-                                                                    visitor_run_id
-                                                                );
-                                                                Some("invalid secret key".to_string())
-                                                            }
-                                                        }
-                                                    };
-
-                                                    if let Some(error) = rejection {
-                                                        let resp = StcpVisitorRespMsg {
-                                                            proxy_name: proxy_name.clone(),
-                                                            error,
-                                                            visitor_run_id,
-                                                        };
-                                                        if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
-                                                            log::error!("Failed to send StcpVisitorResp: {:?}", e);
-                                                        }
-                                                        continue;
-                                                    }
-
-                                                    // 签名校验通过：允许同客户端与跨客户端访问，
-                                                    // 桥接以 proxy_name 为 id，双方各自建工作连接后由桥接管理器配对
-                                                    let proxy_run_id = proxy_run_id.unwrap();
-                                                    self.stcp_bridge_manager.create_bridge(
-                                                        proxy_name.clone()
-                                                    ).await;
-
-                                                    let msg_tx_proxy = self.control_manager.get_msg_tx(&proxy_run_id).await;
-                                                    let msg_tx_visitor = self.control_manager.get_msg_tx(&visitor_run_id).await;
-
-                                                    if let Some(tx) = &msg_tx_proxy {
-                                                        let req = ReqWorkConnMsg {
-                                                            proxy_name: proxy_name.clone(),
-                                                        };
-                                                        if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
-                                                            log::error!("Failed to send ReqWorkConn to proxy: {:?}", e);
-                                                        }
-                                                    }
-
-                                                    if let Some(tx) = &msg_tx_visitor {
-                                                        let req = ReqWorkConnMsg {
-                                                            proxy_name: proxy_name.clone(),
-                                                        };
-                                                        if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
-                                                            log::error!("Failed to send ReqWorkConn to visitor: {:?}", e);
-                                                        }
-                                                    }
-
-                                                    let resp = StcpVisitorRespMsg {
-                                                        proxy_name: proxy_name.clone(),
-                                                        error: String::new(),
-                                                        visitor_run_id: visitor_run_id.clone(),
-                                                    };
-                                                    if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
-                                                        log::error!("Failed to send StcpVisitorResp: {:?}", e);
-                                                    }
+                                                    self.handle_stcp_visitor(stcp_msg).await?;
                                                 }
                                                 Message::XtcpNatInfo(xtcp_msg) => {
-                                                    log::info!(
-                                                        "Received XTCP NAT info for proxy {} from {}",
-                                                        xtcp_msg.proxy_name,
-                                                        self.run_id
-                                                    );
-
-                                                    let proxy_name = xtcp_msg.proxy_name.clone();
-                                                    let from_run_id = self.run_id.clone();
-
-                                                    let owner_run_id = {
-                                                        let owners = self.proxy_owners.read().await;
-                                                        owners.get(&proxy_name).cloned()
-                                                    };
-
-                                                    let owner_run_id = match owner_run_id {
-                                                        Some(id) => id,
-                                                        None => {
-                                                            log::error!("No proxy owner found for XTCP: {}", proxy_name);
-                                                            continue;
-                                                        }
-                                                    };
-
-                                                    let mut relay = XtcpNatInfoMsg {
-                                                        proxy_name: proxy_name.clone(),
-                                                        run_id: from_run_id.clone(),
-                                                        nat_type: xtcp_msg.nat_type.clone(),
-                                                        local_addr: xtcp_msg.local_addr.clone(),
-                                                        public_addr: xtcp_msg.public_addr.clone(),
-                                                        sign_key: xtcp_msg.sign_key.clone(),
-                                                        timestamp: xtcp_msg.timestamp,
-                                                    };
-
-                                                    if from_run_id != owner_run_id {
-                                                        // 来自 visitor：先校验 secret_key 签名（fail-closed）
-                                                        let registered_secret = global_proxy_secrets().get(&proxy_name);
-                                                        let sign_ok = match &registered_secret {
-                                                            Some(secret) => verify_stcp_visitor_sign(
-                                                                secret,
-                                                                &proxy_name,
-                                                                xtcp_msg.timestamp,
-                                                                &xtcp_msg.sign_key,
-                                                            ),
-                                                            None => false,
-                                                        };
-                                                        if !sign_ok {
-                                                            log::error!(
-                                                                "XTCP visitor sign verification failed for proxy {} (visitor {})",
-                                                                proxy_name,
-                                                                from_run_id
-                                                            );
-                                                            continue;
-                                                        }
-                                                        // 校验通过后转发时不携带签名（owner 侧无需也不可信）
-                                                        relay.sign_key = String::new();
-
-                                                        // 存储 visitor run_id 并中继给 proxy owner
-                                                        {
-                                                            let mut visitors = self.xtcp_visitors.write().await;
-                                                            visitors.insert(proxy_name.clone(), from_run_id.clone());
-                                                        }
-                                                        log::info!("XTCP visitor registered: {} -> {}", proxy_name, from_run_id);
-
-                                                        let target_tx = self.control_manager.get_msg_tx(&owner_run_id).await;
-                                                        if let Some(tx) = &target_tx {
-                                                            if let Err(e) = tx.send(Message::XtcpNatInfo(relay)).await {
-                                                                log::error!("Failed to relay XTCP NAT info to owner: {:?}", e);
-                                                            }
-                                                        }
-                                                    } else {
-                                                        // 来自 proxy owner，中继给 visitor
-                                                        let visitor_run_id = {
-                                                            let visitors = self.xtcp_visitors.read().await;
-                                                            visitors.get(&proxy_name).cloned()
-                                                        };
-
-                                                        match visitor_run_id {
-                                                            Some(vid) => {
-                                                                let target_tx = self.control_manager.get_msg_tx(&vid).await;
-                                                                if let Some(tx) = &target_tx {
-                                                                    if let Err(e) = tx.send(Message::XtcpNatInfo(relay)).await {
-                                                                        log::error!("Failed to relay XTCP NAT info to visitor: {:?}", e);
-                                                                    } else {
-                                                                        log::info!("Relayed XTCP NAT info from owner {} to visitor {}", from_run_id, vid);
-                                                                    }
-                                                                }
-                                                            }
-                                                            None => {
-                                                                log::info!("No XTCP visitor yet for proxy {}, NAT info from owner stored", proxy_name);
-                                                            }
-                                                        }
-                                                    }
+                                                    self.handle_xtcp_nat_info(xtcp_msg).await?;
                                                 }
                                                 Message::XtcpHolePunch(hp_msg) => {
-                                                    let to_run_id = hp_msg.to_run_id.clone();
-                                                    let relay = XtcpHolePunchMsg {
-                                                        proxy_name: hp_msg.proxy_name.clone(),
-                                                        from_run_id: hp_msg.from_run_id.clone(),
-                                                        to_run_id: to_run_id.clone(),
-                                                        peer_local_addr: hp_msg.peer_local_addr.clone(),
-                                                        peer_public_addr: hp_msg.peer_public_addr.clone(),
-                                                    };
-
-                                                    let target_tx = self.control_manager.get_msg_tx(&to_run_id).await;
-                                                    if let Some(tx) = &target_tx {
-                                                        if let Err(e) = tx.send(Message::XtcpHolePunch(relay)).await {
-                                                            log::error!("Failed to relay XTCP hole punch: {:?}", e);
-                                                        }
-                                                    }
+                                                    self.handle_xtcp_hole_punch(hp_msg).await;
                                                 }
                                                 _ => {
                                                     log::warn!("unexpected message in loop: {:?}", msg);
                                                 }
+
                                             }
                                         }
                                         Ok(Err(e)) => {
@@ -606,6 +331,360 @@ impl Control {
 
         Ok(())
     }
+    /// 心跳：刷新 last_heartbeat 并回 Pong
+    async fn handle_ping(
+        &mut self,
+        ping_msg: rust_frp_core::PingMsg,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.last_heartbeat = Instant::now();
+        let pong_msg = rust_frp_core::PongMsg {
+            timestamp: ping_msg.timestamp,
+        };
+        if let Err(e) = self.write_msg(&Message::Pong(pong_msg)).await {
+            log::error!("Failed to send pong message: {:?}", e);
+            self.cleanup_proxies().await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 代理注册：登记 proxy_owners/secret_key/metrics 并回执
+    async fn handle_register_proxy(
+        &mut self,
+        register_proxy_msg: rust_frp_core::RegisterProxyMsg,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let proxy = register_proxy_msg.proxy;
+        let proxy_name = proxy.name.clone();
+        let proxy_type = proxy.r#type.clone();
+        let proxy_remote_port = proxy.remote_port;
+        let proxy_secret_key = proxy.secret_key.clone();
+        let result = self
+            .proxy_manager
+            .add_proxy_for_user(proxy, &self.user)
+            .await;
+
+        let error_msg = match result {
+            Ok(_) => {
+                self.registered_proxies.push(proxy_name.clone());
+                self.proxy_owners
+                    .write()
+                    .await
+                    .insert(proxy_name.clone(), self.run_id.clone());
+                // stcp/xtcp 代理登记共享密钥，供访问者签名校验（fail-closed）
+                if matches!(proxy_type.as_str(), "stcp" | "xtcp") {
+                    match proxy_secret_key.as_deref() {
+                        Some(sk) if !sk.is_empty() => {
+                            global_proxy_secrets().register(&proxy_name, sk);
+                            log::info!(
+                                "secret_key registered for {} proxy: {}",
+                                proxy_type,
+                                proxy_name
+                            );
+                        }
+                        _ => {
+                            log::warn!(
+                                "stcp/xtcp proxy {} has no secret_key configured; visitor access will be rejected",
+                                proxy_name
+                            );
+                        }
+                    }
+                }
+                global_metrics().register_proxy_stat(&proxy_name, &proxy_type, proxy_remote_port);
+                "".to_string()
+            }
+            Err(e) => format!("{:?}", e),
+        };
+
+        let resp = rust_frp_core::RegisterProxyRespMsg {
+            name: proxy_name.clone(),
+            error: error_msg.clone(),
+        };
+
+        if let Err(e) = self.write_msg(&Message::RegisterProxyResp(resp)).await {
+            log::error!("Failed to send register proxy response: {:?}", e);
+            self.cleanup_proxies().await;
+            return Err(e);
+        }
+
+        if error_msg.is_empty() {
+            log::info!("proxy registered: {}", proxy_name);
+            // 初始化工作连接池（不做预填充，由 get_work_conn 的取后补充自然填充）
+            self.work_conn_manager.init_pool(&proxy_name).await;
+        } else {
+            log::error!("failed to register proxy {}: {}", proxy_name, error_msg);
+        }
+        Ok(())
+    }
+
+    /// 查询代理状态并回执
+    async fn handle_proxy_status(
+        &mut self,
+        proxy_status_msg: rust_frp_core::ProxyStatusMsg,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let status = self
+            .proxy_manager
+            .get_proxy_status(&proxy_status_msg.name)
+            .await
+            .map_err(|e| format!("{:?}", e))?;
+        let resp = rust_frp_core::ProxyStatusRespMsg {
+            name: proxy_status_msg.name,
+            status: status.unwrap_or_else(|| "unknown".to_string()),
+            error: "".to_string(),
+        };
+        if let Err(e) = self.write_msg(&Message::ProxyStatusResp(resp)).await {
+            log::error!("Failed to send proxy status response: {:?}", e);
+            self.cleanup_proxies().await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 转发 UDP 包给对应访问者
+    async fn handle_udp_packet(&mut self, udp_msg: rust_frp_core::UdpPacketMsg) {
+        if let Some(addr) = &udp_msg.client_addr {
+            if let Err(e) = self
+                .proxy_manager
+                .send_udp_packet(&udp_msg.proxy_name, &udp_msg.data, addr)
+                .await
+            {
+                log::error!("Failed to send UDP packet to visitor: {:?}", e);
+            }
+        }
+    }
+
+    /// STCP 访客请求：fail-closed 签名校验 + 建桥（跨客户端支持）
+    async fn handle_stcp_visitor(
+        &mut self,
+        stcp_msg: rust_frp_core::StcpVisitorMsg,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::info!(
+            "Received STCP visitor request for proxy {} from client {}",
+            stcp_msg.proxy_name,
+            self.run_id
+        );
+
+        let proxy_name = stcp_msg.proxy_name.clone();
+        let visitor_run_id = self.run_id.clone();
+
+        // 查代理所有者与注册的共享密钥（先取值再 await，避免跨 await 持锁）
+        let (proxy_run_id, registered_secret) = {
+            let owners = self.proxy_owners.read().await;
+            let owner = owners.get(&proxy_name).cloned();
+            let secret = global_proxy_secrets().get(&proxy_name);
+            (owner, secret)
+        };
+
+        // fail-closed：代理不存在、未登记 secret_key、签名不匹配均拒绝
+        let rejection = match (&proxy_run_id, &registered_secret) {
+            (None, _) => Some("proxy not found".to_string()),
+            (Some(_), None) => {
+                log::error!(
+                    "STCP proxy {} has no secret_key registered; rejecting visitor {}",
+                    proxy_name,
+                    visitor_run_id
+                );
+                Some("proxy secret_key not configured".to_string())
+            }
+            (Some(_), Some(secret)) => {
+                if verify_stcp_visitor_sign(
+                    secret,
+                    &proxy_name,
+                    stcp_msg.timestamp,
+                    &stcp_msg.sign_key,
+                ) {
+                    None
+                } else {
+                    log::error!(
+                        "STCP visitor sign verification failed for proxy {} (visitor {})",
+                        proxy_name,
+                        visitor_run_id
+                    );
+                    Some("invalid secret key".to_string())
+                }
+            }
+        };
+
+        if let Some(error) = rejection {
+            let resp = StcpVisitorRespMsg {
+                proxy_name: proxy_name.clone(),
+                error,
+                visitor_run_id,
+            };
+            if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                log::error!("Failed to send StcpVisitorResp: {:?}", e);
+            }
+            return Ok(());
+        }
+
+        // 签名校验通过：允许同客户端与跨客户端访问，
+        // 桥接以 proxy_name 为 id，双方各自建工作连接后由桥接管理器配对
+        let Some(proxy_run_id) = &proxy_run_id else {
+            log::error!(
+                "STCP proxy {} lost its owner during sign verification; aborting bridge",
+                proxy_name
+            );
+            return Ok(());
+        };
+        self.stcp_bridge_manager
+            .create_bridge(proxy_name.clone())
+            .await;
+
+        let msg_tx_proxy = self.control_manager.get_msg_tx(proxy_run_id).await;
+        let msg_tx_visitor = self.control_manager.get_msg_tx(&visitor_run_id).await;
+
+        if let Some(tx) = &msg_tx_proxy {
+            let req = ReqWorkConnMsg {
+                proxy_name: proxy_name.clone(),
+            };
+            if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
+                log::error!("Failed to send ReqWorkConn to proxy: {:?}", e);
+            }
+        }
+
+        if let Some(tx) = &msg_tx_visitor {
+            let req = ReqWorkConnMsg {
+                proxy_name: proxy_name.clone(),
+            };
+            if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
+                log::error!("Failed to send ReqWorkConn to visitor: {:?}", e);
+            }
+        }
+
+        let resp = StcpVisitorRespMsg {
+            proxy_name: proxy_name.clone(),
+            error: String::new(),
+            visitor_run_id: visitor_run_id.clone(),
+        };
+        if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+            log::error!("Failed to send StcpVisitorResp: {:?}", e);
+        }
+        Ok(())
+    }
+
+    /// XTCP NAT 信息：visitor 侧签名校验后中继给 owner，owner 侧回传 visitor
+    async fn handle_xtcp_nat_info(
+        &mut self,
+        xtcp_msg: rust_frp_core::XtcpNatInfoMsg,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        log::info!(
+            "Received XTCP NAT info for proxy {} from {}",
+            xtcp_msg.proxy_name,
+            self.run_id
+        );
+
+        let proxy_name = xtcp_msg.proxy_name.clone();
+        let from_run_id = self.run_id.clone();
+
+        let owner_run_id = {
+            let owners = self.proxy_owners.read().await;
+            owners.get(&proxy_name).cloned()
+        };
+
+        let owner_run_id = match owner_run_id {
+            Some(id) => id,
+            None => {
+                log::error!("No proxy owner found for XTCP: {}", proxy_name);
+                return Ok(());
+            }
+        };
+
+        let mut relay = XtcpNatInfoMsg {
+            proxy_name: proxy_name.clone(),
+            run_id: from_run_id.clone(),
+            nat_type: xtcp_msg.nat_type.clone(),
+            local_addr: xtcp_msg.local_addr.clone(),
+            public_addr: xtcp_msg.public_addr.clone(),
+            sign_key: xtcp_msg.sign_key.clone(),
+            timestamp: xtcp_msg.timestamp,
+        };
+
+        if from_run_id != owner_run_id {
+            // 来自 visitor：先校验 secret_key 签名（fail-closed）
+            let registered_secret = global_proxy_secrets().get(&proxy_name);
+            let sign_ok = match &registered_secret {
+                Some(secret) => verify_stcp_visitor_sign(
+                    secret,
+                    &proxy_name,
+                    xtcp_msg.timestamp,
+                    &xtcp_msg.sign_key,
+                ),
+                None => false,
+            };
+            if !sign_ok {
+                log::error!(
+                    "XTCP visitor sign verification failed for proxy {} (visitor {})",
+                    proxy_name,
+                    from_run_id
+                );
+                return Ok(());
+            }
+            // 校验通过后转发时不携带签名（owner 侧无需也不可信）
+            relay.sign_key = String::new();
+
+            // 存储 visitor run_id 并中继给 proxy owner
+            {
+                let mut visitors = self.xtcp_visitors.write().await;
+                visitors.insert(proxy_name.clone(), from_run_id.clone());
+            }
+            log::info!("XTCP visitor registered: {} -> {}", proxy_name, from_run_id);
+
+            let target_tx = self.control_manager.get_msg_tx(&owner_run_id).await;
+            if let Some(tx) = &target_tx {
+                if let Err(e) = tx.send(Message::XtcpNatInfo(relay)).await {
+                    log::error!("Failed to relay XTCP NAT info to owner: {:?}", e);
+                }
+            }
+        } else {
+            // 来自 proxy owner，中继给 visitor
+            let visitor_run_id = {
+                let visitors = self.xtcp_visitors.read().await;
+                visitors.get(&proxy_name).cloned()
+            };
+
+            match visitor_run_id {
+                Some(vid) => {
+                    let target_tx = self.control_manager.get_msg_tx(&vid).await;
+                    if let Some(tx) = &target_tx {
+                        if let Err(e) = tx.send(Message::XtcpNatInfo(relay)).await {
+                            log::error!("Failed to relay XTCP NAT info to visitor: {:?}", e);
+                        } else {
+                            log::info!(
+                                "Relayed XTCP NAT info from owner {} to visitor {}",
+                                from_run_id,
+                                vid
+                            );
+                        }
+                    }
+                }
+                None => {
+                    log::info!(
+                        "No XTCP visitor yet for proxy {}, NAT info from owner stored",
+                        proxy_name
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// XTCP 打洞消息中继
+    async fn handle_xtcp_hole_punch(&mut self, hp_msg: rust_frp_core::XtcpHolePunchMsg) {
+        let to_run_id = hp_msg.to_run_id.clone();
+        let relay = XtcpHolePunchMsg {
+            proxy_name: hp_msg.proxy_name.clone(),
+            from_run_id: hp_msg.from_run_id.clone(),
+            to_run_id: to_run_id.clone(),
+            peer_local_addr: hp_msg.peer_local_addr.clone(),
+            peer_public_addr: hp_msg.peer_public_addr.clone(),
+        };
+
+        let target_tx = self.control_manager.get_msg_tx(&to_run_id).await;
+        if let Some(tx) = &target_tx {
+            if let Err(e) = tx.send(Message::XtcpHolePunch(relay)).await {
+                log::error!("Failed to relay XTCP hole punch: {:?}", e);
+            }
+        }
+    }
 }
 
 /// 控制器管理器
@@ -619,15 +698,17 @@ pub struct ClientInfo {
     pub last_heartbeat: Instant,
 }
 
+/// 踢连接信号表：run_id -> (kick 通知, 清理完成回执接收端)
+type KickSignalMap =
+    RwLock<std::collections::HashMap<String, (watch::Sender<()>, oneshot::Receiver<()>)>>;
+
 pub struct ControlManager {
     // 存储 run_id -> msg_tx 映射，用于向客户端发送消息
     msg_channels: RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>,
     // 存储客户端连接信息 (run_id -> ClientInfo)
     clients: RwLock<std::collections::HashMap<String, ClientInfo>>,
-    // 踢连接信号：run_id -> (kick 通知, 清理完成回执接收端)
-    // 同一 client_id 重复登录时，用它通知旧 Control 退出并等待其释放 proxy
-    kick_signals:
-        RwLock<std::collections::HashMap<String, (watch::Sender<()>, oneshot::Receiver<()>)>>,
+    // 踢连接信号：同一 client_id 重复登录时，用它通知旧 Control 退出并等待其释放 proxy
+    kick_signals: KickSignalMap,
 }
 
 impl Default for ControlManager {
