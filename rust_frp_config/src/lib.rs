@@ -34,6 +34,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+mod compat;
+
+use compat::ConfigKind;
+
 /// 配置模块错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -100,34 +104,43 @@ pub enum ConfigError {
 #[serde(default)]
 pub struct ServerConfig {
     /// 绑定地址，0.0.0.0 表示监听所有网络接口
+    #[serde(alias = "bindAddr")]
     pub bind_addr: String,
 
     /// 控制连接端口，客户端通过此端口连接服务器
+    #[serde(alias = "bindPort")]
     pub bind_port: u16,
 
     /// KCP 协议绑定端口（可选，UDP）
     // 路线图配置项：字段先随配置 schema 固化，协议实现后接通
     #[allow(dead_code)]
+    #[serde(alias = "kcpBindPort")]
     pub kcp_bind_port: Option<u16>,
 
     /// QUIC 协议绑定端口（可选，UDP）
     // 路线图配置项：字段先随配置 schema 固化，协议实现后接通
     #[allow(dead_code)]
+    #[serde(alias = "quicBindPort")]
     pub quic_bind_port: Option<u16>,
 
     /// HTTP 虚主机端口，用于 HTTP 代理
+    #[serde(alias = "vhostHTTPPort")]
     pub vhost_http_port: Option<u16>,
 
     /// HTTPS 虚主机端口，用于 HTTPS 代理
+    #[serde(alias = "vhostHTTPSPort")]
     pub vhost_https_port: Option<u16>,
 
     /// TCP 多路复用 HTTP 连接端口
+    #[serde(alias = "tcpmuxHTTPConnectPort")]
     pub tcpmux_http_connect_port: Option<u16>,
 
     /// 工作连接端口，用于工作连接（默认 = bind_port + 1000）
+    #[serde(alias = "workConnPort")]
     pub work_conn_port: Option<u16>,
 
     /// Web Dashboard 配置
+    #[serde(alias = "webServer")]
     pub web_server: WebServerConfig,
 
     /// 认证配置
@@ -150,6 +163,7 @@ pub struct ServerConfig {
     ///     { start = 10000, end = 20000 },  # 允许端口范围
     /// ]
     /// ```
+    #[serde(alias = "allowPorts")]
     pub allow_ports: Vec<PortRange>,
 
     /// 单用户最大端口数限制（可选）
@@ -164,9 +178,11 @@ pub struct ServerConfig {
     /// ```toml
     /// max_ports_per_user = 5
     /// ```
+    #[serde(alias = "maxPortsPerUser")]
     pub max_ports_per_user: Option<usize>,
 
     /// 自定义 404 页面路径（可选）
+    #[serde(alias = "custom404Page")]
     pub custom_404_page: Option<String>,
 
     /// 配置文件包含模式（glob）
@@ -241,9 +257,11 @@ impl Default for ServerConfig {
 #[serde(default)]
 pub struct ClientConfig {
     /// 服务器地址
+    #[serde(alias = "serverAddr")]
     pub server_addr: String,
 
     /// 服务器控制连接端口
+    #[serde(alias = "serverPort")]
     pub server_port: u16,
 
     /// 服务器工作连接端口（可选）
@@ -252,15 +270,18 @@ pub struct ClientConfig {
     ///
     /// - 未设置时默认使用 server_port + 1000
     /// - 需与服务端 frps.toml 的 work_conn_port 一致
+    #[serde(alias = "workConnPort")]
     pub work_conn_port: Option<u16>,
 
     /// 用户名（可选，用于多用户场景）
     pub user: Option<String>,
 
     /// 客户端 ID（可选，用于多客户端场景）
+    #[serde(alias = "clientID")]
     pub client_id: Option<String>,
 
     /// Web Dashboard 配置（可选）
+    #[serde(alias = "webServer")]
     pub web_server: WebServerConfig,
 
     /// 认证配置
@@ -330,7 +351,7 @@ pub struct WebServerConfig {
     /// 安全说明（评审 P1-4）：/metrics 包含 run_id、代理名、流量计数等
     /// 内部信息。默认关闭（请求返回 404）；需要 Prometheus 抓取时显式
     /// 置为 true，并建议同时用反向代理限制来源。
-    #[serde(default)]
+    #[serde(default, alias = "exposeMetrics")]
     pub expose_metrics: bool,
 }
 
@@ -378,12 +399,15 @@ pub struct OidcConfig {
     pub audience: String,
 
     /// OAuth 客户端 ID
+    #[serde(alias = "clientID")]
     pub client_id: String,
 
     /// OAuth 客户端密钥
+    #[serde(alias = "clientSecret")]
     pub client_secret: String,
 
     /// Token 端点 URL
+    #[serde(alias = "tokenEndpointURL")]
     pub token_endpoint_url: String,
 }
 
@@ -417,6 +441,7 @@ pub struct TransportConfig {
     /// 启用 TCP 多路复用
     ///
     /// 多个业务流共享单个 TCP 连接，减少握手延迟
+    #[serde(alias = "tcpMux")]
     pub tcp_mux: bool,
 
     /// 强制 TLS（仅服务端有效，对齐 frp 的 transport.tls.force）
@@ -433,15 +458,50 @@ pub struct TransportConfig {
     /// enable = true
     /// # tls_only = true
     /// ```
+    #[serde(alias = "tlsOnly")]
     pub tls_only: bool,
 
     /// 连接池大小
     ///
     /// 客户端预建立的工作连接数量。建议值：5-100
+    #[serde(alias = "poolCount")]
     pub pool_count: u32,
 
     /// 带宽限制（可选），格式如 "1MB" 或 "1GB"
+    #[serde(alias = "bandwidthLimit")]
     pub bandwidth_limit: Option<String>,
+
+    /// 应用层加密开关（兼容原版 `transport.useEncryption`）
+    ///
+    /// # 说明
+    ///
+    /// 仅在代理/访问者级 `[[proxies]].transport` 子表中生效：解析后会被
+    /// 合并进该代理的 `use_encryption`（见 ConfigLoader 的 normalize 步骤）。
+    /// 出现在全局 `[transport]` 中时被忽略。
+    #[serde(default, alias = "useEncryption")]
+    pub use_encryption: bool,
+
+    /// 应用层压缩（兼容原版 `transport.useCompression`）
+    ///
+    // 路线图配置项：压缩算法未实现，字段先随配置 schema 固化，仅保证
+    // 原版配置可解析不报错（未知字段告警不会误报）。
+    #[serde(default, alias = "useCompression")]
+    #[allow(dead_code)]
+    pub use_compression: bool,
+
+    /// 带宽限制模式（兼容原版 `transport.bandwidthLimitMode`，"client"/"server"）
+    ///
+    // 路线图配置项：仅 client 模式实际生效，server 模式未实现。
+    #[serde(default, alias = "bandwidthLimitMode")]
+    #[allow(dead_code)]
+    pub bandwidth_limit_mode: Option<String>,
+
+    /// PROXY protocol 版本（兼容原版 `transport.proxyProtocolVersion`，"v1"/"v2"）
+    ///
+    // 路线图配置项：本实现仅支持 v1（proxy_protocol 布尔开关），v2 未实现。
+    #[serde(default, alias = "proxyProtocolVersion")]
+    #[allow(dead_code)]
+    pub proxy_protocol_version: Option<String>,
 }
 
 impl Default for TransportConfig {
@@ -453,6 +513,10 @@ impl Default for TransportConfig {
             tls_only: false,
             pool_count: 10,
             bandwidth_limit: None,
+            use_encryption: false,
+            use_compression: false,
+            bandwidth_limit_mode: None,
+            proxy_protocol_version: None,
         }
     }
 }
@@ -494,14 +558,17 @@ pub struct TlsConfig {
     pub enable: bool,
 
     /// TLS 证书文件路径（服务器用）
+    #[serde(alias = "certFile")]
     pub cert_file: Option<String>,
 
     /// TLS 私钥文件路径（服务器用）
+    #[serde(alias = "keyFile")]
     pub key_file: Option<String>,
 
     /// 受信任的 CA 证书文件路径（客户端用）
     ///
     /// 用于验证服务器证书
+    #[serde(alias = "trustedCaFile")]
     pub trusted_ca_file: Option<String>,
 
     /// 是否跳过服务器证书验证（客户端用）
@@ -511,6 +578,7 @@ pub struct TlsConfig {
     /// # 默认值
     ///
     /// **false** - 默认验证服务器证书
+    #[serde(alias = "skipVerify")]
     pub skip_verify: bool,
 
     /// 强制使用 TLS（即使协议不支持 TLS）
@@ -615,12 +683,15 @@ pub struct ProxyConfig {
     pub r#type: String,
 
     /// 本地服务 IP 地址
+    #[serde(alias = "localIP")]
     pub local_ip: String,
 
     /// 本地服务端口
+    #[serde(alias = "localPort")]
     pub local_port: u16,
 
     /// 远程映射端口（TCP/UDP 代理必需）
+    #[serde(alias = "remotePort")]
     pub remote_port: Option<u16>,
 
     /// 自定义域名列表（HTTP/HTTPS 代理用）
@@ -630,11 +701,13 @@ pub struct ProxyConfig {
     /// ```toml
     /// custom_domains = ["web.example.com", "api.example.com"]
     /// ```
+    #[serde(alias = "customDomains")]
     pub custom_domains: Option<Vec<String>>,
 
     /// 子域名（HTTP/HTTPS 代理用）
     ///
     /// 配合服务器的 `subdomain_base` 使用
+    #[serde(alias = "subDomain")]
     pub subdomain: Option<String>,
 
     /// URL 路径匹配规则（HTTP 代理用）
@@ -647,23 +720,29 @@ pub struct ProxyConfig {
     pub locations: Option<Vec<String>>,
 
     /// 改写 Host header（HTTP 代理用）
+    #[serde(alias = "hostHeaderRewrite")]
     pub host_header_rewrite: Option<String>,
 
     /// HTTP 基本认证用户名（HTTP 代理用）
+    #[serde(alias = "httpUser")]
     pub http_user: Option<String>,
 
     /// HTTP 基本认证密码（HTTP 代理用）
+    #[serde(alias = "httpPassword")]
     pub http_password: Option<String>,
 
     /// 健康检查配置（可选）
+    #[serde(alias = "healthCheck")]
     pub health_check: Option<HealthCheckConfig>,
 
     /// 带宽限制（可选），格式如 "1MB"、"500KB"、"10GB"
     ///
     /// 限制该代理的最大传输速率，覆盖全局 bandwidth_limit
+    #[serde(alias = "bandwidthLimit")]
     pub bandwidth_limit: Option<String>,
 
     /// 共享密钥（stcp/xtcp 代理用）
+    #[serde(alias = "secretKey")]
     pub secret_key: Option<String>,
 
     /// 传输层覆盖配置（可选）
@@ -693,6 +772,7 @@ pub struct ProxyConfig {
     /// set_real_ip_from 127.0.0.1;
     /// real_ip_header proxy_protocol;
     /// ```
+    #[serde(alias = "proxyProtocol")]
     pub proxy_protocol: Option<bool>,
 
     /// 负载均衡分组名（可选，仅 TCP 代理）
@@ -715,6 +795,7 @@ pub struct ProxyConfig {
     /// 负载均衡分组密钥（可选，与 group 配合）
     ///
     /// 加入组时校验，与已有成员不匹配则拒绝注册（防止误入他人分组）。
+    #[serde(alias = "groupKey")]
     pub group_key: Option<String>,
 
     /// 应用层加密：对该代理的工作连接流量启用 AES-256-GCM 加密
@@ -722,7 +803,7 @@ pub struct ProxyConfig {
     /// 密钥由 token 派生（SHA-256），两端需配置一致；只加密不认证，
     /// 防被动嗅探不防中间人（需要身份认证请叠加 TLS）。
     /// 客户端未配置 token 时启用此选项会导致代理启动失败（fail-closed）。
-    #[serde(default)]
+    #[serde(default, alias = "useEncryption")]
     pub use_encryption: bool,
 }
 
@@ -751,24 +832,28 @@ pub struct VisitorConfig {
     pub r#type: String,
 
     /// 要访问的代理名称（需与对方客户端配置匹配）
+    #[serde(alias = "serverName")]
     pub server_name: String,
 
     /// 共享密钥（需与对方代理配置匹配）
+    #[serde(alias = "secretKey")]
     pub secret_key: Option<String>,
 
     /// 本地绑定地址
+    #[serde(alias = "bindAddr")]
     pub bind_addr: String,
 
     /// 本地监听端口
     ///
     /// 访问者连接此端口即可访问远程服务
+    #[serde(alias = "bindPort")]
     pub bind_port: u16,
 
     /// 传输层配置（可选）
     pub transport: Option<TransportConfig>,
 
     /// 应用层加密：需与对端代理的 use_encryption 配置一致
-    #[serde(default)]
+    #[serde(default, alias = "useEncryption")]
     pub use_encryption: bool,
 }
 
@@ -792,14 +877,17 @@ pub struct HealthCheckConfig {
     pub r#type: String,
 
     /// 超时时间（秒）
+    #[serde(alias = "timeoutSeconds")]
     pub timeout_seconds: u32,
 
     /// 连续失败次数阈值
     ///
     /// 超过此值则判定为不健康
+    #[serde(alias = "maxFailed")]
     pub max_failed: u32,
 
     /// 检查间隔（秒）
+    #[serde(alias = "intervalSeconds")]
     pub interval_seconds: u32,
 
     /// HTTP 检查路径（仅 type = "http" 时使用）
@@ -860,27 +948,35 @@ pub struct PluginConfig {
     pub r#type: String,
 
     /// Unix 域套接字路径（unix_domain_socket 插件用）
+    #[serde(alias = "unixPath")]
     pub unix_path: Option<String>,
 
     /// 本地文件路径（static_file 插件用）
+    #[serde(alias = "localPath")]
     pub local_path: Option<String>,
 
     /// 路径前缀剥离（static_file 插件用）
+    #[serde(alias = "stripPrefix")]
     pub strip_prefix: Option<String>,
 
     /// HTTP 用户名（http_proxy 插件用）
+    #[serde(alias = "httpUser")]
     pub http_user: Option<String>,
 
     /// HTTP 密码（http_proxy 插件用）
+    #[serde(alias = "httpPassword")]
     pub http_password: Option<String>,
 
     /// 本地地址（http_proxy/socks5 及 TLS 系插件 https2http/tls2raw/https2https 用）
+    #[serde(alias = "localAddr")]
     pub local_addr: Option<String>,
 
     /// 证书文件路径（HTTPS 相关插件用）
+    #[serde(alias = "crtPath")]
     pub crt_path: Option<String>,
 
     /// 私钥文件路径（HTTPS 相关插件用）
+    #[serde(alias = "keyPath")]
     pub key_path: Option<String>,
 }
 
@@ -920,9 +1016,10 @@ impl ConfigLoader {
     pub fn load_server_config<P: AsRef<Path>>(
         path: P,
     ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-        let mut config: ServerConfig = Self::load_config_from_file(path)?;
+        let mut config: ServerConfig = Self::load_config_from_file(path, ConfigKind::Server)?;
         Self::process_includes(&mut config)?;
         Self::replace_environment_variables(&mut config)?;
+        Self::normalize_server_config(&mut config);
         Self::validate_server_config(&config)?;
         Ok(config)
     }
@@ -935,9 +1032,10 @@ impl ConfigLoader {
     pub fn load_client_config<P: AsRef<Path>>(
         path: P,
     ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-        let mut config = Self::load_config_from_file(path)?;
+        let mut config = Self::load_config_from_file(path, ConfigKind::Client)?;
         Self::process_includes_client(&mut config)?;
         Self::replace_environment_variables_client(&mut config)?;
+        Self::normalize_client_config(&mut config);
         Self::validate_client_config(&config)?;
         Ok(config)
     }
@@ -953,6 +1051,7 @@ impl ConfigLoader {
     /// 首次成功的格式会被记录，避免重复尝试
     fn load_config_from_file<P: AsRef<Path>, T: serde::de::DeserializeOwned + Default>(
         path: P,
+        kind: ConfigKind,
     ) -> Result<T, Box<dyn std::error::Error>> {
         let mut file = File::open(path)?;
         let mut content = String::new();
@@ -960,7 +1059,7 @@ impl ConfigLoader {
         // 注意：绝不能把配置原文写进日志——配置文件里通常包含 auth token、
         // web_server 密码、OIDC client_secret 等敏感信息。
         log::debug!("Loaded config content ({} bytes)", content.len());
-        Self::parse_config(&content)
+        Self::parse_config(&content, kind)
     }
 
     /// 解析配置内容
@@ -976,6 +1075,7 @@ impl ConfigLoader {
     /// 所有格式都失败时返回错误
     fn parse_config<T: serde::de::DeserializeOwned + Default>(
         content: &str,
+        kind: ConfigKind,
     ) -> Result<T, Box<dyn std::error::Error>> {
         // 按 TOML -> YAML -> JSON 顺序盲试；全部失败时把三种格式各自的
         // 错误信息汇总后抛出，避免排障时只能看到一句无信息量的
@@ -986,6 +1086,7 @@ impl ConfigLoader {
         match toml::from_str::<T>(content) {
             Ok(config) => {
                 log::info!("Successfully parsed config as TOML");
+                Self::warn_raw_fields::<toml::Value>(content, kind);
                 return Ok(config);
             }
             Err(e) => {
@@ -998,6 +1099,7 @@ impl ConfigLoader {
         match serde_yaml::from_str::<T>(content) {
             Ok(config) => {
                 log::info!("Successfully parsed config as YAML");
+                Self::warn_raw_fields::<serde_yaml::Value>(content, kind);
                 return Ok(config);
             }
             Err(e) => {
@@ -1010,6 +1112,7 @@ impl ConfigLoader {
         match serde_json::from_str::<T>(content) {
             Ok(config) => {
                 log::info!("Successfully parsed config as JSON");
+                Self::warn_raw_fields::<serde_json::Value>(content, kind);
                 return Ok(config);
             }
             Err(e) => {
@@ -1025,6 +1128,54 @@ impl ConfigLoader {
                 errors.join("\n  ")
             ),
         )))
+    }
+
+    /// 把原始配置文本转成 JSON Value 后做未知字段告警。
+    ///
+    /// 解析失败时静默跳过（主解析已报错，告警无意义）。
+    fn warn_raw_fields<R: serde::de::DeserializeOwned + serde::Serialize>(
+        content: &str,
+        kind: ConfigKind,
+    ) {
+        let Ok(raw) = serde_json::from_str::<R>(content) else {
+            return;
+        };
+        let Ok(json) = serde_json::to_value(&raw) else {
+            return;
+        };
+        compat::warn_unknown_fields(kind, &json);
+    }
+
+    /// 归并代理级 transport 子表中的应用层加密开关。
+    ///
+    /// 原版 frp 把 `useEncryption` 放在 `[[proxies]].transport` 子表中，
+    /// 本实现的主开关在代理顶层 `use_encryption`；两者任一为 true 即生效。
+    fn normalize_server_config(config: &mut ServerConfig) {
+        for proxy in &mut config.proxies {
+            if let Some(t) = &proxy.transport {
+                if t.use_encryption {
+                    proxy.use_encryption = true;
+                }
+            }
+        }
+    }
+
+    /// 客户端版归并：除代理外还处理 `[[visitors]].transport.useEncryption`
+    fn normalize_client_config(config: &mut ClientConfig) {
+        for proxy in &mut config.proxies {
+            if let Some(t) = &proxy.transport {
+                if t.use_encryption {
+                    proxy.use_encryption = true;
+                }
+            }
+        }
+        for visitor in &mut config.visitors {
+            if let Some(t) = &visitor.transport {
+                if t.use_encryption {
+                    visitor.use_encryption = true;
+                }
+            }
+        }
     }
 
     /// 处理服务器配置文件包含
@@ -1049,7 +1200,8 @@ impl ConfigLoader {
                 for file in files {
                     match file {
                         Ok(path) => {
-                            let include_config = Self::load_config_from_file(path)?;
+                            let include_config =
+                                Self::load_config_from_file(path, ConfigKind::Server)?;
                             Self::merge_server_config(config, &include_config);
                         }
                         Err(e) => {
@@ -1075,7 +1227,8 @@ impl ConfigLoader {
                 for file in files {
                     match file {
                         Ok(path) => {
-                            let include_config = Self::load_config_from_file(path)?;
+                            let include_config =
+                                Self::load_config_from_file(path, ConfigKind::Client)?;
                             Self::merge_client_config(config, &include_config);
                         }
                         Err(e) => {
@@ -1365,7 +1518,8 @@ token = "test_token"
 [[allow_ports]]
 single = 8080
 "#;
-        let config: ServerConfig = ConfigLoader::parse_config::<ServerConfig>(toml_str).unwrap();
+        let config: ServerConfig =
+            ConfigLoader::parse_config::<ServerConfig>(toml_str, ConfigKind::Server).unwrap();
         assert_eq!(config.bind_addr, "0.0.0.0");
         assert_eq!(config.bind_port, 9300);
         assert_eq!(config.vhost_http_port, Some(8080));
@@ -1381,7 +1535,8 @@ single = 8080
             "bind_port": 9300,
             "allow_ports": [{"single": 8080}]
         }"#;
-        let config: ServerConfig = ConfigLoader::parse_config::<ServerConfig>(json_str).unwrap();
+        let config: ServerConfig =
+            ConfigLoader::parse_config::<ServerConfig>(json_str, ConfigKind::Server).unwrap();
         assert_eq!(config.bind_port, 9300);
         assert_eq!(config.allow_ports.len(), 1);
     }
@@ -1555,7 +1710,8 @@ local_ip = "127.0.0.1"
 local_port = 8080
 remote_port = 9302
 "#;
-        let config: ClientConfig = ConfigLoader::parse_config::<ClientConfig>(toml_str).unwrap();
+        let config: ClientConfig =
+            ConfigLoader::parse_config::<ClientConfig>(toml_str, ConfigKind::Client).unwrap();
         assert_eq!(config.server_addr, "10.0.0.1");
         assert_eq!(config.server_port, 9300);
         assert_eq!(config.auth.token, Some("my_token".to_string()));
@@ -1624,7 +1780,6 @@ expose_metrics = true
 mod example_config_tests {
     use super::ConfigLoader;
     use std::path::Path;
-
     /// 示例配置文件必须始终可解析：README 引导用户复制 example 改配置，
     /// 若字段重命名/删除后未同步 example，用户会拿到一个跑不起来的模板。
     #[test]
@@ -1643,4 +1798,163 @@ mod example_config_tests {
             .expect("frps.example.toml must stay parseable by ConfigLoader");
         assert!(config.bind_port > 0);
     }
+}
+
+#[cfg(test)]
+mod upstream_compat_tests {
+    use super::ConfigLoader;
+    use std::path::PathBuf;
+
+    /// 把内容写成临时 TOML 并加载（走完整 load 链路：解析→includes→环境变量→归并→验证）
+    fn write_temp_config(prefix: &str, content: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "{}_{}_{}.toml",
+            prefix,
+            std::process::id(),
+            super::compat_test_counter()
+        ));
+        std::fs::write(&path, content).expect("write temp config");
+        path
+    }
+
+    /// 原版 frp 0.71 风格的客户端配置（camelCase + transport.useEncryption 嵌套）
+    /// 必须可以直接解析，且语义与本项目的 snake_case 写法一致。
+    #[test]
+    fn test_upstream_camelcase_client_config_parses() {
+        let path = write_temp_config(
+            "frpc_upstream",
+            r#"
+serverAddr = "203.0.113.10"
+serverPort = 7000
+user = "alice"
+
+auth.method = "token"
+auth.token = "shared-secret"
+
+transport.protocol = "tcp"
+transport.tls.enable = true
+transport.poolCount = 6
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6022
+
+[[proxies]]
+name = "web-encrypted"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 6180
+transport.useEncryption = true
+
+[[visitors]]
+name = "visit-ssh"
+type = "stcp"
+serverName = "peer-ssh"
+secretKey = "peer-key"
+bindAddr = "127.0.0.1"
+bindPort = 9000
+"#,
+        );
+        let config =
+            ConfigLoader::load_client_config(&path).expect("upstream-style frpc config must parse");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(config.server_addr, "203.0.113.10");
+        assert_eq!(config.server_port, 7000);
+        assert_eq!(config.user.as_deref(), Some("alice"));
+        assert_eq!(config.auth.token.as_deref(), Some("shared-secret"));
+        assert_eq!(config.transport.pool_count, 6);
+
+        assert_eq!(config.proxies[0].local_ip, "127.0.0.1");
+        assert_eq!(config.proxies[0].remote_port, Some(6022));
+        assert!(!config.proxies[0].use_encryption);
+
+        // transport.useEncryption 应被归并进代理顶层 use_encryption
+        assert!(config.proxies[1].use_encryption);
+
+        assert_eq!(config.visitors[0].server_name, "peer-ssh");
+        assert_eq!(config.visitors[0].bind_port, 9000);
+    }
+
+    /// 原版风格的服务端配置
+    #[test]
+    fn test_upstream_camelcase_server_config_parses() {
+        let path = write_temp_config(
+            "frps_upstream",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+vhostHTTPPort = 8080
+vhostHTTPSPort = 8443
+workConnPort = 8000
+
+webServer.port = 7500
+webServer.addr = "127.0.0.1"
+webServer.user = "admin"
+webServer.password = "admin-pwd"
+
+transport.tls.force = true
+
+[[allowPorts]]
+start = 10000
+end = 20000
+"#,
+        );
+        let config =
+            ConfigLoader::load_server_config(&path).expect("upstream-style frps config must parse");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(config.bind_port, 7000);
+        assert_eq!(config.vhost_http_port, Some(8080));
+        assert_eq!(config.vhost_https_port, Some(8443));
+        assert_eq!(config.work_conn_port, Some(8000));
+        assert_eq!(config.web_server.port, 7500);
+        assert!(config.transport.tls.as_ref().expect("tls config").force);
+        assert_eq!(config.allow_ports.len(), 1);
+        assert_eq!(config.allow_ports[0].start, Some(10000));
+    }
+
+    /// 含原版暂不支持字段（log.*、loginFailExit 等）的配置必须仍能加载，
+    /// 不支持项以 WARN 提示而非硬性拒绝。
+    #[test]
+    fn test_upstream_config_with_unsupported_fields_still_loads() {
+        let path = write_temp_config(
+            "frpc_partial",
+            r#"
+serverAddr = "203.0.113.10"
+serverPort = 7000
+loginFailExit = false
+metasVar = "unused"
+
+log.to = "./frpc.log"
+log.level = "info"
+log.maxDays = 3
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6022
+"#,
+        );
+        let config = ConfigLoader::load_client_config(&path)
+            .expect("config with unsupported upstream fields must still load");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(config.server_addr, "203.0.113.10");
+        assert_eq!(config.proxies.len(), 1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn compat_test_counter() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
