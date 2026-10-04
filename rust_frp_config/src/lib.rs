@@ -1141,6 +1141,8 @@ pub struct PluginConfig {
     /// - `https2http`: TLS 卸载（访客 HTTPS → 明文 HTTP 本地服务）
     /// - `tls2raw`: TLS 卸载（访客 TLS → 明文 TCP 本地服务，与 https2http 同实现）
     /// - `https2https`: 双层 TLS 桥接（访客 HTTPS → TLS 本地服务）
+    /// - `http2http`: 明文 HTTP 接入 → 明文 HTTP 本地服务（可改写 Host / 注入请求头）
+    /// - `http2https`: 明文 HTTP 接入 → TLS 本地服务（可改写 Host / 注入请求头）
     pub r#type: String,
 
     /// Unix 域套接字路径（unix_domain_socket 插件用）
@@ -1180,6 +1182,33 @@ pub struct PluginConfig {
     /// 私钥文件路径（HTTPS 相关插件用）
     #[serde(alias = "keyPath")]
     pub key_path: Option<String>,
+
+    /// 改写转发到本地服务的 `Host` 请求头（http2http/http2https/https2http 等插件用）
+    ///
+    /// 为空时保留访客原始 Host（即 `custom_domains` 中的域名）。
+    #[serde(alias = "hostHeaderRewrite")]
+    pub host_header_rewrite: Option<String>,
+
+    /// 注入/覆盖转发到本地服务的请求头（对齐原版 `HeaderOperations`）
+    #[serde(alias = "requestHeaders")]
+    pub request_headers: Option<HeaderOperations>,
+}
+
+/// 请求头操作（对齐原版 frp v1 `HeaderOperations`）
+///
+/// TOML 写法：
+///
+/// ```toml
+/// [proxies.plugin]
+/// type = "http2https"
+/// localAddr = "127.0.0.1:443"
+/// requestHeaders.set.x-from-where = "frp"
+/// ```
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
+pub struct HeaderOperations {
+    /// 需要设置/覆盖的请求头（键大小写不敏感匹配后覆盖）
+    pub set: std::collections::HashMap<String, String>,
 }
 
 /// 配置加载器 - 负责配置的加载、解析和验证

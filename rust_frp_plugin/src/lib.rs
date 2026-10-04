@@ -29,6 +29,10 @@
 //!    - 访客 TLS 接入 → 终止 TLS → 重新 TLS 连接 local_addr(双层 TLS)
 //!    - 本地侧跳过证书验证(自签场景)
 //!
+//! 7. **HttpBridgePlugin (http2http / http2https)**
+//!    - 访客明文 HTTP 接入 → 解析并重写请求 → 转发到本地 HTTP / HTTPS 服务
+//!    - 支持 hostHeaderRewrite 与 requestHeaders.set 注入
+//!
 //! ## 架构图
 //!
 //! ```text
@@ -80,6 +84,10 @@ use tokio::net::UnixStream;
 
 /// 服务端 HTTP 插件机制（frps 控制面回调），与本地插件（数据面）互补。
 pub mod server_plugin;
+
+/// HTTP 反向代理桥接插件（http2http / http2https）
+pub mod http_bridge;
+pub use http_bridge::HttpBridgePlugin;
 
 /// Combined trait for AsyncRead + AsyncWrite
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
@@ -877,6 +885,15 @@ impl PluginManager {
             "https2https".to_string(),
             Box::new(TlsBridgePluginFactory {}),
         );
+        // HTTP 反向代理桥接（明文 HTTP 接入 → 本地 HTTP / HTTPS）
+        factories.insert(
+            "http2http".to_string(),
+            Box::new(HttpBridgePluginFactory {}),
+        );
+        factories.insert(
+            "http2https".to_string(),
+            Box::new(HttpBridgePluginFactory {}),
+        );
 
         Self { factories }
     }
@@ -979,6 +996,21 @@ impl PluginFactory for TlsBridgePluginFactory {
         config: &PluginConfig,
     ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Box::new(TlsBridgePlugin::new(config)?))
+    }
+}
+
+/// HTTP 反向代理桥接插件工厂（http2http / http2https）
+///
+/// 两者的差别仅在于转发目标协议（明文 / TLS），
+/// 由 [`HttpBridgePlugin::new`] 依据 `config.type` 判定。
+struct HttpBridgePluginFactory {}
+
+impl PluginFactory for HttpBridgePluginFactory {
+    fn create(
+        &self,
+        config: &PluginConfig,
+    ) -> Result<Box<dyn Plugin>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Box::new(HttpBridgePlugin::new(config)?))
     }
 }
 
