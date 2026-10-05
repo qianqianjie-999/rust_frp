@@ -11,8 +11,10 @@
 //! ```
 //!
 //! - 密钥：`SHA-256(token)`（与服务端 `AuthManager::encryption_key` 同源派生）；
-//! - nonce：`4B 随机会话前缀 + 8B 大端计数器`，解密端直接读帧内 nonce，
-//!   无需同步计数状态；随机前缀使两个方向/相邻会话的 nonce 空间几乎不重叠；
+//! - nonce：`8B 随机会话前缀 + 4B 大端计数器`（共 12B，随帧传输），解密端直接读
+//!   帧内 nonce，无需同步计数状态。8B 随机前缀把"两个方向/相邻会话的 nonce 空间
+//!   碰撞"概率压到 2^-64（此前 4B 前缀为 2^-32，正好卡在 NIST 边界上）；
+//!   计数器上限 2^32 条记录，耗尽即断连——宁可断连也绝不复用 nonce；
 //! - 单条记录明文上限 [`MAX_PLAINTEXT_RECORD`]，超限视为协议攻击立即断连（fail-closed）。
 //!
 //! # 性能说明
@@ -25,6 +27,8 @@
 //!
 //! 只加密不认证（无证书校验），防被动嗅探、不防中间人——与 frp 原版一致；
 //! 需要身份认证请叠加 TLS（`transport.tls` / `trusted_ca_file`）。
+//! 同时**不做重放检测**：解密端直接接受帧携带的 nonce，同一帧被重复投递不会
+//! 被识别。需要抗重放请在 TLS 之上叠加（mTLS + 每连接随机 run_id）。
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -36,8 +40,17 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub const MAX_PLAINTEXT_RECORD: usize = 16 * 1024;
 
 const NONCE_LEN: usize = 12;
+/// nonce 随机前缀长度（8B）
+const NONCE_PREFIX_LEN: usize = 8;
+/// nonce 计数器长度（4B）；与前缀合计必须等于 [`NONCE_LEN`]
+const NONCE_COUNTER_LEN: usize = 4;
 const TAG_LEN: usize = 16;
 const HEADER_LEN: usize = 4;
+/// 编译期保证 nonce 布局自洽（前缀 + 计数器 = 12B）
+const _: () = assert!(NONCE_PREFIX_LEN + NONCE_COUNTER_LEN == NONCE_LEN);
+/// 编译期保证随机前缀足够宽（< 8B 会让 GCM nonce 碰撞概率逼近 NIST 上限 2^-32）
+const _: () = assert!(NONCE_PREFIX_LEN >= 8);
+
 /// 最小帧载荷：nonce + 空明文 + tag
 const MIN_PAYLOAD: usize = NONCE_LEN + TAG_LEN;
 /// 最大帧载荷：nonce + 最大明文 + tag
@@ -54,8 +67,8 @@ pub struct EncryptedStream<S> {
     read_key: LessSafeKey,
     /// 写方向密钥（加密本端记录）
     write_key: LessSafeKey,
-    /// 本方向 nonce 随机前缀（4B）
-    nonce_prefix: [u8; 4],
+    /// 本方向 nonce 随机前缀（8B）
+    nonce_prefix: [u8; NONCE_PREFIX_LEN],
     write_counter: u64,
     /// 待发送的加密字节（完整帧或半帧），`out_pos` 为已写出偏移
     out_buf: Vec<u8>,
@@ -105,7 +118,7 @@ impl<S: crate::FrpConn> EncryptedStream<S> {
                     "write key must be 32 bytes for AES-256-GCM",
                 )
             })?);
-        let mut prefix = [0u8; 4];
+        let mut prefix = [0u8; NONCE_PREFIX_LEN];
         let rng = SystemRandom::new();
         rng.fill(&mut prefix)
             .map_err(|_| std::io::Error::other("rng unavailable"))?;
@@ -124,19 +137,28 @@ impl<S: crate::FrpConn> EncryptedStream<S> {
         })
     }
 
-    /// 生成下一条记录的 nonce（4B 随机前缀 + 8B 大端计数器）
-    fn next_nonce(&mut self) -> [u8; NONCE_LEN] {
+    /// 生成下一条记录的 nonce（8B 随机前缀 + 4B 大端计数器）
+    ///
+    /// 计数器耗尽（已发出 2^32 条记录）时返回错误：此时若继续就会出现 nonce
+    /// 复用，而 AES-GCM 的 (key, nonce) 复用会同时摧毁机密性与完整性，因此
+    /// 这里选择 fail-closed（断连）而不是回绕。
+    fn next_nonce(&mut self) -> std::io::Result<[u8; NONCE_LEN]> {
+        if self.write_counter > u32::MAX as u64 {
+            return Err(std::io::Error::other(
+                "encrypted stream: nonce counter exhausted, refusing to reuse a nonce",
+            ));
+        }
         let mut nonce = [0u8; NONCE_LEN];
-        nonce[..4].copy_from_slice(&self.nonce_prefix);
-        nonce[4..].copy_from_slice(&self.write_counter.to_be_bytes());
-        self.write_counter = self.write_counter.wrapping_add(1);
-        nonce
+        nonce[..NONCE_PREFIX_LEN].copy_from_slice(&self.nonce_prefix);
+        nonce[NONCE_PREFIX_LEN..].copy_from_slice(&(self.write_counter as u32).to_be_bytes());
+        self.write_counter += 1;
+        Ok(nonce)
     }
 
     /// 加密 `data` 为一帧并追加到发送缓冲
     fn seal_into_out_buf(&mut self, data: &[u8]) -> std::io::Result<()> {
         // ring 0.16 Buffer 语义：整段缓冲为明文，tag 追加在末尾
-        let nonce_bytes = self.next_nonce();
+        let nonce_bytes = self.next_nonce()?;
         let mut body = data.to_vec();
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)
             .map_err(|_| std::io::Error::other("invalid nonce"))?;
@@ -484,16 +506,56 @@ mod crypto_tests {
 
     #[test]
     fn test_nonce_layout_prefix_plus_counter() {
-        // 直接验证 nonce 布局：前 4B 前缀 + 后 8B 计数器
-        let prefix = [0x11u8, 0x22, 0x33, 0x44];
-        let mut counter: u64 = 0;
+        // 直接验证 nonce 布局：前 8B 随机前缀 + 后 4B 计数器
+        let prefix = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let mut nonce = [0u8; NONCE_LEN];
-        nonce[..4].copy_from_slice(&prefix);
-        nonce[4..].copy_from_slice(&counter.to_be_bytes());
-        assert_eq!(&nonce[..4], &prefix);
-        assert_eq!(&nonce[4..], &0u64.to_be_bytes());
-        counter = 42;
-        nonce[4..].copy_from_slice(&counter.to_be_bytes());
-        assert_eq!(&nonce[4..], &42u64.to_be_bytes());
+        nonce[..NONCE_PREFIX_LEN].copy_from_slice(&prefix);
+        nonce[NONCE_PREFIX_LEN..].copy_from_slice(&42u32.to_be_bytes());
+        assert_eq!(&nonce[..NONCE_PREFIX_LEN], &prefix);
+        assert_eq!(&nonce[NONCE_PREFIX_LEN..], &42u32.to_be_bytes());
+        // 前缀宽度由模块级 const 断言保证 >= 8B（本次加固的实质）
+    }
+
+    #[tokio::test]
+    async fn test_nonce_counter_exhaustion_fails_closed() {
+        // 计数器耗尽必须报错断连，绝不回绕复用 nonce
+        let (a, _b) = tcp_pair().await;
+        let mut e = EncryptedStream::new(a, &key()).unwrap();
+        e.write_counter = u32::MAX as u64;
+        assert!(e.next_nonce().is_ok(), "最后一条记录仍可用");
+        assert!(
+            e.next_nonce().is_err(),
+            "计数器耗尽后必须 fail-closed 而不是回绕"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_4b_prefix_frame_still_decrypts() {
+        // 兼容性回归：旧版发送端用「4B 前缀 + 8B 计数器」构造 nonce，
+        // 新版接收端必须仍能解密——nonce 随帧传输，接收端不解释其内部布局，
+        // 因此本次前缀扩容对旧对端是**协议兼容**的。
+        let (a, _b) = tcp_pair().await;
+        let mut reader = EncryptedStream::new(a, &key()).unwrap();
+
+        let mut legacy_nonce = [0u8; NONCE_LEN];
+        legacy_nonce[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        legacy_nonce[4..].copy_from_slice(&7u64.to_be_bytes());
+
+        let k = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key()).unwrap());
+        let mut body = b"legacy-layout".to_vec();
+        k.seal_in_place_append_tag(
+            Nonce::try_assume_unique_for_key(&legacy_nonce).unwrap(),
+            Aad::empty(),
+            &mut body,
+        )
+        .unwrap();
+
+        let mut frame = ((NONCE_LEN + body.len()) as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&legacy_nonce);
+        frame.extend_from_slice(&body);
+        reader.rx_buf = frame;
+
+        assert!(reader.try_decrypt_frame().unwrap(), "旧布局帧必须可解");
+        assert_eq!(reader.in_plain, b"legacy-layout");
     }
 }

@@ -194,6 +194,23 @@ pub(crate) fn session_token_from_headers(headers: &axum::http::HeaderMap) -> Opt
     })
 }
 
+/// 无鉴权模式下必须拒绝的请求（纵深防御，security review P1）
+///
+/// 与配置层「启用 dashboard 就必须配齐凭据」互为补充：即便将来某条代码路径让
+/// `requires_login()` 为 false（测试、嵌入式用法、未来重构），有副作用的端点也
+/// 绝不对匿名请求开放——`POST /api/reload` 会触发全局配置重载，属于操作类端点。
+///
+/// 规则：GET/HEAD/OPTIONS 之外的**所有**方法一律拒绝；GET 也不放行敏感端点。
+fn is_unsafe_unauthenticated(method: &axum::http::Method, path: &str) -> bool {
+    if !matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return true;
+    }
+    path == "/api/reload"
+}
+
 fn create_routes(
     server: std::sync::Arc<Server>,
     auth: std::sync::Arc<WebAuth>,
@@ -307,11 +324,29 @@ fn create_routes(
             },
         ))
     } else {
-        log::warn!(
-            "Web server authentication is DISABLED: no web_server.user/password configured, \
-             the dashboard is reachable by anyone who can reach the port"
+        // 配置层已拒绝「port != 0 且无凭据」的配置，因此这里在生产环境不可达；
+        // 保留拦截作为纵深防御，避免 fail-open 被重新引入。
+        log::error!(
+            "Web server authentication is DISABLED (no web_server.user/password): the \
+             dashboard is reachable by anyone who can reach the port. State-changing \
+             requests are refused. Configure user/password or set web_server.port = 0."
         );
-        app
+        app.layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                if is_unsafe_unauthenticated(request.method(), request.uri().path()) {
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(serde_json::json!({
+                            "success": false,
+                            "error": "dashboard authentication is not configured; \
+                                      state-changing requests are refused",
+                        })),
+                    )
+                        .into_response();
+                }
+                next.run(request).await
+            },
+        ))
     }
 }
 
@@ -606,5 +641,31 @@ impl WebServer {
 
         self.server = Some(handle);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod auth_disabled_gate_tests {
+    use super::is_unsafe_unauthenticated;
+    use axum::http::Method;
+
+    #[test]
+    fn state_changing_methods_are_refused_without_auth() {
+        for m in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(
+                is_unsafe_unauthenticated(&m, "/api/clients"),
+                "{m} 必须被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_methods_pass_except_sensitive_paths() {
+        assert!(!is_unsafe_unauthenticated(&Method::GET, "/api/clients"));
+        assert!(!is_unsafe_unauthenticated(&Method::GET, "/"));
+        // GET 也不放行操作类端点
+        assert!(is_unsafe_unauthenticated(&Method::GET, "/api/reload"));
+        // 无鉴权时登录端点本身也没有意义
+        assert!(is_unsafe_unauthenticated(&Method::POST, "/login"));
     }
 }

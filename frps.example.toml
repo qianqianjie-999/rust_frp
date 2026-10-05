@@ -39,6 +39,13 @@ allow_ports = [
     { start = 10000, end = 20000 },
 ]
 
+# --- 自定义域名白名单（HTTP/HTTPS/tcpmux 代理的 custom_domains） ---
+# 客户端提交的 custom_domains 决定 vhost 的 Host 匹配项。留空 = 只校验域名语法、
+# 不限制归属（任何已认证客户端都能注册任意域名抢占 Host 匹配）；
+# 填了 = 客户端注册的域名必须落在白名单内，否则该代理注册失败。
+# 匹配：精确条目只放行自身；"*.example.com" 放行其子域（含客户端注册的同名通配）。
+# custom_domains_allowlist = ["app.example.com", "*.corp.example.com"]
+
 # --- 服务端 HTTP 插件（可选，默认不启用） ---
 # frps 在登录 / 代理注册 / 关闭代理 / 心跳 / 工作连接 / 用户连接等事件时，
 # POST 到插件地址：{addr}{path}?version=0.1.0&op={Op}，请求体为
@@ -56,7 +63,9 @@ allow_ports = [
 # ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewWorkConn", "NewUserConn"]
 
 # --- Web Dashboard（默认禁用：port = 0） ---
-# user / password 必须成对配置且非空，否则服务端会拒绝启动。
+# ⚠️ 只要 port != 0，user 与 password 就必须成对配置且非空——不配会**拒绝启动**。
+#    原因：无凭据时鉴权中间件不挂载，dashboard 全部页面连同有副作用的
+#    POST /api/reload 会对任何能访问该端口的人开放。
 # 生产环境建议只监听 127.0.0.1，并前置 Nginx 提供 HTTPS。
 # [web_server]
 # addr = "127.0.0.1"

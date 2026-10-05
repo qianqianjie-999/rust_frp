@@ -183,6 +183,32 @@ pub struct ServerConfig {
     #[serde(alias = "maxPortsPerUser")]
     pub max_ports_per_user: Option<usize>,
 
+    /// 允许客户端注册的自定义域名白名单（可选）
+    ///
+    /// # 安全说明
+    ///
+    /// 客户端提交的 `custom_domains` 决定 vhost 路由表的 Host 匹配项。此前服务端
+    /// 既不校验域名语法也不校验归属 ⇒ **任意客户端可注册任意域名**（含他人域名）
+    /// 抢占 Host 匹配。本字段用于收口：
+    ///
+    /// - **为空**（默认）：只做域名语法校验（畸形域名一律拒绝注册），不限制归属；
+    /// - **非空**：客户端注册的每个域名都必须落在白名单内，否则该代理注册失败。
+    ///
+    /// # 匹配规则
+    ///
+    /// - 精确匹配：`example.com` 只放行 `example.com`；
+    /// - 白名单通配：`*.example.com` 放行其**严格子域**（含客户端注册的通配
+    ///   `*.example.com` 自身），但**不放行 apex `example.com`**——需要 apex
+    ///   时另写一条精确条目。
+    ///
+    /// # 配置示例
+    ///
+    /// ```toml
+    /// custom_domains_allowlist = ["app.example.com", "*.corp.example.com"]
+    /// ```
+    #[serde(alias = "customDomainsAllowlist")]
+    pub custom_domains_allowlist: Vec<String>,
+
     /// 自定义 404 页面路径（可选）
     #[serde(alias = "custom404Page")]
     pub custom_404_page: Option<String>,
@@ -304,6 +330,7 @@ impl Default for ServerConfig {
             transport: TransportConfig::default(),
             allow_ports: Vec::new(),
             max_ports_per_user: None,
+            custom_domains_allowlist: Vec::new(),
             custom_404_page: None,
             log: LogConfig::default(),
             log_file: None,
@@ -314,6 +341,67 @@ impl Default for ServerConfig {
             http_plugins: Vec::new(),
         }
     }
+}
+
+/// 校验一个自定义域名（HTTP/HTTPS/tcpmux 代理的 `custom_domains` 项）
+///
+/// # 规则
+///
+/// - 可选的前导通配符 `*.`：只允许出现在最前面、只允许一层；
+/// - 其余部分按 DNS 主机名：以 `.` 分标签，每标签 1–63 字符、仅含
+///   `A-Za-z0-9-`、不得以 `-` 开头或结尾；
+/// - 整串长度 ≤ 253，不允许空标签（首尾 `.` 或连续 `.`）。
+///
+/// # 为什么需要
+///
+/// 客户端提交的 `custom_domains` 会被并进 vhost 路由表决定 Host 匹配。
+/// 语法校验挡住畸形输入，归属校验见 [`ServerConfig::custom_domains_allowlist`]。
+///
+/// # 示例
+///
+/// ```
+/// use rust_frp_config::validate_custom_domain;
+/// assert!(validate_custom_domain("app.example.com").is_ok());
+/// assert!(validate_custom_domain("*.example.com").is_ok());
+/// assert!(validate_custom_domain("bad_underscore.example.com").is_err());
+/// assert!(validate_custom_domain("evil..example.com").is_err());
+/// ```
+pub fn validate_custom_domain(domain: &str) -> Result<(), String> {
+    let d = domain.trim();
+    if d.is_empty() {
+        return Err("domain is empty".to_string());
+    }
+    if d.len() > 253 {
+        return Err(format!("domain is too long ({} bytes > 253)", d.len()));
+    }
+    // 前导通配符：只允许一层且只在最前面
+    let rest = d.strip_prefix("*.").unwrap_or(d);
+    if rest.contains('*') {
+        return Err("wildcard '*' is only allowed as a single leading '*.' label".to_string());
+    }
+    if rest.is_empty() {
+        return Err("wildcard must be followed by a domain".to_string());
+    }
+    for label in rest.split('.') {
+        if label.is_empty() {
+            return Err("empty label (leading/trailing/doubled '.')".to_string());
+        }
+        if label.len() > 63 {
+            return Err(format!("label {label:?} is longer than 63 characters"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!("label {label:?} must not start or end with '-'"));
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(format!(
+                "label {label:?} contains characters outside [A-Za-z0-9-]"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 客户端配置 - 定义 FRP 客户端的所有配置选项
@@ -2046,10 +2134,19 @@ impl ConfigLoader {
                     }
                 }
                 (None, None) => {
-                    log::warn!(
-                        "web_server.user/password not configured: dashboard authentication \
-                         is DISABLED, anyone who can reach the port can read the dashboard"
-                    );
+                    // 安全评审 P1：此前这里只打一条 warn 就继续启动。由于鉴权中间件
+                    // 在 `requires_login() == false` 时**根本不挂载**（web.rs），
+                    // 结果是 fail-open——dashboard 的全部页面连同**有副作用的
+                    // `POST /api/reload`** 对任何能访问该端口的人开放。
+                    // 现在直接拒绝启动：要么配齐凭据，要么显式 `port = 0` 关掉 dashboard。
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "web_server.port is set but web_server.user/password are missing: \
+                         an unauthenticated dashboard would expose every page and the \
+                         side-effecting /api/reload endpoint to anyone who can reach the \
+                         port. Set both user and password, or set web_server.port = 0 to \
+                         disable the dashboard.",
+                    )));
                 }
                 _ => {
                     return Err(Box::new(std::io::Error::new(
@@ -2057,6 +2154,17 @@ impl ConfigLoader {
                         "web_server.user and web_server.password must be configured together",
                     )));
                 }
+            }
+        }
+
+        // 自定义域名白名单：条目自身必须是合法域名。否则一条笔误会让白名单在
+        // 运行时静默失效（例如误写成 "*"），等于没收口，所以启动时就拒绝。
+        for domain in &config.custom_domains_allowlist {
+            if let Err(e) = validate_custom_domain(domain) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("custom_domains_allowlist entry {domain:?} is invalid: {e}"),
+                )));
             }
         }
 
@@ -2586,6 +2694,110 @@ useCompression = true
         };
         let result = ConfigLoader::validate_server_config(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_config_rejects_dashboard_without_credentials() {
+        // 安全评审 P1：启用 dashboard 但没配凭据时，鉴权中间件根本不挂载
+        // （requires_login() == false）⇒ 全部页面 + POST /api/reload 对匿名开放。
+        // 必须拒绝启动，而不是只打一条 warn。
+        let config = ServerConfig {
+            bind_port: 9300,
+            web_server: WebServerConfig {
+                port: 7500,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = ConfigLoader::validate_server_config(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("web_server.user/password"),
+            "错误信息应指明缺少凭据：{err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_server_config_accepts_dashboard_with_credentials() {
+        let config = ServerConfig {
+            bind_port: 9300,
+            web_server: WebServerConfig {
+                port: 7500,
+                user: Some("boss".to_string()),
+                password: Some("pw".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(ConfigLoader::validate_server_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_domain_accepts_wellformed_names() {
+        for good in [
+            "example.com",
+            "app.example.com",
+            "*.example.com",
+            "a-b.c.example.com",
+            "localhost",
+            "123.example.com",
+        ] {
+            assert!(validate_custom_domain(good).is_ok(), "{good:?} 应通过");
+        }
+    }
+
+    #[test]
+    fn test_validate_custom_domain_rejects_malformed_names() {
+        let long_label = "x".repeat(64);
+        let mut bad: Vec<&str> = vec![
+            "",
+            "   ",
+            "evil..example.com",
+            ".example.com",
+            "example.com.",
+            "bad_underscore.example.com",
+            "-lead.example.com",
+            "trail-.example.com",
+            "mid*star.example.com",
+            "*.evil*.example.com",
+            "*",
+            "*.",
+            "a.*.example.com",
+            "exa mple.com",
+        ];
+        bad.push(long_label.as_str());
+        for b in bad {
+            assert!(validate_custom_domain(b).is_err(), "{b:?} 应被拒绝");
+        }
+    }
+
+    #[test]
+    fn test_validate_server_config_rejects_bad_domain_allowlist_entry() {
+        // 白名单条目本身写错（例如想写 *.example.com 却写成 "*"）会让收口静默失效，
+        // 必须在启动时就拒绝。
+        let config = ServerConfig {
+            bind_port: 9300,
+            custom_domains_allowlist: vec!["*".to_string()],
+            ..Default::default()
+        };
+        let err = ConfigLoader::validate_server_config(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("custom_domains_allowlist"),
+            "错误信息应指明白名单条目非法：{err}"
+        );
+    }
+
+    #[test]
+    fn test_server_config_accepts_custom_domains_allowlist() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+bind_port = 9300
+custom_domains_allowlist = ["app.example.com", "*.corp.example.com"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.custom_domains_allowlist.len(), 2);
+        // 默认必须为空（零破坏：不改变既有部署行为）
+        assert!(ServerConfig::default().custom_domains_allowlist.is_empty());
     }
 
     #[test]

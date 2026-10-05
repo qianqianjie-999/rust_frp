@@ -50,6 +50,8 @@ mod fields {
         "allowPorts",
         "max_ports_per_user",
         "maxPortsPerUser",
+        "custom_domains_allowlist",
+        "customDomainsAllowlist",
         "custom_404_page",
         "custom404Page",
         "log",

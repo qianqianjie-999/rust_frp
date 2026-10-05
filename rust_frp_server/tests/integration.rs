@@ -145,6 +145,7 @@ fn build_manager(
         ProxyManagerOptions {
             allow_ports,
             max_ports_per_user,
+            custom_domains_allowlist: Vec::new(),
             tcpmux_port: None,
             plugin_manager: Arc::new(rust_frp_plugin::server_plugin::Manager::default()),
         },
