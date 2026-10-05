@@ -15,17 +15,25 @@
 //!   这是相对原版的一处有意差异 —— 原版配置了 `log.to` 就只写文件；
 //!   这里保留 stderr 是为了 systemd 场景下 `journalctl` 依然可用，
 //!   且实测运维习惯依赖 journald（见 2026-10-05 线上核查报告）。
+//! - **本地时间**：日志行时间戳与轮转文件名的日期都用**进程本地时区**
+//!   （`2026-10-05T12:24:34.123456+08:00`），与原版 frp 的 Go `log` 行为一致。
+//!   时区取自 `TZ` 环境变量 / `/etc/localtime`，无法确定时回退 UTC。
 //! - **按天轮转**：跨天时把当前文件重命名为 `<name>.<YYYY-MM-DD>` 并重建。
-//!   日期按 **UTC** 计算 —— 与 tracing 默认输出的时间戳（`...Z`）保持一致。
+//!   日期同样按**本地时区**计算，与日志行时间戳严格一致。
 //! - **清理**：保留最近 `max_days` 天（含当天）。`0` 表示不自动清理。
 //! - **失败不阻断**：写日志失败绝不 panic；轮转失败退回继续写原句柄。
 //!
-//! # 为什么不用 `time` / `chrono`
+//! # 时区是怎么拿到的
 //!
-//! 只需要「当前 UTC 日期字符串」与「日期串比较」两件事，用经典的
-//! civil-from-days 算法（Howard Hinnant）几十行即可完成，避免为日志引入
-//! 额外依赖与本地时区探测的不可靠性（`time::OffsetDateTime::now_local()`
-//! 在多线程进程里可能直接失败）。
+//! 用 libc 的 [`localtime_r`]（可重入、线程安全）读取当前偏移，其余全部是纯 Rust
+//! 的民用历算法（Howard Hinnant civil-from-days）。
+//!
+//! 之所以不用 `time` / `chrono`：`time` 的 `UtcOffset::current_local_offset()` 在多线程
+//! 进程里**会直接返回 Err**（我们跑在 tokio 多线程 runtime 上），而 `tracing_subscriber`
+//! 的 `LocalTime` 正是基于它 —— 那会导致时间戳静默退化成 UTC，即本次要修的问题。
+//! `libc` 只是 FFI 声明：无 C 代码、不要求 C 工具链，且早已是 tokio 的传递依赖。
+//!
+//! 若需要强制某个时区，给进程设 `TZ`（如 systemd 单元里 `Environment=TZ=Asia/Shanghai`）即可。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -58,6 +66,7 @@ pub fn init(to: Option<&str>, level: Option<&str>, max_days: u32) -> io::Result<
                 fmt::layer()
                     .with_writer(writer)
                     .with_ansi(false)
+                    .with_timer(LocalTimer)
                     .with_target(true),
             )
         }
@@ -65,7 +74,10 @@ pub fn init(to: Option<&str>, level: Option<&str>, max_days: u32) -> io::Result<
     };
 
     // 控制台 layer 显式用 stdout，保持与改造前 `tracing_subscriber::fmt()` 一致
-    let console_layer = fmt::layer().with_writer(io::stdout).with_target(true);
+    let console_layer = fmt::layer()
+        .with_writer(io::stdout)
+        .with_timer(LocalTimer)
+        .with_target(true);
 
     tracing_subscriber::registry()
         .with(filter)
@@ -127,7 +139,7 @@ impl DailyFileWriter {
             inner: Arc::new(Mutex::new(WriterState {
                 base_path: path.to_path_buf(),
                 file: Some(file),
-                date: utc_date_string(SystemTime::now()),
+                date: local_date_string(SystemTime::now()),
                 max_days,
             })),
         })
@@ -170,7 +182,7 @@ impl<'a> fmt::MakeWriter<'a> for DailyFileWriter {
 impl WriterState {
     /// 跨天则轮转；失败时保留原句柄继续写（best-effort，不返回错误）
     fn rotate_if_needed(&mut self) {
-        let today = utc_date_string(SystemTime::now());
+        let today = local_date_string(SystemTime::now());
         if today == self.date {
             return;
         }
@@ -266,23 +278,129 @@ fn open_append(path: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-/// 当前 UTC 日期字符串（`YYYY-MM-DD`）
-fn utc_date_string(now: SystemTime) -> String {
-    let secs = now
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+// ─────────────────────────── 本地时间 ───────────────────────────
+
+/// tracing 计时器：输出**本地时间** RFC 3339（`2026-10-05T12:24:34.123456+08:00`）
+///
+/// 相对于 tracing 默认的 [`fmt::time::SystemTime`]（UTC + `Z` 后缀），这里带显式
+/// 偏移量，既不产生歧义，也不需要运维心算时差。
+#[derive(Clone, Copy, Default)]
+pub struct LocalTimer;
+
+impl fmt::time::FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut fmt::format::Writer<'_>) -> std::fmt::Result {
         // 系统时钟早于 1970（配置错误/极端情况）时退回 epoch，不 panic
-        .unwrap_or(0);
-    format_date(secs.div_euclid(86_400))
+        let now = SystemTime::now();
+        let elapsed = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+        // 复用 `format_local_timestamp`：格式化逻辑只有一份，不会与测试漂移
+        // （`Writer::write_str` 是固有方法，无需引入 fmt::Write）
+        w.write_str(&format_local_timestamp(
+            elapsed.as_secs() as i64,
+            elapsed.subsec_micros(),
+            local_offset_secs_at(now),
+        ))
+    }
 }
 
-/// 天数（自 1970-01-01，UTC）→ `YYYY-MM-DD`
+/// 时区偏移的 RFC 3339 写法（`+08:00` / `-05:30` / `+00:00`）
+struct OffsetDisplay(i32);
+
+impl std::fmt::Display for OffsetDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign = if self.0 < 0 { '-' } else { '+' };
+        let abs = self.0.unsigned_abs();
+        write!(f, "{sign}{:02}:{:02}", abs / 3600, (abs % 3600) / 60)
+    }
+}
+
+/// `SystemTime` → Unix 秒（早于 1970 时退回 0）
+fn unix_secs(now: SystemTime) -> i64 {
+    now.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 进程本地时区相对 UTC 的偏移（秒）；无法确定时回退 `0`（即 UTC）
+///
+/// 走 libc 的 `localtime_r`：可重入（线程安全），会读取 `TZ` 环境变量与
+/// `/etc/localtime`，因此能正确处理夏令时与 `+05:30`/`+05:45` 这类非整点时区。
+#[cfg(unix)]
+fn local_offset_secs_at(now: SystemTime) -> i32 {
+    // 走 u64 → time_t 的**可失败**转换：32 位平台的 time_t 是 i32，这里要能拒绝
+    let secs_u64 = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // musl 目标的 `libc::time_t` 被标了 deprecated（musl 1.2 起 time_t 由 32 位改 64 位，
+    // libc 将在未来版本跟进改名）。这里只是照 `localtime_r` 的现有签名传参，取值在
+    // 32/64 位两种宽度下都安全，故就地放行；待 libc 提供稳定别名后移除本 allow。
+    #[allow(deprecated)]
+    let Ok(secs) = libc::time_t::try_from(secs_u64) else {
+        return 0;
+    };
+    // SAFETY: `secs` 是栈上值、`tm` 是栈上已初始化的有效目标，`localtime_r`
+    // 是 POSIX 规定的可重入接口，不会保留参数引用。
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let filled = unsafe { !libc::localtime_r(&secs, &mut tm).is_null() };
+    if filled {
+        tm.tm_gmtoff as i32
+    } else {
+        0
+    }
+}
+
+/// 非 Unix 平台没有 `tm_gmtoff`，退回 UTC（不 panic）
+#[cfg(not(unix))]
+fn local_offset_secs_at(_now: SystemTime) -> i32 {
+    0
+}
+
+/// 当前**本地**日期字符串（`YYYY-MM-DD`）
+fn local_date_string(now: SystemTime) -> String {
+    let (days, _) = local_parts(unix_secs(now), local_offset_secs_at(now));
+    format_date(days)
+}
+
+/// UTC 秒 + 偏移 → （自 1970-01-01 的天数, 当日秒）
+///
+/// 纯函数，便于测试；`div_euclid`/`rem_euclid` 保证负偏移方向正确。
+fn local_parts(utc_secs: i64, offset_secs: i32) -> (i64, u32) {
+    let shifted = utc_secs + i64::from(offset_secs);
+    (
+        shifted.div_euclid(86_400),
+        shifted.rem_euclid(86_400) as u32,
+    )
+}
+
+/// 当日秒 → `HH:MM:SS`
+fn format_clock(sec_of_day: u32) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        sec_of_day / 3600,
+        (sec_of_day % 3600) / 60,
+        sec_of_day % 60
+    )
+}
+
+/// 纯函数版时间戳（供测试复用；`micros` 为微秒部分）
+fn format_local_timestamp(utc_secs: i64, micros: u32, offset_secs: i32) -> String {
+    let (days, sec_of_day) = local_parts(utc_secs, offset_secs);
+    format!(
+        "{}T{}.{:06}{}",
+        format_date(days),
+        format_clock(sec_of_day),
+        micros,
+        OffsetDisplay(offset_secs)
+    )
+}
+
+/// 天数（自 1970-01-01 的天数，民用历，与时区无关）→ `YYYY-MM-DD`
 fn format_date(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// `YYYY-MM-DD` → 天数（自 1970-01-01，UTC）；非法格式返回 None
+/// `YYYY-MM-DD` → 天数（自 1970-01-01 的天数）；非法格式返回 None
 fn parse_date(s: &str) -> Option<i64> {
     let mut parts = s.split('-');
     let y: i64 = parts.next()?.parse().ok()?;
@@ -375,6 +493,74 @@ mod tests {
         assert_eq!(parse_date("2026-13-01"), None); // 月份非法
         assert_eq!(parse_date("not-a-date"), None);
         assert_eq!(parse_date("2026-10-05.log"), None);
+    }
+
+    /// 2026-10-05T00:00:00Z 的 Unix 秒（20731 天 × 86400）
+    const UTC_2026_10_05: i64 = 20_731 * 86_400;
+
+    #[test]
+    fn test_local_parts_applies_offset_both_directions() {
+        // 东八区：UTC 00:00 → 本地同日 08:00
+        assert_eq!(local_parts(UTC_2026_10_05, 8 * 3600), (20_731, 28_800));
+        // 跨天向前：UTC 16:00(+8h) → 本地次日 00:00
+        let (days, sod) = local_parts(UTC_2026_10_05 + 16 * 3600, 8 * 3600);
+        assert_eq!((days, sod), (20_732, 0));
+        // 跨天向后：UTC 00:00(-5h) → 本地前一日 19:00
+        let (days, sod) = local_parts(UTC_2026_10_05, -5 * 3600);
+        assert_eq!((days, sod), (20_730, 68_400));
+        // 负偏移跨 epoch：UTC 0 - 8h → 1969-12-31 16:00
+        let (days, sod) = local_parts(0, -8 * 3600);
+        assert_eq!((days, sod), (-1, 57_600));
+        assert_eq!(format_date(-1), "1969-12-31");
+    }
+
+    #[test]
+    fn test_format_local_timestamp_with_offset_suffix() {
+        // 东八区
+        assert_eq!(
+            format_local_timestamp(UTC_2026_10_05, 123_456, 8 * 3600),
+            "2026-10-05T08:00:00.123456+08:00"
+        );
+        // UTC 显式写成 +00:00（而不是 Z）—— 让偏移量自证，避免"忘了配时区"被误读
+        assert_eq!(
+            format_local_timestamp(UTC_2026_10_05, 0, 0),
+            "2026-10-05T00:00:00.000000+00:00"
+        );
+        // 半整点时区（印度 +05:30）与负偏移
+        assert_eq!(
+            format_local_timestamp(UTC_2026_10_05, 1, 19_800),
+            "2026-10-05T05:30:00.000001+05:30"
+        );
+        assert_eq!(
+            format_local_timestamp(UTC_2026_10_05, 0, -5 * 3600),
+            "2026-10-04T19:00:00.000000-05:00"
+        );
+        // 45 分钟时区（尼泊尔 +05:45）
+        assert_eq!(
+            format_local_timestamp(UTC_2026_10_05, 0, 20_700),
+            "2026-10-05T05:45:00.000000+05:45"
+        );
+    }
+
+    #[test]
+    fn test_format_clock_padding() {
+        assert_eq!(format_clock(0), "00:00:00");
+        assert_eq!(format_clock(28_800), "08:00:00");
+        assert_eq!(format_clock(86_399), "23:59:59");
+    }
+
+    /// 真实环境取偏移：本机 `/etc/localtime` 指向何处都不得 panic，
+    /// 且结果必须落在 `-14:00..=+14:00` 的合法时区范围内。
+    #[test]
+    fn test_local_offset_is_sane() {
+        let offset = local_offset_secs_at(SystemTime::now());
+        assert!(
+            (-14 * 3600..=14 * 3600).contains(&offset),
+            "offset out of range: {offset}"
+        );
+        // 日期串必须是可解析的标准形式（供轮转/清理复用）
+        let today = local_date_string(SystemTime::now());
+        assert!(parse_date(&today).is_some(), "bad local date: {today}");
     }
 
     #[test]

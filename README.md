@@ -58,7 +58,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | OIDC 认证 | ✅ | 服务端：issuer Discovery + JWKS 拉取 + RS256/ES256 验签（按 `kid` 选钥、支持密钥轮转）；客户端：`client_credentials` 换取 `access_token` |
 | tokenSource 动态令牌 | ✅ | `auth.tokenSource`：`type = "file"` 读文件 / `type = "exec"` 执行命令取 stdout；与静态 `token` 互斥，客户端启动与配置重载时解析（仅存内存） |
 | additionalScopes | ✅ | `auth.additionalScopes`：`heartBeats` 心跳 Ping 附带 HMAC 签名并由服务端强校验（fail-closed，要求 token 认证）；`newWorkConns` 兼容值（rust 工作连接签名始终强制） |
-| 日志配置 | ✅ | `[log] to`/`level`/`maxDays`（对齐原版）；同时兼容旧版顶层 `log_file`/`log_level`/`log_max_days`，`[log]` 段优先。配置 `to` 后 stderr 与文件双写，按天轮转 `<文件名>.<YYYY-MM-DD>`（UTC，与日志时间戳一致），自动清理超过 `maxDays` 天（默认 3，0 = 不清理） |
+| 日志配置 | ✅ | `[log] to`/`level`/`maxDays`（对齐原版）；同时兼容旧版顶层 `log_file`/`log_level`/`log_max_days`，`[log]` 段优先。配置 `to` 后 stderr 与文件双写，按天轮转 `<文件名>.<YYYY-MM-DD>`（**本地时区**，与日志时间戳一致；时区取自 `TZ`/`/etc/localtime`），自动清理超过 `maxDays` 天（默认 3，0 = 不清理） |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |

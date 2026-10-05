@@ -24,6 +24,9 @@ futures-util = "0.3"
 rand = "0.8"
 glob = "0.3"
 hostname = "0.3"
+# 仅用于读取本地时区偏移（libc::localtime_r，可重入）。纯 FFI 声明、无 C 代码，
+# 且早已是 tokio 的传递依赖 —— 不引入新的编译单元，也不要求 C 工具链。
+libc = "0.2"
 ring = "0.17"
 snap = "1"
 base64 = "0.22"
