@@ -32,7 +32,7 @@ const IO_CHUNK: usize = 8 * 1024;
 
 /// 报文体分帧方式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyFraming {
+pub(crate) enum BodyFraming {
     /// 无报文体
     None,
     /// 固定长度（`Content-Length`）
@@ -179,16 +179,16 @@ impl Plugin for HttpBridgePlugin {
 }
 
 /// 访客请求（仅解析桥接所需字段）
-struct Request {
-    method: String,
-    target: String,
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) target: String,
     /// 是否为 HTTP/1.0（决定缺省连接语义）
-    http10: bool,
-    headers: Vec<(String, String)>,
+    pub(crate) http10: bool,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 impl Request {
-    fn parse(head: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub(crate) fn parse(head: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (first_line, headers) = parse_head(head)?;
         let mut parts = first_line.split_whitespace();
         let method = parts
@@ -209,7 +209,7 @@ impl Request {
         })
     }
 
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -217,7 +217,7 @@ impl Request {
     }
 
     /// HTTP/1.0 默认短连接（除非显式 `Connection: keep-alive`）；HTTP/1.1 默认长连接
-    fn keep_alive(&self) -> bool {
+    pub(crate) fn keep_alive(&self) -> bool {
         match self.header("connection") {
             Some(v) if v.eq_ignore_ascii_case("close") => false,
             Some(v) if v.eq_ignore_ascii_case("keep-alive") => true,
@@ -225,7 +225,7 @@ impl Request {
         }
     }
 
-    fn body_framing(&self) -> BodyFraming {
+    pub(crate) fn body_framing(&self) -> BodyFraming {
         if has_chunked(&self.headers) {
             return BodyFraming::Chunked;
         }
@@ -237,13 +237,13 @@ impl Request {
 }
 
 /// 本地响应（仅解析桥接所需字段）
-struct Response {
-    status: u16,
-    headers: Vec<(String, String)>,
+pub(crate) struct Response {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 impl Response {
-    fn parse(head: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub(crate) fn parse(head: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (first_line, headers) = parse_head(head)?;
         let status = first_line
             .split_whitespace()
@@ -253,7 +253,7 @@ impl Response {
         Ok(Self { status, headers })
     }
 
-    fn body_framing(&self, request_method: &str) -> BodyFraming {
+    pub(crate) fn body_framing(&self, request_method: &str) -> BodyFraming {
         // 1xx / 204 / 304 与 HEAD 响应无报文体
         if request_method.eq_ignore_ascii_case("HEAD")
             || (100..200).contains(&self.status)
@@ -310,7 +310,7 @@ fn content_length(headers: &[(String, String)]) -> Option<u64> {
 }
 
 /// 取 `host:port` 中的 host 部分（TLS SNI 与缺省 Host 头使用）
-fn host_part(addr: &str) -> String {
+pub(crate) fn host_part(addr: &str) -> String {
     match addr.rsplit_once(':') {
         Some((host, _)) if !host.is_empty() => {
             // IPv6 字面量形如 [::1]:8080
@@ -371,7 +371,7 @@ fn build_forward_request_head(
 ///
 /// 丢弃上游 `Connection`（本地连接恒为 close，不应透传给访客），
 /// 按本插件与访客之间的实际连接语义重新声明。
-fn build_forward_response_head(response: &Response, keep_alive: bool) -> String {
+pub(crate) fn build_forward_response_head(response: &Response, keep_alive: bool) -> String {
     let mut out = format!(
         "HTTP/1.1 {} {}\r\n",
         response.status,
@@ -430,7 +430,7 @@ fn status_text(status: u16) -> &'static str {
 /// 读取完整头部（含结尾 `\r\n\r\n`）
 ///
 /// 返回 `Ok(None)` 表示对端在发送任何数据前关闭（正常结束，不算错误）。
-async fn read_head(
+pub(crate) async fn read_head(
     conn: &mut Box<dyn AsyncStream>,
     pending: &mut Vec<u8>,
 ) -> std::io::Result<Option<Vec<u8>>> {
@@ -492,7 +492,7 @@ async fn read_line(
 }
 
 /// 精确转发 `n` 字节（先消费已缓冲数据）
-async fn copy_exactly(
+pub(crate) async fn copy_exactly(
     from: &mut Box<dyn AsyncStream>,
     pending: &mut Vec<u8>,
     to: &mut Box<dyn AsyncStream>,
@@ -522,7 +522,7 @@ async fn copy_exactly(
 }
 
 /// 原样转发 chunked 报文体（含块大小行、块尾 CRLF 与尾部头），直至 0 长度块
-async fn forward_chunked(
+pub(crate) async fn forward_chunked(
     from: &mut Box<dyn AsyncStream>,
     pending: &mut Vec<u8>,
     to: &mut Box<dyn AsyncStream>,
@@ -554,7 +554,7 @@ async fn forward_chunked(
 }
 
 /// 读到 EOF 为止（close-delimited 响应体）
-async fn copy_until_eof(
+pub(crate) async fn copy_until_eof(
     from: &mut Box<dyn AsyncStream>,
     pending: &mut Vec<u8>,
     to: &mut Box<dyn AsyncStream>,

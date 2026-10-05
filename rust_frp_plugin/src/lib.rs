@@ -14,7 +14,7 @@
 //!    - 内置路径遍历攻击防护
 //!
 //! 3. **HttpProxyPlugin (HTTP 代理)**
-//!    - 实现 HTTP CONNECT 代理功能
+//!    - 实现 HTTP CONNECT 隧道 + 普通 HTTP 正向代理（绝对形式 / origin 形式目标）
 //!    - 支持隧道穿过防火墙
 //!
 //! 4. **Socks5Plugin (SOCKS5 代理)**
@@ -411,12 +411,18 @@ impl Plugin for StaticFilePlugin {
     }
 }
 
-/// HTTP 代理插件（HTTP CONNECT 隧道）
+/// HTTP 代理插件（CONNECT 隧道 + 普通 HTTP 正向代理）
 ///
-/// 访客按 `CONNECT host:port` 语义建立隧道并双向转发。
+/// 对齐原版 frp `pkg/plugin/client/http_proxy.go` 的两类语义：
+///
+/// - **CONNECT 隧道**：`CONNECT host:port` 后双向转发（HTTPS 等任意 TCP 流量）；
+/// - **普通 HTTP 转发**：请求目标支持绝对形式（`GET http://host/path HTTP/1.1`）
+///   与 origin 形式（`GET /path HTTP/1.1` + `Host` 头），剥离代理专属头后
+///   转发到目标源站并原样回写响应（等价于原版 `http.DefaultTransport.RoundTrip`）。
+///
 /// 配置了 `http_user` / `http_password` 时强制校验 `Proxy-Authorization: Basic`
-/// 请求头；校验在解析目标之前进行，未通过一律 407（不暴露代理行为）。
-/// 已知限制：仅支持 CONNECT，普通 HTTP 转发未实现（见 README）。
+/// 请求头（常量时间比较）；认证先于目标解析，未通过一律 407（不暴露代理行为）。
+/// 凭据头 `Proxy-Authorization` 永不转发给源站。
 pub struct HttpProxyPlugin {
     http_user: Option<String>,
     http_password: Option<String>,
@@ -430,17 +436,13 @@ impl HttpProxyPlugin {
         })
     }
 
-    /// 校验代理认证（`Proxy-Authorization: Basic`）
-    ///
-    /// 未配置 `http_user` / `http_password` 时视为匿名代理直接放行；
-    /// 配置后必须提供匹配凭据（常量时间比较），否则返回 `false`。
-    fn check_proxy_auth(&self, lines: &[&str]) -> bool {
-        if self.http_user.is_none() && self.http_password.is_none() {
-            return true;
-        }
-        let expected_user = self.http_user.as_deref().unwrap_or("");
-        let expected_password = self.http_password.as_deref().unwrap_or("");
+    /// 是否为匿名代理（未配置任何凭据）
+    fn is_anonymous(&self) -> bool {
+        self.http_user.is_none() && self.http_password.is_none()
+    }
 
+    /// 校验代理认证（`Proxy-Authorization: Basic`）——按请求行列表形式
+    fn check_proxy_auth(&self, lines: &[&str]) -> bool {
         let header = lines.iter().find_map(|line| {
             let (name, value) = line.split_once(':')?;
             if name.eq_ignore_ascii_case("proxy-authorization") {
@@ -449,6 +451,19 @@ impl HttpProxyPlugin {
                 None
             }
         });
+        self.check_proxy_auth_value(header)
+    }
+
+    /// 校验代理认证——按已解析的头部值形式
+    ///
+    /// 未配置 `http_user` / `http_password` 时视为匿名代理直接放行；
+    /// 配置后必须提供匹配凭据（常量时间比较），否则返回 `false`。
+    fn check_proxy_auth_value(&self, header: Option<&str>) -> bool {
+        if self.is_anonymous() {
+            return true;
+        }
+        let expected_user = self.http_user.as_deref().unwrap_or("");
+        let expected_password = self.http_password.as_deref().unwrap_or("");
 
         let Some(header) = header else {
             return false;
@@ -473,61 +488,79 @@ impl HttpProxyPlugin {
         constant_time_eq(user, expected_user) && constant_time_eq(password, expected_password)
     }
 
-    /// 处理 HTTP 代理请求
+    /// 处理 HTTP 代理请求（按首行分派 CONNECT / 普通 HTTP）
     async fn handle_http_proxy_request(
         &self,
         mut conn: Box<dyn AsyncStream>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 读取 HTTP 请求
-        let mut buf = [0; 1024];
-        let n = conn.read(&mut buf).await?;
-        let request = String::from_utf8_lossy(&buf[..n]);
+        // 读取完整请求头（头部之后的残留字节保留在 pending 中）
+        let mut pending: Vec<u8> = Vec::new();
+        let Some(head_bytes) = http_bridge::read_head(&mut conn, &mut pending).await? else {
+            // 对端在发送任何数据前关闭
+            return Ok(());
+        };
 
-        // 解析 HTTP 请求
-        let lines: Vec<&str> = request.lines().collect();
-        if lines.is_empty() {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid HTTP request",
-            )));
-        }
-
-        let first_line = lines[0];
+        let head_text = String::from_utf8_lossy(&head_bytes);
+        let lines: Vec<&str> = head_text.lines().collect();
+        let Some(first_line) = lines.first() else {
+            return Self::reject(&mut conn, "400 Bad Request", "invalid HTTP request").await;
+        };
         let parts: Vec<&str> = first_line.split_whitespace().collect();
         if parts.len() < 3 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid HTTP request line",
-            )));
+            return Self::reject(&mut conn, "400 Bad Request", "invalid HTTP request line").await;
         }
 
         // 认证先于命令分派：未通过认证不解析目标、不暴露代理行为
         if !self.check_proxy_auth(&lines) {
-            let response = "HTTP/1.1 407 Proxy Authentication Required\r\n\
-                 Proxy-Authenticate: Basic realm=\"frp http proxy\"\r\n\
-                 Content-Length: 0\r\n\
-                 Connection: close\r\n\r\n";
-            conn.write_all(response.as_bytes()).await?;
-            return Ok(());
+            return Self::reject(
+                &mut conn,
+                "407 Proxy Authentication Required",
+                "proxy authentication required",
+            )
+            .await;
         }
 
-        if parts[0] != "CONNECT" {
-            // 本实现仅支持 CONNECT 隧道；普通 HTTP 转发（原版支持）尚未实现
-            let body = "Method Not Allowed: only CONNECT is supported";
-            let response = format!(
-                "HTTP/1.1 405 Method Not Allowed\r\n\
-                 Content-Type: text/plain; charset=utf-8\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            conn.write_all(response.as_bytes()).await?;
-            return Ok(());
+        if parts[0].eq_ignore_ascii_case("CONNECT") {
+            self.handle_connect(&mut conn, parts[1], pending).await
+        } else {
+            self.handle_plain_http(&mut conn, &head_bytes, pending)
+                .await
         }
+    }
 
-        let target = parts[1];
+    /// 统一的错误响应（附带 Connection: close，写完即结束）
+    ///
+    /// `status` 为 `407` 时按原版语义附带 `Proxy-Authenticate: Basic`。
+    async fn reject(
+        conn: &mut Box<dyn AsyncStream>,
+        status: &str,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let auth_header = if status.starts_with("407") {
+            "Proxy-Authenticate: Basic realm=\"frp http proxy\"\r\n"
+        } else {
+            ""
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\n\
+             {auth_header}\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        conn.write_all(response.as_bytes()).await?;
+        Ok(())
+    }
 
+    /// CONNECT 隧道：连接目标后双向转发
+    async fn handle_connect(
+        &self,
+        conn: &mut Box<dyn AsyncStream>,
+        target: &str,
+        pending: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 连接到目标服务器（TcpStream::connect 支持域名解析，与原版 net.Dial 一致）
         let mut target_conn = match tokio::net::TcpStream::connect(target).await {
             Ok(c) => c,
@@ -540,14 +573,261 @@ impl HttpProxyPlugin {
             }
         };
 
-        // 发送 HTTP 响应
-        let response = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        conn.write_all(response.as_bytes()).await?;
+        // 发送隧道建立响应
+        conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        // 头部之后可能已有残留字节（少见但合法），先补发
+        if !pending.is_empty() {
+            target_conn.write_all(&pending).await?;
+        }
 
         // 双向转发数据
-        tokio::io::copy_bidirectional(&mut conn, &mut target_conn).await?;
-
+        tokio::io::copy_bidirectional(conn, &mut target_conn).await?;
         Ok(())
+    }
+
+    /// 普通 HTTP 正向代理（对齐原版 `HTTPHandler` + `http.DefaultTransport.RoundTrip`）
+    ///
+    /// - 目标解析：绝对形式（`http://host[:port]/path`，默认端口 80；`https://` 默认 443
+    ///   并以验证模式建立 TLS）或 origin 形式（`/path` + `Host` 头，默认端口 80）；
+    /// - 头部改写：剥离 `Connection` / `Proxy-Connection` / `Proxy-Authenticate` /
+    ///   `Proxy-Authorization` / `TE` / `Trailers` / `Upgrade`（对齐原版 removeProxyHeaders），
+    ///   `Content-Length` / `Transfer-Encoding` 保留（报文体按原分帧原样转发）；
+    /// - 响应回写：剥离上游逐跳头后按本连接语义重声明，支持同一连接上的 keep-alive。
+    async fn handle_plain_http(
+        &self,
+        conn: &mut Box<dyn AsyncStream>,
+        head_bytes: &[u8],
+        mut pending: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request = http_bridge::Request::parse(head_bytes)?;
+        let mut request = request;
+
+        loop {
+            // ---- 1. 解析转发目标（认证已在分派前完成） ----
+            let Some(resolved) = Self::resolve_forward_target(&request) else {
+                return Self::reject(
+                    conn,
+                    "400 Bad Request",
+                    "cannot resolve proxy target (absolute URL or Host header required)",
+                )
+                .await;
+            };
+
+            // ---- 2. 连接目标并转发重写后的请求 ----
+            let mut target = match Self::connect_target(&resolved).await {
+                Ok(t) => t,
+                Err(_) => {
+                    return Self::reject(conn, "502 Bad Gateway", "cannot reach proxy target")
+                        .await;
+                }
+            };
+            let out_head = Self::build_proxy_request_head(&request, &resolved);
+            target.write_all(out_head.as_bytes()).await?;
+
+            match request.body_framing() {
+                http_bridge::BodyFraming::None => {}
+                http_bridge::BodyFraming::Length(n) => {
+                    http_bridge::copy_exactly(conn, &mut pending, &mut target, n).await?;
+                }
+                http_bridge::BodyFraming::Chunked => {
+                    http_bridge::forward_chunked(conn, &mut pending, &mut target).await?;
+                }
+                http_bridge::BodyFraming::UntilEof => {
+                    // HTTP/1.1 请求体不会以「连接关闭」定界；防御性处理
+                    return Err(invalid_input("unexpected close-delimited request body"));
+                }
+            }
+            target.flush().await?;
+
+            // ---- 3. 读取源站响应并回写 ----
+            let mut target_pending: Vec<u8> = Vec::new();
+            let Some(resp_bytes) = http_bridge::read_head(&mut target, &mut target_pending).await?
+            else {
+                // 源站未响应即关闭：直接断开访客连接
+                let _ = conn.shutdown().await;
+                return Ok(());
+            };
+            let response = http_bridge::Response::parse(&resp_bytes)?;
+            let resp_framing = response.body_framing(&request.method);
+
+            let request_keep_alive = request.keep_alive();
+            let must_close =
+                resp_framing == http_bridge::BodyFraming::UntilEof || !request_keep_alive;
+            let out_resp_head = http_bridge::build_forward_response_head(&response, !must_close);
+            conn.write_all(out_resp_head.as_bytes()).await?;
+            conn.flush().await?;
+
+            match resp_framing {
+                http_bridge::BodyFraming::None => {}
+                http_bridge::BodyFraming::Length(n) => {
+                    http_bridge::copy_exactly(&mut target, &mut target_pending, conn, n).await?;
+                }
+                http_bridge::BodyFraming::Chunked => {
+                    http_bridge::forward_chunked(&mut target, &mut target_pending, conn).await?;
+                }
+                http_bridge::BodyFraming::UntilEof => {
+                    http_bridge::copy_until_eof(&mut target, &mut target_pending, conn).await?;
+                }
+            }
+            conn.flush().await?;
+            let _ = target.shutdown().await;
+
+            if must_close {
+                let _ = conn.shutdown().await;
+                return Ok(());
+            }
+
+            // ---- 4. keep-alive：读取下一个请求并进入下一轮处理 ----
+            let Some(next_head) = http_bridge::read_head(conn, &mut pending).await? else {
+                return Ok(());
+            };
+            let next = http_bridge::Request::parse(&next_head)?;
+            // 后续请求重新做代理认证（对齐原版每请求校验）
+            let auth_value = next.header("proxy-authorization").map(str::to_string);
+            if !self.check_proxy_auth_value(auth_value.as_deref()) {
+                return Self::reject(
+                    conn,
+                    "407 Proxy Authentication Required",
+                    "proxy authentication required",
+                )
+                .await;
+            }
+            request = next;
+        }
+    }
+
+    /// 解析普通 HTTP 转发目标
+    ///
+    /// 返回 `(https, authority, path, host_header)`；
+    /// 无法解析（既非绝对 URL 也无 Host 头）时返回 `None`。
+    fn resolve_forward_target(request: &http_bridge::Request) -> Option<ResolvedTarget> {
+        let target = request.target.as_str();
+
+        // 绝对形式：scheme://authority/path
+        if let Some((scheme, rest)) = target.split_once("://") {
+            let https = match scheme.to_ascii_lowercase().as_str() {
+                "http" => false,
+                "https" => true,
+                _ => return None,
+            };
+            let (authority, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, "/"),
+            };
+            if authority.is_empty() {
+                return None;
+            }
+            // Host 头优先（客户端显式声明的权威值），否则取 URL authority
+            let host_header = request
+                .header("host")
+                .map(str::to_string)
+                .unwrap_or_else(|| authority.to_string());
+            return Some(ResolvedTarget {
+                https,
+                authority: authority.to_string(),
+                path: path.to_string(),
+                host_header,
+            });
+        }
+
+        // origin 形式：路径 + Host 头（HTTP/1.1 强制）
+        if target.starts_with('/') {
+            let host = request.header("host")?.trim().to_string();
+            if host.is_empty() {
+                return None;
+            }
+            return Some(ResolvedTarget {
+                https: false,
+                host_header: host.clone(),
+                authority: host,
+                path: target.to_string(),
+            });
+        }
+
+        None
+    }
+
+    /// 建立到源站的连接（https 时以验证模式建立 TLS，SNI 取 authority 的 host 部分）
+    async fn connect_target(
+        resolved: &ResolvedTarget,
+    ) -> Result<Box<dyn AsyncStream>, Box<dyn std::error::Error + Send + Sync>> {
+        let addr = if resolved.authority.contains(':') && !resolved.authority.starts_with('[') {
+            resolved.authority.clone()
+        } else {
+            format!("{}:{}", resolved.authority, resolved.default_port())
+        };
+        let tcp = tokio::net::TcpStream::connect(addr.as_str()).await?;
+        if !resolved.https {
+            return Ok(Box::new(tcp));
+        }
+        let tls = rust_frp_net::TlsConfig::new_client()?;
+        let host = http_bridge::host_part(&resolved.authority);
+        let stream = tls.connect_stream(&host, tcp).await?;
+        Ok(Box::new(stream))
+    }
+
+    /// 构造转发给源站的请求头
+    ///
+    /// 剥离逐跳头与代理专属头（对齐原版 `removeProxyHeaders`），
+    /// 保留 `Content-Length` / `Transfer-Encoding` 以维持报文体分帧，
+    /// 对源站统一声明 `Connection: close`。
+    fn build_proxy_request_head(
+        request: &http_bridge::Request,
+        resolved: &ResolvedTarget,
+    ) -> String {
+        const HOP_BY_HOP: [&str; 7] = [
+            "connection",
+            "proxy-connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "upgrade",
+        ];
+
+        let mut out = format!("{} {} HTTP/1.1\r\n", request.method, resolved.path);
+        let mut has_host = false;
+        for (k, v) in &request.headers {
+            let lower = k.to_ascii_lowercase();
+            if HOP_BY_HOP.contains(&lower.as_str()) {
+                continue;
+            }
+            if lower == "host" {
+                has_host = true;
+                out.push_str(&format!("Host: {}\r\n", resolved.host_header));
+                continue;
+            }
+            out.push_str(&format!("{k}: {v}\r\n"));
+        }
+        if !has_host {
+            out.push_str(&format!("Host: {}\r\n", resolved.host_header));
+        }
+        out.push_str("Connection: close\r\n\r\n");
+        out
+    }
+}
+
+/// 普通 HTTP 转发目标（`resolve_forward_target` 的产物）
+struct ResolvedTarget {
+    /// 是否为 https（需 TLS 连接源站）
+    https: bool,
+    /// 拨号用的 `host[:port]` authority
+    authority: String,
+    /// 转发的请求路径（含查询串）
+    path: String,
+    /// 转发请求的 `Host` 头值
+    host_header: String,
+}
+
+impl ResolvedTarget {
+    /// 缺省端口（authority 未携带端口时使用）
+    fn default_port(&self) -> u16 {
+        if self.https {
+            443
+        } else {
+            80
+        }
     }
 }
 
@@ -1112,6 +1392,251 @@ mod static_file_auth_tests {
             &plugin(Some("u"), None),
             &[basic_header("u", "anything")]
         ));
+    }
+}
+
+#[cfg(test)]
+mod http_proxy_plain_http_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn http_plugin(user: Option<&str>, password: Option<&str>) -> HttpProxyPlugin {
+        let cfg = PluginConfig {
+            r#type: "http_proxy".to_string(),
+            http_user: user.map(str::to_string),
+            http_password: password.map(str::to_string),
+            ..Default::default()
+        };
+        HttpProxyPlugin::new(&cfg).expect("http proxy build failed")
+    }
+
+    /// 起一个「收一个请求 → 回固定长度响应 → 关闭」的源站，并捕获收到的请求原文
+    async fn spawn_origin(
+        body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let received = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+            received
+        });
+        (addr, task)
+    }
+
+    /// 通过 duplex 把请求喂给插件并收完整响应（请求侧声明 Connection: close）
+    async fn run(plugin: &mut HttpProxyPlugin, request: String) -> String {
+        let (mut client, server) = tokio::io::duplex(8192);
+        let client_side = async move {
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut out = Vec::new();
+            client.read_to_end(&mut out).await.unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let (resp, handle_result) = tokio::join!(client_side, plugin.handle(Box::new(server)));
+        handle_result.expect("plugin should not error on well-formed traffic");
+        resp
+    }
+
+    /// 绝对形式目标：转发时还原为 origin-form 路径、保留 Host、剥离代理认证头
+    #[tokio::test]
+    async fn absolute_form_target_forwarded() {
+        let (addr, origin_task) = spawn_origin("pong").await;
+        let mut plugin = http_plugin(Some("u"), Some("p"));
+        let auth = format!("Proxy-Authorization: Basic {}", base64::encode("u:p"));
+        let request = format!(
+            "GET http://{addr}/ping?x=1 HTTP/1.1\r\nHost: example.com\r\n{auth}\r\nConnection: close\r\n\r\n"
+        );
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            run(&mut plugin, request).await
+        })
+        .await
+        .expect("request timed out");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), origin_task)
+            .await
+            .expect("origin did not receive request")
+            .unwrap();
+
+        assert!(
+            seen.starts_with("GET /ping?x=1 HTTP/1.1\r\n"),
+            "origin request: {seen}"
+        );
+        assert!(
+            seen.contains("Host: example.com\r\n"),
+            "origin request: {seen}"
+        );
+        assert!(
+            seen.contains("Connection: close\r\n"),
+            "origin request: {seen}"
+        );
+        // 代理凭据绝不透传给源站
+        assert!(
+            !seen.to_ascii_lowercase().contains("proxy-authorization"),
+            "credentials leaked: {seen}"
+        );
+
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
+        assert!(resp.ends_with("pong"), "resp: {resp}");
+    }
+
+    /// origin 形式目标：无 Host 头的绝对 URL 依赖 Host 头拨号
+    #[tokio::test]
+    async fn origin_form_target_forwarded() {
+        let (addr, origin_task) = spawn_origin("ok").await;
+        let mut plugin = http_plugin(None, None);
+        let request = format!("GET /alpha HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            run(&mut plugin, request).await
+        })
+        .await
+        .expect("request timed out");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), origin_task)
+            .await
+            .expect("origin did not receive request")
+            .unwrap();
+
+        assert!(
+            seen.starts_with("GET /alpha HTTP/1.1\r\n"),
+            "origin request: {seen}"
+        );
+        assert!(
+            seen.contains(&format!("Host: {addr}\r\n")),
+            "origin request: {seen}"
+        );
+        assert!(resp.ends_with("ok"), "resp: {resp}");
+    }
+
+    /// POST + Content-Length 请求体被完整转发
+    #[tokio::test]
+    async fn post_body_forwarded() {
+        let (addr, origin_task) = spawn_origin("done").await;
+        let mut plugin = http_plugin(None, None);
+        let request = format!(
+            "POST http://{addr}/upload HTTP/1.1\r\nHost: a.test\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+        );
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            run(&mut plugin, request).await
+        })
+        .await
+        .expect("request timed out");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), origin_task)
+            .await
+            .expect("origin did not receive request")
+            .unwrap();
+
+        assert!(
+            seen.starts_with("POST /upload HTTP/1.1\r\n"),
+            "seen: {seen}"
+        );
+        assert!(seen.contains("Content-Length: 5\r\n"), "seen: {seen}");
+        assert!(seen.ends_with("hello"), "seen: {seen}");
+        assert!(resp.ends_with("done"), "resp: {resp}");
+    }
+
+    /// 凭据错误 → 407，且不连接源站
+    #[tokio::test]
+    async fn plain_http_bad_credentials_rejected() {
+        let mut plugin = http_plugin(Some("u"), Some("p"));
+        let (mut client, server) = tokio::io::duplex(4096);
+        let client_side = async move {
+            client
+                .write_all(
+                    b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut buf = [0u8; 256];
+            let n = client.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        };
+        let (resp, _) = tokio::join!(client_side, plugin.handle(Box::new(server)));
+        assert!(resp.starts_with("HTTP/1.1 407"), "resp: {resp}");
+    }
+
+    /// origin 形式但缺少 Host 头 → 400
+    #[tokio::test]
+    async fn origin_form_without_host_rejected() {
+        let mut plugin = http_plugin(None, None);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            run(&mut plugin, "GET / HTTP/1.1\r\n\r\n".to_string()).await
+        })
+        .await
+        .expect("request timed out");
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "resp: {resp}");
+    }
+
+    /// 同一连接上串行两个 keep-alive 请求
+    #[tokio::test]
+    async fn keep_alive_serves_two_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await.unwrap();
+                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong")
+                    .await
+                    .unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let mut plugin = http_plugin(None, None);
+        let (mut client, server) = tokio::io::duplex(8192);
+        let client_side = async move {
+            client
+                .write_all(format!("GET /1 HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            // 读满第一个响应（以 "pong" 结尾）
+            let mut buf = [0u8; 512];
+            let mut first = String::new();
+            while !first.ends_with("pong") {
+                let n = client.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                first.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            // 第二个请求要求关闭
+            client
+                .write_all(
+                    format!("GET /2 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            client.read_to_end(&mut rest).await.unwrap();
+            (first, String::from_utf8_lossy(&rest).into_owned())
+        };
+
+        let ((first, second), _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client_side, plugin.handle(Box::new(server)))
+        })
+        .await
+        .expect("keep-alive session timed out");
+        tokio::time::timeout(std::time::Duration::from_secs(5), origin_task)
+            .await
+            .expect("origin did not receive both requests")
+            .unwrap();
+
+        assert!(first.ends_with("pong"), "first: {first}");
+        assert!(second.ends_with("pong"), "second: {second}");
+        assert!(second.contains("Connection: close\r\n"), "second: {second}");
     }
 }
 
