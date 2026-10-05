@@ -98,6 +98,10 @@ enable = true
 # 证书校验为 fail-closed 设计：既不配 trusted_ca_file 又不显式开 skip_verify 时，客户端拒绝启动。
 # ⚠️ 生产环境：配置 trusted_ca_file（推荐），用 CA 证书验证服务端身份，防中间人攻击。
 # trusted_ca_file = "/etc/frp/certs/ca.crt"
+#   ↳ 前提：服务端已配 cert_file/key_file（稳定证书），且证书 SAN 必须匹配 server_addr
+#     （连 IP 就要有 IP SAN，连域名就要有该域名 SAN）。服务端未配证书时用的是
+#     **内置运行时自签证书**（每次重启重生成、SAN 仅 frp-server.local/localhost），
+#     此时 trusted_ca_file 无法固定它，只能让服务端换证书或改用下面的 skip_verify。
 # ⚠️ 仅限自签名测试环境：显式跳过证书验证（只加密、不认证，打印 WARN）。
 # skip_verify = true
 

@@ -633,6 +633,15 @@ impl VisitorManager for ClientVisitorManager {
 ///
 /// `skip_verify = true` 意味着任何中间人都可以冒充服务端，仅应在测试环境使用。
 /// 生产环境请务必配置 `transport.tls.trusted_ca_file`，并在服务端换用自建证书。
+///
+/// # ⚠️ `trusted_ca_file` 的生效前提
+///
+/// `trusted_ca_file` 是在**服务端证书稳定且 SAN 与 `server_addr` 匹配**时才有效：
+/// 校验同时包含"链是否被该 CA 签发"与"证书名是否匹配 `server_addr`"。
+/// 若服务端未配 `cert_file`/`key_file`，将使用**内置运行时自签证书**——它每次重启
+/// 重新生成、SAN 仅含 `frp-server.local`/`localhost`，因此**无法**被 `trusted_ca_file` 固定
+/// （即使拿到证书，连 IP 时也会因名称不匹配失败）。这种场景只有两条路：
+/// 服务端改用 SAN 匹配的自建证书，或客户端显式 `skip_verify = true`。
 fn build_client_tls_config(
     config: &rust_frp_config::ClientConfig,
 ) -> Result<Option<TlsConfig>, Box<dyn std::error::Error>> {
@@ -655,8 +664,11 @@ fn build_client_tls_config(
     Err(
         "TLS is enabled but transport.tls.trusted_ca_file is not set and \
          transport.tls.skip_verify is false: refusing to connect with unverified server \
-         certificate (fail-closed). Set trusted_ca_file to pin the server CA, or set \
-         skip_verify = true to explicitly accept the risk (encryption only, no authentication)."
+         certificate (fail-closed). Set trusted_ca_file to pin the server CA (the server must \
+         present a stable cert whose SAN matches server_addr; the built-in runtime self-signed \
+         cert is regenerated every restart and only carries 'frp-server.local'/'localhost', so \
+         it cannot be pinned), or set skip_verify = true to explicitly accept the risk \
+         (encryption only, no authentication)."
             .into(),
     )
 }
