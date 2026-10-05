@@ -22,7 +22,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **重试机制**：客户端连接本地服务时使用指数退避重试
 - **端口白名单**：服务器默认拒绝未明确允许的端口，必须配置才能正常使用
 - **环境变量**：配置文件支持 `${VAR_NAME}` 环境变量替换
-- **多格式配置**：支持 TOML、YAML、JSON 配置格式；**兼容原版 frp 的 camelCase 字段名**（`serverAddr`/`localIP`/`bindPort` 等可直接使用），原版配置文件可直接复用；无法识别的字段（如原版 `log.to`）加载时打印 WARN 但不拒绝启动
+- **多格式配置**：支持 TOML、YAML、JSON 配置格式；**兼容原版 frp 的 camelCase 字段名**（`serverAddr`/`localIP`/`bindPort` 等可直接使用），原版配置文件可直接复用；`[log]` 段（`to`/`level`/`maxDays`）与旧版顶层 `log_file`/`log_level`/`log_max_days` 均已支持（stderr + 文件双写、按天轮转、保留 `maxDays` 天）；其余无法识别的字段（如原版 `loginFailExit`）加载时打印 WARN，严格模式下则直接报错
 - **优雅关闭**：客户端 SIGINT/SIGTERM 优雅退出；服务端 SIGINT/SIGTERM 停止接收新连接并按 10s 上限排空存量连接（不再硬 `exit(0)`）
 - **OIDC 认证**：服务端拉取 issuer 的 Discovery + JWKS 并校验 RS256/ES256 签名（拒绝 `none`/`HS*`，防算法混淆）；客户端支持 `client_credentials` 换取访问令牌
 - **tokenSource 动态令牌**：`auth.tokenSource` 支持 `type = "file"`（读文件）或 `type = "exec"`（执行命令取 stdout），避免把明文 token 写进配置文件（与静态 `token` 互斥）
@@ -58,19 +58,18 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | OIDC 认证 | ✅ | 服务端：issuer Discovery + JWKS 拉取 + RS256/ES256 验签（按 `kid` 选钥、支持密钥轮转）；客户端：`client_credentials` 换取 `access_token` |
 | tokenSource 动态令牌 | ✅ | `auth.tokenSource`：`type = "file"` 读文件 / `type = "exec"` 执行命令取 stdout；与静态 `token` 互斥，客户端启动与配置重载时解析（仅存内存） |
 | additionalScopes | ✅ | `auth.additionalScopes`：`heartBeats` 心跳 Ping 附带 HMAC 签名并由服务端强校验（fail-closed，要求 token 认证）；`newWorkConns` 兼容值（rust 工作连接签名始终强制） |
+| 日志配置 | ✅ | `[log] to`/`level`/`maxDays`（对齐原版）；同时兼容旧版顶层 `log_file`/`log_level`/`log_max_days`，`[log]` 段优先。配置 `to` 后 stderr 与文件双写，按天轮转 `<文件名>.<YYYY-MM-DD>`（UTC，与日志时间戳一致），自动清理超过 `maxDays` 天（默认 3，0 = 不清理） |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
 | PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP（v1 文本 / v2 二进制，`proxyProtocolVersion` 选择版本） |
-| 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容）；**约 25+ 个原版字段暂未支持**，解析成功但会 WARN 提示（清单见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md) 第十节） |
+| 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容）；`[log]` 段已支持；**仍有部分原版字段暂未支持**，非严格模式下解析成功并 WARN 提示、严格模式下直接报错（清单见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md) 第十节） |
 | frpc CLI 子命令 | ✅ | `verify`（校验配置）/ `reload`（热重载）/ `status`（代理状态）/ `stop`（优雅停止），后三者走 frpc 管理端口（Basic Auth 保护）；另有 `nathole discover`（NAT 探测）、`frpc <type> [visitor]`（单代理/访客快速启动，9 类代理）、`--config_dir`（多实例）、`--api-timeout`、`--strict_config`（严格配置模式，默认 true，未知字段直接报错；`--strict_config=false` 退回 WARN 模式） |
 | 流量统计 | ✅ | 桥接结束累加双向字节：服务端 `/api/proxies`（`traffic_in/out`）+ Prometheus per-proxy 指标；客户端 `frpc status`（`traffic_down/up`） |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 
-> **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 81%。尚未支持的主要项：
-> 客户端插件 `virtual_net`
-> 服务端 tracer、
-> `auth.additionalScopes`、SSH 隧道网关、`--strict_config`、Store 配置源等。
+> **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 87%。尚未支持的主要项：
+> 客户端插件 `virtual_net`、SSH 隧道网关、`featureGates`、Store 配置源、legacy INI 配置等。
 > 逐项源码级对照与本项目更严格的安全默认值，见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md)。
 
 ---

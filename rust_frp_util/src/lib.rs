@@ -230,7 +230,14 @@ pub mod retry;
 /// 提供基于令牌桶算法的带宽限制功能，支持对读写操作进行限速。
 pub mod rate_limiter;
 
+/// 日志初始化模块
+///
+/// 对齐原版 frp `[log]` 段：`to` / `level` / `maxDays`，
+/// 支持输出到 stderr + 日志文件（按天轮转、按天数清理）。
+pub mod logging;
+
 // 重新导出常用类型
+pub use logging::init as init_logging;
 pub use rate_limiter::{parse_bandwidth_limit, RateLimitedReader, RateLimitedWriter, TokenBucket};
 pub use retry::{
     retry, retry_with_default, ConnectionError, RetryConfig, RetryResult, RetryableError,

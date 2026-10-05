@@ -52,6 +52,13 @@ mod fields {
         "maxPortsPerUser",
         "custom_404_page",
         "custom404Page",
+        "log",
+        "log_file",
+        "logFile",
+        "log_level",
+        "logLevel",
+        "log_max_days",
+        "logMaxDays",
         "includes",
         "proxies",
         "http_plugins",
@@ -74,6 +81,13 @@ mod fields {
         "transport",
         "proxies",
         "visitors",
+        "log",
+        "log_file",
+        "logFile",
+        "log_level",
+        "logLevel",
+        "log_max_days",
+        "logMaxDays",
         "includes",
     ];
 
@@ -259,6 +273,9 @@ mod fields {
 
     pub const PORT_RANGE: &[&str] = &["start", "end", "single"];
 
+    /// `[log]` 段（原版 frp 新式写法）
+    pub const LOG: &[&str] = &["to", "file", "level", "max_days", "maxDays"];
+
     pub const HTTP_PLUGIN: &[&str] = &["name", "addr", "path", "ops", "tls_verify", "tlsVerify"];
 }
 
@@ -278,6 +295,7 @@ fn section_fields(section: &str) -> &'static [&'static str] {
         "health_check" => fields::HEALTH_CHECK,
         "plugin" => fields::PLUGIN,
         "port_range" => fields::PORT_RANGE,
+        "log" => fields::LOG,
         "http_plugin" => fields::HTTP_PLUGIN,
         _ => &[],
     }
@@ -294,6 +312,7 @@ fn child_section(section: &str, key: &str) -> Option<&'static str> {
             "proxies" => Some("proxy"),
             "visitors" => Some("visitor"),
             "allow_ports" | "allowPorts" => Some("port_range"),
+            "log" => Some("log"),
             "http_plugins" | "httpPlugins" => Some("http_plugin"),
             _ => None,
         },
@@ -318,7 +337,7 @@ fn child_section(section: &str, key: &str) -> Option<&'static str> {
     }
 }
 
-/// 收集配置中无法识别的字段路径（如 `log`、`proxies[0].metadatas`）。
+/// 收集配置中无法识别的字段路径（如 `metadatas`、`proxies[0].subdomain`）。
 pub(crate) fn collect_unknown_fields(kind: ConfigKind, root: &Value) -> Vec<String> {
     let mut out = Vec::new();
     match kind {
@@ -417,7 +436,7 @@ mod tests {
             "serverAddr": "1.2.3.4",
             "serverPort": 7000,
             "loginFailExit": true,
-            "log": { "to": "./frpc.log", "level": "info" },
+            "log": { "to": "./frpc.log", "level": "info", "maxDays": 3 },
             "proxies": [
                 { "name": "ssh", "type": "tcp", "localIP": "127.0.0.1", "localPort": 22, "remotePort": 6022, "metadatas": {} }
             ]
@@ -427,10 +446,60 @@ mod tests {
             unknown.contains(&"loginFailExit".to_string()),
             "got {unknown:?}"
         );
-        assert!(unknown.contains(&"log".to_string()), "got {unknown:?}");
         assert!(
             unknown.contains(&"proxies[0].metadatas".to_string()),
             "got {unknown:?}"
+        );
+        // `[log]` 段已支持（原版标准写法），不得再被误报
+        assert!(
+            !unknown.iter().any(|f| f == "log" || f.starts_with("log.")),
+            "got {unknown:?}"
+        );
+    }
+
+    /// 回归：原版两种日志写法（`[log]` 段 与 旧版顶层 `log_file`/`log_level`/
+    /// `log_max_days`）在 strict 模式下都必须被接受。
+    ///
+    /// 修复背景：此前 `log` 段与 `log_file`/`log_level` 均不在已知键中，
+    /// 导致**一份标准原版 frps.toml 在 strict 模式下直接启动失败**。
+    #[test]
+    fn test_log_section_and_legacy_fields_are_known() {
+        let section_style = json!({
+            "bindPort": 9300,
+            "log": { "to": "/var/log/frps.log", "level": "info", "maxDays": 3 },
+            "auth": { "method": "token", "token": "abc" }
+        });
+        assert!(
+            collect_unknown_fields(ConfigKind::Server, &section_style).is_empty(),
+            "got {:?}",
+            collect_unknown_fields(ConfigKind::Server, &section_style)
+        );
+
+        let legacy_style = json!({
+            "serverAddr": "1.2.3.4",
+            "serverPort": 9300,
+            "log_file": "/var/log/frpc.log",
+            "log_level": "info",
+            "log_max_days": 7,
+            "auth": { "method": "token", "token": "abc" }
+        });
+        assert!(
+            collect_unknown_fields(ConfigKind::Client, &legacy_style).is_empty(),
+            "got {:?}",
+            collect_unknown_fields(ConfigKind::Client, &legacy_style)
+        );
+
+        // camelCase 变体同样接受
+        let camel_style = json!({
+            "bindPort": 9300,
+            "logFile": "/var/log/frps.log",
+            "logLevel": "info",
+            "logMaxDays": 7
+        });
+        assert!(
+            collect_unknown_fields(ConfigKind::Server, &camel_style).is_empty(),
+            "got {:?}",
+            collect_unknown_fields(ConfigKind::Server, &camel_style)
         );
     }
 
