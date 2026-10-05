@@ -16,7 +16,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 - **wire protocol v2**：`transport.wire_protocol = "v2"` 可选启用——魔数标识 + 帧化能力协商 + HKDF 方向性 AEAD 控制通道（默认 v1，向后兼容）
 - **TLS 加密**：使用 rustls 实现，未配置证书时服务端在运行时生成自签名证书（内存中、不落盘不入库），也支持自定义证书；控制连接和数据连接均默认启用加密；客户端支持跳过证书验证模式，方便使用自签名证书
 - **HMAC 签名验证**：工作连接使用 HMAC-SHA256 签名，防止连接伪造
-- **PROXY Protocol**：可选启用，透传真实访问者 IP 给本地 nginx/haproxy，方便日志记录和访问控制
+- **PROXY Protocol（v1 / v2）**：可选启用，透传真实访问者 IP 给本地 nginx/haproxy，方便日志记录和访问控制
 - **工作连接池模式**：与 frp 原版一致，per-proxy mpsc channel 池管理，取后自动补充 + 失败重试
 - **连接池**：内置连接池管理，支持空闲超时和生命周期控制
 - **重试机制**：客户端连接本地服务时使用指数退避重试
@@ -60,7 +60,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
-| PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP（**仅 v1**；原版 v2 未实现） |
+| PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP（v1 文本 / v2 二进制，`proxyProtocolVersion` 选择版本） |
 | 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容）；**约 25+ 个原版字段暂未支持**，解析成功但会 WARN 提示（清单见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md) 第十节） |
 | frpc CLI 子命令 | ✅ | `verify`（校验配置）/ `reload`（热重载）/ `status`（代理状态）/ `stop`（优雅停止），后三者走 frpc 管理端口（Basic Auth 保护）；另有 `nathole discover`（NAT 探测）、`frpc <type> [visitor]`（单代理/访客快速启动，9 类代理）、`--config_dir`（多实例）、`--api-timeout`；**尚未支持** `--strict_config`（rust 为 WARN 模式） |
 | 流量统计 | ✅ | 桥接结束累加双向字节：服务端 `/api/proxies`（`traffic_in/out`）+ Prometheus per-proxy 指标；客户端 `frpc status`（`traffic_down/up`） |
@@ -774,6 +774,8 @@ remote_port = 9302
 # 可选：启用 PROXY protocol 透传真实访问者 IP
 # 本地 nginx 需配合配置：listen 80 proxy_protocol;
 # proxy_protocol = true
+# 可选：选择版本（v1 文本 / v2 二进制，缺省 v1）
+# proxy_protocol_version = "v2"
 ```
 
 ### UDP 代理
@@ -1302,7 +1304,14 @@ TokenBucket（令牌桶算法）              ← 控制读写速率
 
 ### PROXY Protocol
 
-可选功能，通过 `proxy_protocol = true` 启用。在客户端连接本地服务前，写入 PROXY protocol v1 header，让 nginx/haproxy 获取真实访问者 IP 而非 `127.0.0.1`。
+可选功能，通过 `proxy_protocol = true` 启用（或直接设置 `proxy_protocol_version`，与原版语义一致）。
+在客户端连接本地服务前写入 PROXY protocol header，让 nginx/haproxy 获取真实访问者 IP 而非 `127.0.0.1`。
+
+**版本选择**（`proxy_protocol_version`，alias `proxyProtocolVersion`）：
+
+- `"v1"`（默认）：文本格式 `PROXY TCP4 <src> <dst> <sport> <dport>\r\n`；
+- `"v2"`：二进制格式（12 字节签名 + 地址载荷，IPv4/IPv6 均支持）；
+- 访问者地址不是合法 IP 字面量时退化为 `PROXY UNKNOWN`（v1）/ LOCAL 帧（v2）。
 
 **数据流**：
 
@@ -1314,7 +1323,8 @@ TokenBucket（令牌桶算法）              ← 控制读写速率
 
 **涉及修改**：
 
-- `rust_frp_config` — `proxy_protocol: Option<bool>` 配置字段
+- `rust_frp_config` — `proxy_protocol` / `proxy_protocol_version` 配置字段
+- `rust_frp_net` — `proxy_protocol` 模块（v1/v2 头构造，含 IPv6 与 UNKNOWN/LOCAL 回退）
 - `rust_frp_core` — `StartWorkConnMsg` 新增 `src_addr/src_port/dst_addr/dst_port`
 - `rust_frp_server` — `get_work_conn` 传递访问者地址填入 StartWorkConn
 - `rust_frp_client` — `establish_work_connection` 检测配置，按需写入 PROXY header

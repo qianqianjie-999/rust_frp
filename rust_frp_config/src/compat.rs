@@ -182,6 +182,8 @@ mod fields {
         "plugin",
         "proxy_protocol",
         "proxyProtocol",
+        "proxy_protocol_version",
+        "proxyProtocolVersion",
         "group",
         "group_key",
         "groupKey",

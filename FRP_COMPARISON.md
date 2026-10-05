@@ -29,7 +29,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~322 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 能力覆盖率 | **≈ 86%（63/73）** ｜ 数据面 **96%（25/26）**、控制/运维面 **81%（38/47）** | 100%（基线） | 见第二节 |
+| 能力覆盖率 | **≈ 88%（64/73）** ｜ 数据面 **100%（26/26）**、控制/运维面 **81%（38/47）** | 100%（基线） | 见第二节 |
 | 配置字段兼容 | ⚠️ 双向 alias 兼容，但**约 25+ 个原版字段未支持**（解析成功 + WARN） | camelCase + 严格模式 | 原版配置**可加载**但部分字段不生效 |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify / reload / status / stop / nathole / 每类代理与访客 / `--config_dir` | reload / status / stop / verify / nathole / 每类代理 | rust 已基本对齐 |
@@ -51,7 +51,7 @@
 | 代理类型 | **8/8** | 100% | —（rust 另多 1 种 `websocket` 代理类型） |
 | 传输协议 | **5/5** | 100% | —（`wss` 已落地，见 五、传输与协议对照） |
 | 内部线协议 | **2/2** | 100% | —（v1 与 v2 双版本均已落地，见 五、传输与协议对照） |
-| 数据面能力 | **10/11** | 91% | PROXY protocol v2（rust 仅 v1 布尔开关） |
+| 数据面能力 | **11/11** | 100% | —（PROXY protocol v1/v2 已落地，见 六、数据面能力对照） |
 | 客户端插件 | **9/10** | 90% | `virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 已支持普通 HTTP 转发） |
 | 服务端插件 | **1/2** | 50% | tracer 链路追踪 |
 | 认证与安全 | **4/7** | 57% | `additionalScopes`、SSH 隧道网关、FeatureGate/`--allow-unsafe` |
@@ -65,7 +65,7 @@
 
 | 分组 | 覆盖 | 说明 |
 |------|:----:|------|
-| 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **25/26（96%）** | 转发链路基本对齐 |
+| 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **26/26（100%）** | 转发链路完全对齐 |
 | 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **38/47（81%）** | 剩余差距集中在个别插件/认证/配置字段 |
 
 > 计分口径：一项能力「确实可用且与原版等价（或更强）」记 1 分；缺失 / 仅占位 / 显著弱化 / 未强制记 0 分。
@@ -133,10 +133,10 @@
 | 工作连接池（poolCount） | ✅ | ✅ | 等价 |
 | 配置热重载 | ✅ | ✅ | SIGHUP / 文件监听 / API / frpc reload |
 | 优雅关闭 | ✅ | ✅ | rust 停止 accept + 排空存量连接（10s 上限） |
-| PROXY protocol | ⚠️ **仅 v1** | ✅ v1 + v2 | rust 为布尔开关，v2 未实现 |
+| PROXY protocol | ✅ v1 + v2 | ✅ v1 + v2 | rust 新增 `proxy_protocol_version`（alias `proxyProtocolVersion`）：v1 文本 / v2 二进制（IPv4/IPv6；非法源地址回退 UNKNOWN/LOCAL）；客户端写给本地服务，语义同原版 |
 | 流量统计 | ✅ | ✅ | rust 桥接结束累加双向字节，服务端 + Prometheus + frpc status 暴露 |
 
-> 计分中「数据面能力 10/11」即上表 11 项里 PROXY protocol 因仅 v1 记 0。
+> 数据面 11 项已全部落地（PROXY protocol v2 于 2026-10-05 补齐）。
 
 ---
 
@@ -307,7 +307,7 @@
 ### P2 — 生态 / 增强项（非必需）
 `virtual_net`（vnet）、`pkg/sdk` 进程内嵌库、SSH 隧道网关、
 Store 配置源 + StoreProxy CRUD、FeatureGates、`--strict_config`、端口保留（断线 24h）、
-PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start`、
+`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start`、
 `udpPacketSize`、`metadatas` 之外的元数据、服务端带宽限制模式、legacy INI 配置。
 
 > ✅ 已落地（原 P2 项）：`http2http`、`http2https` 客户端插件 —— 明文 HTTP 接入，

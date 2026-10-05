@@ -944,6 +944,9 @@ pub use wire_v2::{
     FRAME_TYPE_SERVER_HELLO, MAGIC_V2,
 };
 
+/// PROXY protocol 头构造（v1 文本 / v2 二进制，frpc 写给本地服务）
+pub mod proxy_protocol;
+
 /// 极简 HTTP/1.1 客户端（OIDC 拉取 issuer/JWKS/token、插件回调共用）
 pub mod http;
 
