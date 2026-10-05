@@ -26,9 +26,9 @@
 use crate::{AnyConn, FrpConn, NetError};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -107,31 +107,15 @@ fn transport_config(opts: &QuicOptions) -> Arc<quinn::TransportConfig> {
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, NetError> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| NetError::PemDecode(e.to_string()))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| NetError::PemDecode(format!("{}", e)))
+        .map_err(|e| NetError::PemDecode(e.to_string()))
 }
 
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, NetError> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| NetError::PemDecode(format!("{}", e)))?;
-    if let Some(k) = pkcs8.into_iter().next() {
-        return Ok(k.into());
-    }
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let rsa = rustls_pemfile::rsa_private_keys(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| NetError::PemDecode(format!("{}", e)))?;
-    rsa.into_iter()
-        .next()
-        .map(|k| k.into())
-        .ok_or_else(|| NetError::Other("no private key found for QUIC".into()))
+    // from_pem 自动识别 PKCS8 / RSA(PKCS1) / SEC1，与旧实现「先 pkcs8 后 rsa 兜底」一致
+    PrivateKeyDer::from_pem_file(path).map_err(|e| NetError::PemDecode(e.to_string()))
 }
 
 /// 构造 QUIC 服务端配置
@@ -143,6 +127,7 @@ pub fn build_server_config(
     key_file: Option<&str>,
     opts: &QuicOptions,
 ) -> Result<quinn::ServerConfig, NetError> {
+    crate::ensure_crypto_provider();
     let mut rustls_cfg = match (cert_file, key_file) {
         (Some(c), Some(k)) => rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -185,6 +170,7 @@ pub fn build_client_config(
     insecure: bool,
     opts: &QuicOptions,
 ) -> Result<quinn::ClientConfig, NetError> {
+    crate::ensure_crypto_provider();
     let mut rustls_cfg = if let Some(ca) = ca_file {
         let mut roots = rustls::RootCertStore::empty();
         for cert in load_certs(ca)? {
