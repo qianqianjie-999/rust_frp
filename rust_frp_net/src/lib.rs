@@ -26,7 +26,6 @@
 //! - 生产环境请配置自定义证书
 
 use futures_util::{Sink, Stream};
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +36,7 @@ use tokio::net::{
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::UnixTime;
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
@@ -587,43 +587,29 @@ impl Clone for TlsConfig {
     }
 }
 
+/// 安装 rustls 进程级 CryptoProvider（ring 后端）
+///
+/// rustls 0.23 起不再根据 crate features 自动选择 provider，未安装时
+/// `ClientConfig::builder()` / `ServerConfig::builder()` 会 panic。
+/// 此函数幂等（重复安装忽略 `AlreadyInstalled`）；所有构造 rustls 配置的
+/// 入口（TCP/TLS 与 QUIC）都应先调用它。
+pub fn ensure_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 impl TlsConfig {
     /// 从文件创建服务器 TLS 配置
     pub fn new_server(cert_file: &str, key_file: &str) -> Result<Self, NetError> {
-        let cert_file = std::fs::File::open(cert_file)?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let cert_chain: Result<Vec<CertificateDer<'static>>, _> =
-            rustls_pemfile::certs(&mut cert_reader).collect();
-        let cert_chain = cert_chain.map_err(|e| NetError::PemDecode(format!("{}", e)))?;
+        ensure_crypto_provider();
+        let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_file)
+            .map_err(|e| NetError::PemDecode(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| NetError::PemDecode(e.to_string()))?;
 
-        let key_file_path = key_file.to_string();
-        let key_file = std::fs::File::open(&key_file_path)?;
-        let mut key_reader = BufReader::new(key_file);
-        let pkcs8_keys: Result<Vec<_>, _> =
-            rustls_pemfile::pkcs8_private_keys(&mut key_reader).collect();
-        let mut keys: Vec<PrivateKeyDer<'static>> = pkcs8_keys
-            .map_err(|e| NetError::PemDecode(format!("{}", e)))?
-            .into_iter()
-            .map(|k| k.into())
-            .collect();
-
-        if keys.is_empty() {
-            let key_file = std::fs::File::open(&key_file_path)?;
-            let mut key_reader = BufReader::new(key_file);
-            let rsa_keys: Result<Vec<_>, _> =
-                rustls_pemfile::rsa_private_keys(&mut key_reader).collect();
-            let rsa_keys: Vec<PrivateKeyDer<'static>> = rsa_keys
-                .map_err(|e| NetError::PemDecode(format!("{}", e)))?
-                .into_iter()
-                .map(|k| k.into())
-                .collect();
-            keys.extend(rsa_keys);
-        }
-
-        if keys.is_empty() {
-            return Err(NetError::Other("No private key found in file".to_string()));
-        }
-        let key = keys.remove(0);
+        // from_pem 自动识别 PKCS8 / RSA(PKCS1) / SEC1，取文件中第一段私钥，
+        // 与旧实现「先 pkcs8 后 rsa 兜底」语义一致
+        let key = PrivateKeyDer::from_pem_file(key_file)
+            .map_err(|e| NetError::PemDecode(e.to_string()))?;
 
         let config = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -637,11 +623,11 @@ impl TlsConfig {
 
     /// 创建客户端 TLS 配置，信任自定义 CA 证书文件
     pub fn new_client_with_ca_file(ca_file: &str) -> Result<Self, NetError> {
-        let cert_file = std::fs::File::open(ca_file)?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs: Result<Vec<CertificateDer<'static>>, _> =
-            rustls_pemfile::certs(&mut cert_reader).collect();
-        let certs = certs.map_err(|e| NetError::PemDecode(format!("{}", e)))?;
+        ensure_crypto_provider();
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_file)
+            .map_err(|e| NetError::PemDecode(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| NetError::PemDecode(e.to_string()))?;
 
         let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
         for cert in certs {
@@ -662,6 +648,7 @@ impl TlsConfig {
     /// 仅使用 TLS 加密，但不验证服务器证书
     /// 类似于原版 frp 中没有 trustedCaFile 时的行为
     pub fn new_client_insecure() -> Result<Self, NetError> {
+        ensure_crypto_provider();
         log::warn!(
             "TLS client configured with certificate verification DISABLED: \
              traffic is encrypted but the server identity is NOT authenticated"
@@ -680,6 +667,7 @@ impl TlsConfig {
 
     /// 创建客户端 TLS 配置（使用系统根证书）
     pub fn new_client() -> Result<Self, NetError> {
+        ensure_crypto_provider();
         let root_certs: Vec<CertificateDer<'static>> = webpki_roots::TLS_SERVER_ROOTS
             .iter()
             .map(|ta| CertificateDer::from(ta.subject_public_key_info.to_vec()))
@@ -708,6 +696,7 @@ impl TlsConfig {
     ///   需要认证请配置 `transport.tls.cert_file` / `key_file`（服务端）
     ///   与 `transport.tls.trusted_ca_file`（客户端）
     pub fn new_server_with_runtime_cert() -> Result<Self, NetError> {
+        ensure_crypto_provider();
         log::warn!(
             "Using a RUNTIME-GENERATED self-signed TLS certificate (fresh per process): \
              encryption only, server identity NOT authenticated. \
