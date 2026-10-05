@@ -62,7 +62,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
 | PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP（v1 文本 / v2 二进制，`proxyProtocolVersion` 选择版本） |
 | 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容）；**约 25+ 个原版字段暂未支持**，解析成功但会 WARN 提示（清单见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md) 第十节） |
-| frpc CLI 子命令 | ✅ | `verify`（校验配置）/ `reload`（热重载）/ `status`（代理状态）/ `stop`（优雅停止），后三者走 frpc 管理端口（Basic Auth 保护）；另有 `nathole discover`（NAT 探测）、`frpc <type> [visitor]`（单代理/访客快速启动，9 类代理）、`--config_dir`（多实例）、`--api-timeout`；**尚未支持** `--strict_config`（rust 为 WARN 模式） |
+| frpc CLI 子命令 | ✅ | `verify`（校验配置）/ `reload`（热重载）/ `status`（代理状态）/ `stop`（优雅停止），后三者走 frpc 管理端口（Basic Auth 保护）；另有 `nathole discover`（NAT 探测）、`frpc <type> [visitor]`（单代理/访客快速启动，9 类代理）、`--config_dir`（多实例）、`--api-timeout`、`--strict_config`（严格配置模式，默认 true，未知字段直接报错；`--strict_config=false` 退回 WARN 模式） |
 | 流量统计 | ✅ | 桥接结束累加双向字节：服务端 `/api/proxies`（`traffic_in/out`）+ Prometheus per-proxy 指标；客户端 `frpc status`（`traffic_down/up`） |
 | 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
 

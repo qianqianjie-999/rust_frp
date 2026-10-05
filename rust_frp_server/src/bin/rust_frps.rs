@@ -10,13 +10,27 @@ async fn main() {
         .init();
 
     let args: Vec<String> = env::args().collect();
+
+    // 对齐原版 --strict_config（默认 true）：未知字段直接报错
+    // 支持 `--strict_config`（置 true）与 `--strict_config=false` 内联形式
+    let mut strict_config = true;
+    for arg in args.iter().skip(1) {
+        if let Some((key, value)) = arg.split_once('=') {
+            if key == "--strict_config" || key == "--strict-config" {
+                strict_config = matches!(value, "true" | "1" | "TRUE" | "True");
+            }
+        } else if arg == "--strict_config" || arg == "--strict-config" {
+            strict_config = true;
+        }
+    }
+
     let config_path = if args.len() > 2 && args[1] == "-c" {
         args[2].clone()
     } else {
         "frps.toml".to_string()
     };
 
-    let config = match ConfigLoader::load_server_config(&config_path) {
+    let config = match ConfigLoader::load_server_config_strict(&config_path, strict_config) {
         Ok(config) => config,
         Err(e) => {
             error!("Failed to load config: {:?}", e);

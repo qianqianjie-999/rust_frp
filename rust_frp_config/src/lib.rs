@@ -1272,8 +1272,19 @@ impl ConfigLoader {
     pub fn load_server_config<P: AsRef<Path>>(
         path: P,
     ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
-        let mut config: ServerConfig = Self::load_config_from_file(path, ConfigKind::Server)?;
-        Self::process_includes(&mut config)?;
+        Self::load_server_config_strict(path, false)
+    }
+
+    /// 从文件加载服务端配置（严格模式可选，对齐原版 `--strict_config`）
+    ///
+    /// `strict = true` 时未知字段直接报错；`false` 时仅打印 WARN（缺省）。
+    pub fn load_server_config_strict<P: AsRef<Path>>(
+        path: P,
+        strict: bool,
+    ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+        let mut config: ServerConfig =
+            Self::load_config_from_file(path, ConfigKind::Server, strict)?;
+        Self::process_includes(&mut config, strict)?;
         Self::replace_environment_variables(&mut config)?;
         Self::normalize_server_config(&mut config);
         Self::validate_server_config(&config)?;
@@ -1288,8 +1299,18 @@ impl ConfigLoader {
     pub fn load_client_config<P: AsRef<Path>>(
         path: P,
     ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-        let mut config = Self::load_config_from_file(path, ConfigKind::Client)?;
-        Self::process_includes_client(&mut config)?;
+        Self::load_client_config_strict(path, false)
+    }
+
+    /// 从文件加载客户端配置（严格模式可选，对齐原版 `--strict_config`）
+    ///
+    /// `strict = true` 时未知字段直接报错；`false` 时仅打印 WARN（缺省）。
+    pub fn load_client_config_strict<P: AsRef<Path>>(
+        path: P,
+        strict: bool,
+    ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+        let mut config = Self::load_config_from_file(path, ConfigKind::Client, strict)?;
+        Self::process_includes_client(&mut config, strict)?;
         Self::replace_environment_variables_client(&mut config)?;
         Self::normalize_client_config(&mut config);
         Self::validate_client_config(&config)?;
@@ -1304,7 +1325,17 @@ impl ConfigLoader {
     pub fn validate_client_config_content(
         content: &str,
     ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
-        let mut config = Self::parse_config::<ClientConfig>(content, ConfigKind::Client)?;
+        Self::validate_client_config_content_strict(content, false)
+    }
+
+    /// 校验配置内容（严格模式可选，对齐原版 `--strict_config`）
+    ///
+    /// `strict = true` 时未知字段直接报错；`false` 时仅打印 WARN（缺省）。
+    pub fn validate_client_config_content_strict(
+        content: &str,
+        strict: bool,
+    ) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+        let mut config = Self::parse_config::<ClientConfig>(content, ConfigKind::Client, strict)?;
         Self::normalize_client_config(&mut config);
         Self::validate_client_config(&config)?;
         Ok(config)
@@ -1322,6 +1353,7 @@ impl ConfigLoader {
     fn load_config_from_file<P: AsRef<Path>, T: serde::de::DeserializeOwned + Default>(
         path: P,
         kind: ConfigKind,
+        strict: bool,
     ) -> Result<T, Box<dyn std::error::Error>> {
         let mut file = File::open(path)?;
         let mut content = String::new();
@@ -1329,7 +1361,7 @@ impl ConfigLoader {
         // 注意：绝不能把配置原文写进日志——配置文件里通常包含 auth token、
         // web_server 密码、OIDC client_secret 等敏感信息。
         log::debug!("Loaded config content ({} bytes)", content.len());
-        Self::parse_config(&content, kind)
+        Self::parse_config(&content, kind, strict)
     }
 
     /// 解析配置内容
@@ -1346,6 +1378,7 @@ impl ConfigLoader {
     fn parse_config<T: serde::de::DeserializeOwned + Default>(
         content: &str,
         kind: ConfigKind,
+        strict: bool,
     ) -> Result<T, Box<dyn std::error::Error>> {
         // 按 TOML -> YAML -> JSON 顺序盲试；全部失败时把三种格式各自的
         // 错误信息汇总后抛出，避免排障时只能看到一句无信息量的
@@ -1356,7 +1389,7 @@ impl ConfigLoader {
         match toml::from_str::<T>(content) {
             Ok(config) => {
                 log::info!("Successfully parsed config as TOML");
-                Self::warn_raw_fields::<toml::Value>(content, kind);
+                Self::check_raw_fields(content, kind, strict)?;
                 return Ok(config);
             }
             Err(e) => {
@@ -1369,7 +1402,7 @@ impl ConfigLoader {
         match serde_yaml::from_str::<T>(content) {
             Ok(config) => {
                 log::info!("Successfully parsed config as YAML");
-                Self::warn_raw_fields::<serde_yaml::Value>(content, kind);
+                Self::check_raw_fields(content, kind, strict)?;
                 return Ok(config);
             }
             Err(e) => {
@@ -1382,7 +1415,7 @@ impl ConfigLoader {
         match serde_json::from_str::<T>(content) {
             Ok(config) => {
                 log::info!("Successfully parsed config as JSON");
-                Self::warn_raw_fields::<serde_json::Value>(content, kind);
+                Self::check_raw_fields(content, kind, strict)?;
                 return Ok(config);
             }
             Err(e) => {
@@ -1400,20 +1433,41 @@ impl ConfigLoader {
         )))
     }
 
-    /// 把原始配置文本转成 JSON Value 后做未知字段告警。
+    /// 把原始配置文本转成 JSON Value 后处理未知字段。
+    ///
+    /// - 非严格模式（缺省）：打印 WARN（对齐 rust 的迁移友好策略）；
+    /// - 严格模式（原版 `--strict_config`，默认 true）：直接报错。
     ///
     /// 解析失败时静默跳过（主解析已报错，告警无意义）。
-    fn warn_raw_fields<R: serde::de::DeserializeOwned + serde::Serialize>(
+    /// 把原始配置文本转成 JSON Value 后处理未知字段。
+    ///
+    /// - 非严格模式（缺省）：打印 WARN（对齐 rust 的迁移友好策略）；
+    /// - 严格模式（原版 `--strict_config`，默认 true）：直接报错。
+    ///
+    /// 按与主解析相同的 TOML→YAML→JSON 顺序把原文转成 JSON Value，
+    /// 再做字段名核对；三种格式都转不动时静默跳过（主解析已报错）。
+    fn check_raw_fields(
         content: &str,
         kind: ConfigKind,
-    ) {
-        let Ok(raw) = serde_json::from_str::<R>(content) else {
-            return;
+        strict: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let json: serde_json::Value = if let Ok(v) = toml::from_str::<toml::Value>(content) {
+            serde_json::to_value(v)?
+        } else if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(content) {
+            serde_json::to_value(v)?
+        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+            v
+        } else {
+            return Ok(());
         };
-        let Ok(json) = serde_json::to_value(&raw) else {
-            return;
-        };
+        if strict {
+            if let Some(msg) = compat::strict_unknown_error(kind, &json) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg).into());
+            }
+            return Ok(());
+        }
         compat::warn_unknown_fields(kind, &json);
+        Ok(())
     }
 
     /// 归并代理级 transport 子表中的应用层加密开关。
@@ -1468,7 +1522,10 @@ impl ConfigLoader {
     ///
     /// - 标量值：后者覆盖前者
     /// - 数组（如 proxies）：扩展合并
-    fn process_includes(config: &mut ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn process_includes(
+        config: &mut ServerConfig,
+        strict: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let includes = config.includes.clone();
         if let Some(includes) = includes {
             for pattern in includes {
@@ -1477,7 +1534,7 @@ impl ConfigLoader {
                     match file {
                         Ok(path) => {
                             let include_config =
-                                Self::load_config_from_file(path, ConfigKind::Server)?;
+                                Self::load_config_from_file(path, ConfigKind::Server, strict)?;
                             Self::merge_server_config(config, &include_config);
                         }
                         Err(e) => {
@@ -1495,6 +1552,7 @@ impl ConfigLoader {
     /// 与 `process_includes` 类似，但针对客户端配置
     fn process_includes_client(
         config: &mut ClientConfig,
+        strict: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let includes = config.includes.clone();
         if let Some(includes) = includes {
@@ -1504,7 +1562,7 @@ impl ConfigLoader {
                     match file {
                         Ok(path) => {
                             let include_config =
-                                Self::load_config_from_file(path, ConfigKind::Client)?;
+                                Self::load_config_from_file(path, ConfigKind::Client, strict)?;
                             Self::merge_client_config(config, &include_config);
                         }
                         Err(e) => {
@@ -2074,7 +2132,8 @@ token = "test_token"
 single = 8080
 "#;
         let config: ServerConfig =
-            ConfigLoader::parse_config::<ServerConfig>(toml_str, ConfigKind::Server).unwrap();
+            ConfigLoader::parse_config::<ServerConfig>(toml_str, ConfigKind::Server, false)
+                .unwrap();
         assert_eq!(config.bind_addr, "0.0.0.0");
         assert_eq!(config.bind_port, 9300);
         assert_eq!(config.vhost_http_port, Some(8080));
@@ -2091,7 +2150,8 @@ single = 8080
             "allow_ports": [{"single": 8080}]
         }"#;
         let config: ServerConfig =
-            ConfigLoader::parse_config::<ServerConfig>(json_str, ConfigKind::Server).unwrap();
+            ConfigLoader::parse_config::<ServerConfig>(json_str, ConfigKind::Server, false)
+                .unwrap();
         assert_eq!(config.bind_port, 9300);
         assert_eq!(config.allow_ports.len(), 1);
     }
@@ -2123,7 +2183,8 @@ secret_key = "s3cret"
 useCompression = true
 "#;
         let config: ClientConfig =
-            ConfigLoader::parse_config::<ClientConfig>(toml_str, ConfigKind::Client).unwrap();
+            ConfigLoader::parse_config::<ClientConfig>(toml_str, ConfigKind::Client, false)
+                .unwrap();
 
         let proxy = &config.proxies[0];
         assert_eq!(proxy.r#type, "tcpmux");
@@ -2311,7 +2372,8 @@ local_port = 8080
 remote_port = 9302
 "#;
         let config: ClientConfig =
-            ConfigLoader::parse_config::<ClientConfig>(toml_str, ConfigKind::Client).unwrap();
+            ConfigLoader::parse_config::<ClientConfig>(toml_str, ConfigKind::Client, false)
+                .unwrap();
         assert_eq!(config.server_addr, "10.0.0.1");
         assert_eq!(config.server_port, 9300);
         assert_eq!(config.auth.token, Some("my_token".to_string()));
@@ -2397,6 +2459,18 @@ mod example_config_tests {
         let config = ConfigLoader::load_server_config(&path)
             .expect("frps.example.toml must stay parseable by ConfigLoader");
         assert!(config.bind_port > 0);
+    }
+
+    /// CLI 默认 `--strict_config`（对齐原版，默认 true）：
+    /// 示例配置在严格模式下也必须零未知字段，否则用户照 README 启动即失败。
+    #[test]
+    fn test_examples_pass_strict_mode() {
+        let frpc = Path::new(env!("CARGO_MANIFEST_DIR")).join("../frpc.example.toml");
+        ConfigLoader::load_client_config_strict(&frpc, true)
+            .expect("frpc.example.toml must pass strict (--strict_config default) mode");
+        let frps = Path::new(env!("CARGO_MANIFEST_DIR")).join("../frps.example.toml");
+        ConfigLoader::load_server_config_strict(&frps, true)
+            .expect("frps.example.toml must pass strict (--strict_config default) mode");
     }
 }
 
@@ -3033,6 +3107,54 @@ token_endpoint_url = "https://idp.example.com/token"
         let err = ConfigLoader::validate_client_config_content(&toml)
             .expect_err("v2 with oidc auth must be rejected");
         assert!(err.to_string().contains("requires auth.method"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod strict_config_tests {
+    use super::*;
+
+    const UNKNOWN_FIELD_TOML: &str = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+loginFailExit = true
+"#;
+
+    /// 非严格模式（缺省）：未知字段仅 WARN，解析成功
+    #[test]
+    fn non_strict_mode_warns_but_parses() {
+        let cfg = ConfigLoader::validate_client_config_content(UNKNOWN_FIELD_TOML)
+            .expect("non-strict mode must tolerate unknown fields");
+        assert_eq!(cfg.server_port, 7000);
+    }
+
+    /// 严格模式：未知字段直接报错（对齐原版 --strict_config 默认 true）
+    #[test]
+    fn strict_mode_rejects_unknown_fields() {
+        let err = ConfigLoader::validate_client_config_content_strict(UNKNOWN_FIELD_TOML, true)
+            .expect_err("strict mode must reject unknown fields");
+        assert!(err.to_string().contains("strict config mode"), "{err}");
+        assert!(err.to_string().contains("loginFailExit"), "{err}");
+    }
+
+    /// 已知 camelCase 别名字段在严格模式下不误报
+    #[test]
+    fn strict_mode_accepts_known_aliases() {
+        let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 80
+remotePort = 6000
+proxyProtocolVersion = "v2"
+"#;
+        let cfg = ConfigLoader::validate_client_config_content_strict(toml, true)
+            .expect("known camelCase aliases must pass strict mode");
+        assert_eq!(cfg.proxies[0].proxy_protocol_version.as_deref(), Some("v2"));
     }
 }
 

@@ -106,6 +106,8 @@ struct CliArgs {
     config_dir: Option<String>,
     version: bool,
     api_timeout: Duration,
+    /// 对齐原版 `--strict_config`（默认 true）：未知字段直接报错
+    strict_config: bool,
     opts: QuickOpts,
 }
 
@@ -191,6 +193,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut config_dir: Option<String> = None;
     let mut version = false;
     let mut api_timeout = DEFAULT_API_TIMEOUT;
+    let mut strict_config = true;
     let mut opts = QuickOpts::default();
 
     let mut i = start;
@@ -209,6 +212,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
             "-v" | "--version" => version = true,
             "--api-timeout" => {
                 api_timeout = parse_duration(&take!())?;
+            }
+            // 对齐原版 --strict_config（默认 true）：仅接受显式 bool 内联值
+            "--strict_config" | "--strict-config" => {
+                strict_config = match inline {
+                    Some(v) => matches!(v, "true" | "1" | "TRUE" | "True"),
+                    None => true,
+                };
             }
             "-s" | "--server_addr" | "--serverAddr" => {
                 opts.server_addr = Some(take!());
@@ -313,6 +323,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         config_dir,
         version,
         api_timeout,
+        strict_config,
         opts,
     })
 }
@@ -373,9 +384,9 @@ fn default_config_path(config_path: &Option<String>) -> String {
 }
 
 /// 加载配置；失败打印错误并以退出码 1 结束
-fn load_config_or_exit(config_path: &Option<String>) -> ClientConfig {
+fn load_config_or_exit(config_path: &Option<String>, strict: bool) -> ClientConfig {
     let path = default_config_path(config_path);
-    match ConfigLoader::load_client_config(&path) {
+    match ConfigLoader::load_client_config_strict(&path, strict) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("frpc: load config from {path} failed: {e}");
@@ -385,9 +396,9 @@ fn load_config_or_exit(config_path: &Option<String>) -> ClientConfig {
 }
 
 /// `frpc verify`：校验配置文件后按结果设置退出码
-fn run_verify(config_path: &Option<String>) {
+fn run_verify(config_path: &Option<String>, strict: bool) {
     let path = default_config_path(config_path);
-    match ConfigLoader::load_client_config(&path) {
+    match ConfigLoader::load_client_config_strict(&path, strict) {
         Ok(config) => {
             println!(
                 "syntax check pass: {} proxies, {} visitors",
@@ -403,8 +414,14 @@ fn run_verify(config_path: &Option<String>) {
 }
 
 /// `frpc reload` / `status` / `stop`：请求管理端口并打印响应
-async fn run_admin(config_path: &Option<String>, method: &str, path: &str, timeout: Duration) {
-    let config = load_config_or_exit(config_path);
+async fn run_admin(
+    config_path: &Option<String>,
+    method: &str,
+    path: &str,
+    timeout: Duration,
+    strict: bool,
+) {
+    let config = load_config_or_exit(config_path, strict);
     let ws = &config.web_server;
     if ws.port == 0 {
         eprintln!(
@@ -669,15 +686,36 @@ async fn main() {
     }
 
     match cli.command.clone() {
-        Command::Verify => run_verify(&cli.config_path),
+        Command::Verify => run_verify(&cli.config_path, cli.strict_config),
         Command::Reload => {
-            run_admin(&cli.config_path, "POST", "/reload", cli.api_timeout).await;
+            run_admin(
+                &cli.config_path,
+                "POST",
+                "/reload",
+                cli.api_timeout,
+                cli.strict_config,
+            )
+            .await;
         }
         Command::Status => {
-            run_admin(&cli.config_path, "GET", "/status", cli.api_timeout).await;
+            run_admin(
+                &cli.config_path,
+                "GET",
+                "/status",
+                cli.api_timeout,
+                cli.strict_config,
+            )
+            .await;
         }
         Command::Stop => {
-            run_admin(&cli.config_path, "POST", "/stop", cli.api_timeout).await;
+            run_admin(
+                &cli.config_path,
+                "POST",
+                "/stop",
+                cli.api_timeout,
+                cli.strict_config,
+            )
+            .await;
         }
         Command::NatholeDiscover => run_nathole_discover(&cli.opts).await,
         Command::Proxy(_) | Command::Visitor(_) => {
@@ -688,9 +726,9 @@ async fn main() {
         }
         Command::Run => {
             if let Some(dir) = cli.config_dir.clone() {
-                run_multiple_clients(&dir).await;
+                run_multiple_clients(&dir, cli.strict_config).await;
             } else {
-                run_client(&cli.config_path).await;
+                run_client(&cli.config_path, cli.strict_config).await;
             }
         }
     }
@@ -700,7 +738,7 @@ async fn main() {
 ///
 /// 对齐原版 `runMultipleClients`：目录下所有**文件**各起一个 frpc，
 /// 任一实例失败只打印错误，不影响其他实例。
-async fn run_multiple_clients(dir: &str) {
+async fn run_multiple_clients(dir: &str, strict: bool) {
     let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
         Ok(entries) => entries
             .filter_map(Result::ok)
@@ -730,7 +768,7 @@ async fn run_multiple_clients(dir: &str) {
         let task_path = path_str.clone();
         handles.push(tokio::spawn(async move {
             info!("[{}] starting frpc service", task_path);
-            let result = run_client_once(&Some(task_path.clone())).await;
+            let result = run_client_once(&Some(task_path.clone()), strict).await;
             if let Err(e) = result {
                 error!("[{}] frpc service stopped with error: {e}", task_path);
             } else {
@@ -744,8 +782,8 @@ async fn run_multiple_clients(dir: &str) {
 }
 
 /// 默认运行模式：启动客户端主循环（失败即退出进程）
-async fn run_client(config_path: &Option<String>) {
-    if let Err(e) = run_client_once(config_path).await {
+async fn run_client(config_path: &Option<String>, strict: bool) {
+    if let Err(e) = run_client_once(config_path, strict).await {
         error!("Client error: {e}");
         exit(1);
     }
@@ -753,8 +791,8 @@ async fn run_client(config_path: &Option<String>) {
 }
 
 /// 运行一个客户端实例，返回错误而不直接退出（供多实例模式复用）
-async fn run_client_once(config_path: &Option<String>) -> Result<(), String> {
-    let config = load_config_or_exit(config_path);
+async fn run_client_once(config_path: &Option<String>, strict: bool) -> Result<(), String> {
+    let config = load_config_or_exit(config_path, strict);
     let path = default_config_path(config_path);
 
     info!(

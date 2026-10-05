@@ -29,7 +29,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~322 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 能力覆盖率 | **≈ 88%（64/73）** ｜ 数据面 **100%（26/26）**、控制/运维面 **81%（38/47）** | 100%（基线） | 见第二节 |
+| 能力覆盖率 | **≈ 89%（65/73）** ｜ 数据面 **100%（26/26）**、控制/运维面 **83%（39/47）** | 100%（基线） | 见第二节 |
 | 配置字段兼容 | ⚠️ 双向 alias 兼容，但**约 25+ 个原版字段未支持**（解析成功 + WARN） | camelCase + 严格模式 | 原版配置**可加载**但部分字段不生效 |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify / reload / status / stop / nathole / 每类代理与访客 / `--config_dir` | reload / status / stop / verify / nathole / 每类代理 | rust 已基本对齐 |
@@ -57,7 +57,7 @@
 | 认证与安全 | **4/7** | 57% | `additionalScopes`、SSH 隧道网关、FeatureGate/`--allow-unsafe` |
 | frps 管理 API | **9/9** | 100% | —（v1 serverinfo/clients/按类型名称查询/流量 + v2 套件/分页/prune/users + DELETE offline 全部落地） |
 | frpc 管理 API | **3/5** | 60% | `/api/stop`、Store 源代理 CRUD |
-| CLI | **7/8** | 88% | `--strict_config`（rust 为 WARN 模式） |
+| CLI | **8/8** | 100% | —（`--strict_config` 已落地，且默认 true 与原版一致；关闭时为 WARN 模式） |
 | 配置体系 | **4/6** | 67% | Store 配置源、FeatureGates |
 | **合计** | **63/73** | **≈86%** | — |
 
@@ -230,7 +230,7 @@
 | 每类代理子命令（`frpc tcp/udp/http/…`） | ✅（9 类代理 + stcp/sudp/xtcp `visitor` 子命令） | ✅（8 类 + 访客子命令） |
 | `--config_dir`（多实例） | ✅（目录内每文件起一实例） | ✅ |
 | `--api-timeout`（管理 API 超时） | ✅（默认 30s，支持 `s`/`ms`/`m`） | ✅ |
-| `--strict_config`（未知字段即报错，默认 true） | ❌（rust 为 WARN 模式） | ✅ |
+| `--strict_config`（未知字段即报错，默认 true） | ✅ | ✅（rust 默认同样 true；`--strict_config=false` 退回 WARN 模式；示例配置有严格模式回归测试守护） |
 
 > 快速启动（`frpc <type>`）支持的旗标：`-s/-p/-t/-u`（服务器与认证）、
 > `-n/--name`、`--local_ip`、`--local_port`、`--remote_port`、`--custom_domains`、
@@ -306,7 +306,7 @@
 
 ### P2 — 生态 / 增强项（非必需）
 `virtual_net`（vnet）、`pkg/sdk` 进程内嵌库、SSH 隧道网关、
-Store 配置源 + StoreProxy CRUD、FeatureGates、`--strict_config`、端口保留（断线 24h）、
+Store 配置源 + StoreProxy CRUD、FeatureGates、端口保留（断线 24h）、
 `dnsServer`、`natHoleStunServer`、`loginFailExit`、`start`、
 `udpPacketSize`、`metadatas` 之外的元数据、服务端带宽限制模式、legacy INI 配置。
 
