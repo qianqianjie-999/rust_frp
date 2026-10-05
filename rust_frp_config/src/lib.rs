@@ -958,6 +958,13 @@ pub struct ProxyConfig {
     #[serde(alias = "proxyProtocol")]
     pub proxy_protocol: Option<bool>,
 
+    /// PROXY protocol 版本（可选，`"v1"` / `"v2"`，默认 `"v1"`）
+    ///
+    /// 与 `proxy_protocol` 配合使用；单独设置本字段（不设 `proxy_protocol`）
+    /// 也视为启用，与原版 `transport.proxyProtocolVersion` 语义一致。
+    #[serde(alias = "proxyProtocolVersion")]
+    pub proxy_protocol_version: Option<String>,
+
     /// 负载均衡分组名（可选，仅 TCP 代理）
     ///
     /// 同 group + 同 remote_port 的多个代理组成负载均衡组，
@@ -1935,6 +1942,19 @@ impl ConfigLoader {
                     limit,
                     &format!("proxies[name={}].bandwidth_limit", proxy.name),
                 )?;
+            }
+
+            // PROXY protocol 版本：仅允许 v1 / v2（对齐原版校验）
+            if let Some(version) = proxy.proxy_protocol_version.as_deref() {
+                if !["v1", "v2"].contains(&version) {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "proxies[name={}].proxy_protocol_version {:?} is not supported (expected \"v1\" or \"v2\")",
+                            proxy.name, version
+                        ),
+                    )));
+                }
             }
 
             // tcpmux：仅支持 httpconnect 复用器，且必须配置域名（服务器按域名路由）
@@ -3013,5 +3033,55 @@ token_endpoint_url = "https://idp.example.com/token"
         let err = ConfigLoader::validate_client_config_content(&toml)
             .expect_err("v2 with oidc auth must be rejected");
         assert!(err.to_string().contains("requires auth.method"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod proxy_protocol_version_tests {
+    use super::*;
+
+    fn client_toml(proxy_body: &str) -> String {
+        format!(
+            r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[[proxies]]
+name = "web"
+type = "tcp"
+local_port = 80
+remote_port = 6000
+{proxy_body}
+"#
+        )
+    }
+
+    /// 原版 camelCase 别名 + 合法 v2 值
+    #[test]
+    fn camel_case_alias_v2_accepted() {
+        let toml = client_toml("proxyProtocol = true\nproxyProtocolVersion = \"v2\"");
+        let cfg = ConfigLoader::validate_client_config_content(&toml)
+            .expect("proxyProtocolVersion v2 must validate");
+        let proxy = cfg.proxies.first().expect("proxy present");
+        assert_eq!(proxy.proxy_protocol_version.as_deref(), Some("v2"));
+    }
+
+    /// 仅设置版本（不设 proxy_protocol 布尔）也可解析（原版语义：版本即开关）
+    #[test]
+    fn version_alone_accepted() {
+        let toml = client_toml("proxyProtocolVersion = \"v1\"");
+        let cfg = ConfigLoader::validate_client_config_content(&toml)
+            .expect("version alone must validate");
+        let proxy = cfg.proxies.first().expect("proxy present");
+        assert_eq!(proxy.proxy_protocol_version.as_deref(), Some("v1"));
+    }
+
+    /// 未知版本被拒绝（对齐原版 validation）
+    #[test]
+    fn unknown_version_rejected() {
+        let toml = client_toml("proxyProtocolVersion = \"v3\"");
+        let err = ConfigLoader::validate_client_config_content(&toml)
+            .expect_err("unknown proxy protocol version must be rejected");
+        assert!(err.to_string().contains("proxy_protocol_version"), "{err}");
     }
 }

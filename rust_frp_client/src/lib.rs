@@ -1462,18 +1462,27 @@ async fn establish_work_connection(
     log::info!("Connected to local service: {}", local_addr);
 
     // 如果启用了 PROXY protocol，先写入 header 再桥接
-    let proxy_protocol_enabled = proxy_config.proxy_protocol.unwrap_or(false);
+    // 版本语义对齐原版：显式 proxyProtocolVersion 优先（v1/v2），
+    // 未设置版本时默认 v1；仅设置版本不设 proxy_protocol 也视为启用。
+    let pp_version = proxy_config.proxy_protocol_version.as_deref();
+    let proxy_protocol_enabled =
+        proxy_config.proxy_protocol.unwrap_or(false) || pp_version.is_some();
     if proxy_protocol_enabled && src_port > 0 {
-        let header = format!(
-            "PROXY TCP4 {} {} {} {}\r\n",
-            src_addr, proxy_config.local_ip, src_port, proxy_config.local_port,
+        let version = pp_version.unwrap_or("v1");
+        let header = rust_frp_net::proxy_protocol::build_proxy_protocol_header(
+            &src_addr,
+            src_port,
+            &proxy_config.local_ip,
+            proxy_config.local_port,
+            version,
         );
         log::info!(
-            "Writing PROXY protocol header for {}: {}",
+            "Writing PROXY protocol {} header for {}: {} bytes",
+            version,
             proxy_name,
-            header.trim()
+            header.len()
         );
-        tokio::io::AsyncWriteExt::write_all(&mut local_conn, header.as_bytes()).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut local_conn, &header).await?;
     }
 
     // 双向桥接工作连接和本地连接
