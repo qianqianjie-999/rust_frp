@@ -1159,6 +1159,7 @@ mod tests {
             oidc: None,
             token_source: None,
             additional_scopes: None,
+            ..Default::default()
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_ok());
@@ -1172,6 +1173,7 @@ mod tests {
             oidc: None,
             token_source: None,
             additional_scopes: None,
+            ..Default::default()
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_err());
@@ -1185,6 +1187,7 @@ mod tests {
             oidc: None,
             token_source: None,
             additional_scopes: None,
+            ..Default::default()
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_err());
@@ -1198,6 +1201,7 @@ mod tests {
             oidc: None,
             token_source: None,
             additional_scopes: None,
+            ..Default::default()
         };
         let manager = AuthManager::new(&config).unwrap();
         assert!(manager.encryption_key().is_some());
@@ -1212,6 +1216,7 @@ mod tests {
             oidc: None,
             token_source: None,
             additional_scopes: None,
+            ..Default::default()
         };
         let manager = AuthManager::new(&config).unwrap();
         assert!(manager.verify_login("user", "my_token").await.is_ok());
@@ -1226,6 +1231,7 @@ mod tests {
             oidc: None,
             token_source: None,
             additional_scopes: None,
+            ..Default::default()
         };
         let manager = AuthManager::new(&config).unwrap();
         let key1 = manager
@@ -1681,6 +1687,7 @@ ifGHE5azp2Lav/Kni6rRwBQ=
             oidc: Some(oidc_cfg("https://issuer.example.com", "frp-server")),
             token_source: None,
             additional_scopes: None,
+            ..Default::default()
         };
         assert!(AuthManager::new(&ok).is_ok());
 
@@ -1690,6 +1697,7 @@ ifGHE5azp2Lav/Kni6rRwBQ=
             oidc: None,
             token_source: None,
             additional_scopes: None,
+            ..Default::default()
         };
         assert!(AuthManager::new(&missing).is_err());
     }

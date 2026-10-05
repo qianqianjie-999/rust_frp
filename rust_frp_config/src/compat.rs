@@ -107,6 +107,14 @@ mod fields {
         "token_source",
         "additionalScopes",
         "additional_scopes",
+        "clientIdPolicy",
+        "client_id_policy",
+        "loginMaxFailures",
+        "login_max_failures",
+        "loginLockoutSecs",
+        "login_lockout_secs",
+        "kickRequireSameCert",
+        "kick_require_same_cert",
         "oidc",
     ];
 
@@ -162,6 +170,10 @@ mod fields {
         "trustedCaFile",
         "skip_verify",
         "skipVerify",
+        "client_ca_file",
+        "clientCaFile",
+        "require_client_cert",
+        "requireClientCert",
         "force",
     ];
 

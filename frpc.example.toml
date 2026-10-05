@@ -12,6 +12,12 @@
 server_addr = "127.0.0.1"
 server_port = 9300
 
+# --- 客户端身份（可选） ---
+# 多台主机部署时**建议显式配置互不相同**的 client_id：服务端会把"同 client_id 的新登录"
+# 判为同一客户端重连，踢掉旧会话并等其释放端口。未配置时客户端会随机生成一个，并在进程
+# 生命周期（含配置热重载）内保持不变。
+# client_id = "cli-<主机>-<用途>"
+
 # --- 认证配置（需与 frps 一致） ---
 [auth]
 method = "token"
@@ -105,6 +111,13 @@ enable = true
 #     此时 trusted_ca_file 无法固定它，只能让服务端换证书或改用下面的 skip_verify。
 # ⚠️ 仅限自签名测试环境：显式跳过证书验证（只加密、不认证，打印 WARN）。
 # skip_verify = true
+#
+# ── 可选：mTLS（客户端证书，出示给服务端校验）──
+# 在客户端，cert_file/key_file 表示"客户端证书"，需与服务端 client_ca_file 配套。
+# 必须与 trusted_ca_file 同时配置（两个方向都要认证）；与 skip_verify 互斥，
+# 同时出现会被配置校验直接拒绝（给出示证书却不校验服务端 = 把身份递给冒充者）。
+# cert_file = "/etc/frp/certs/client.crt"
+# key_file  = "/etc/frp/certs/client.key"
 
 # --- 代理定义 ---
 

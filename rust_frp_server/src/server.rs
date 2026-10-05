@@ -100,6 +100,46 @@ fn quic_options(config: &ServerConfig) -> QuicOptions {
     )
 }
 
+/// 由 `transport.tls` 构造服务端 TLS 配置（控制面与工作连接共用同一份逻辑）
+///
+/// - 配了 `cert_file`/`key_file` → 用自定义证书；否则用运行时自签证书；
+/// - 配了 `client_ca_file` → 启用 **mTLS**（校验客户端证书链），`require_client_cert`
+///   决定"未出示证书是否放行"（`false` = 灰度期放行）。
+///
+/// 放在这里统一两份重复构建逻辑（构造期与 TCP 监听循环各一处），避免只改其中一处
+/// 导致 QUIC/TCP 行为不一致。
+/// 取出 TLS 对端（客户端）证书的 SHA-256 指纹（薄封装，便于阅读与替换实现）
+fn peer_cert_fingerprint_of<S>(stream: &tokio_rustls::server::TlsStream<S>) -> Option<String> {
+    rust_frp_net::peer_cert_fingerprint(stream)
+}
+
+/// 日志用短指纹（前 16 个 hex 字符）：够区分不同证书，又不至于刷屏
+fn short_fp(fp: &str) -> &str {
+    &fp[..fp.len().min(16)]
+}
+
+fn build_server_tls_config(
+    tls: &rust_frp_config::TlsConfig,
+) -> Result<TlsConfig, Box<dyn std::error::Error>> {
+    let client_ca = tls.client_ca_file.as_deref();
+    let require = tls.require_client_cert;
+
+    if client_ca.is_some() && tls.cert_file.is_none() {
+        log::warn!(
+            "transport.tls.client_ca_file is configured without cert_file/key_file: mTLS will \
+             verify client certificates, but the server keeps its runtime self-signed certificate \
+             (clients cannot pin the server identity)"
+        );
+    }
+
+    let net_tls = if let (Some(cert_file), Some(key_file)) = (&tls.cert_file, &tls.key_file) {
+        TlsConfig::new_server(cert_file, key_file, client_ca, require)?
+    } else {
+        TlsConfig::new_server_with_runtime_cert(client_ca, require)?
+    };
+    Ok(net_tls)
+}
+
 /// 服务器服务
 pub struct Server {
     config: ServerConfig,
@@ -162,7 +202,31 @@ impl Server {
         config_path: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let auth_manager = Arc::new(AuthManager::new(&config.auth).map_err(|e| e.to_string())?);
-        let control_manager = Arc::new(ControlManager::new());
+        // P1/B4 登录节流 + P1/B1 client_id 策略 + P4 接管指纹判据：
+        // 统一由 ControlManager 承载（它已被逐连接共享，无需再穿透调用栈）
+        let login_throttle = crate::login_throttle::LoginThrottle::new(
+            config.auth.login_max_failures,
+            config.auth.login_lockout_secs,
+        );
+        if let Some(t) = &login_throttle {
+            log::info!(
+                "control login throttle enabled: lock after {} consecutive failures for {}s",
+                t.max_failures(),
+                t.lockout().as_secs()
+            );
+        } else {
+            log::info!("control login throttle disabled (auth.login_max_failures = 0)");
+        }
+        log::info!(
+            "client_id policy = {:?}; kick requires matching client certificate = {}",
+            config.auth.client_id_policy,
+            config.auth.kick_require_same_cert
+        );
+        let control_manager = Arc::new(ControlManager::with_security(
+            login_throttle,
+            config.auth.client_id_policy,
+            config.auth.kick_require_same_cert,
+        ));
         let http_vhost_router = Arc::new(HttpVhostRouter::new());
         let work_conn_manager = Arc::new(ServerWorkConnManager::new(
             config.transport.pool_count as usize,
@@ -189,19 +253,9 @@ impl Server {
         // 注册进程级单例，供 Control::run 等深层调用点使用
         set_global_metrics(metrics.clone());
 
-        let tls_config = if let Some(tls) = &config.transport.tls {
-            if tls.enable {
-                if let (Some(cert_file), Some(key_file)) = (&tls.cert_file, &tls.key_file) {
-                    Some(TlsConfig::new_server(cert_file, key_file)?)
-                } else {
-                    // 使用内置自签名证书
-                    Some(TlsConfig::new_server_with_runtime_cert()?)
-                }
-            } else {
-                None
-            }
-        } else {
-            None
+        let tls_config = match &config.transport.tls {
+            Some(tls) if tls.enable => Some(build_server_tls_config(tls)?),
+            _ => None,
         };
 
         let conn_manager = ConnManager::new(tls_config, config.transport.pool_count as usize);
@@ -445,6 +499,8 @@ impl Server {
             let quic_cfg = rust_frp_net::build_quic_server_config(
                 tls.and_then(|t| t.cert_file.as_deref()),
                 tls.and_then(|t| t.key_file.as_deref()),
+                tls.and_then(|t| t.client_ca_file.as_deref()),
+                tls.map(|t| t.require_client_cert).unwrap_or(false),
                 &quic_options(&self.config),
             )?;
             let listener = QuicListener::bind(addr, quic_cfg)?;
@@ -1316,20 +1372,9 @@ impl Server {
         // 监听器 take 出来：优雅关闭时随局部变量 drop 而关闭套接字，
         // 立即停止接收新连接（不再依赖进程退出强制回收）
         if let Some(listener) = self.tcp_listener.take() {
-            let tls_config = if let Some(ref tls) = self.config.transport.tls {
-                if tls.enable {
-                    if let (Some(ref cert_file), Some(ref key_file)) =
-                        (&tls.cert_file, &tls.key_file)
-                    {
-                        Some(TlsConfig::new_server(cert_file, key_file)?)
-                    } else {
-                        Some(TlsConfig::new_server_with_runtime_cert()?)
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
+            let tls_config = match self.config.transport.tls.as_ref() {
+                Some(tls) if tls.enable => Some(build_server_tls_config(tls)?),
+                _ => None,
             };
 
             let mut reload_rx = self.reload_rx.take();
@@ -1474,6 +1519,7 @@ impl Server {
                 rust_frp_net::accept_websocket_stream(conn, peer.unwrap_or_else(placeholder_addr))
                     .await?;
             let control = Self::negotiate_control_conn(Box::new(ws_conn), &auth_manager).await?;
+            // 明文（非 wss）控制连接：无 TLS ⇒ 无客户端证书指纹
             Self::spawn_control(
                 control,
                 ServerManagers {
@@ -1488,6 +1534,8 @@ impl Server {
                     plugin_manager,
                 },
                 tls_config.is_some(),
+                None,
+                // 明文 WebSocket：未走 TLS 握手 ⇒ 无客户端证书指纹
                 None,
             );
             return Ok(());
@@ -1518,6 +1566,8 @@ impl Server {
         // 工作连接 TLS 协商标志：与控制连接共用同一 TLS 配置
         let work_conn_tls = tls_config.is_some();
         let peer = conn.peer_addr().ok().unwrap_or_else(placeholder_addr);
+        // P4：mTLS 客户端证书指纹（无 TLS / 客户端未出示证书时保持 None）
+        let mut peer_cert_fingerprint: Option<String> = None;
         let conn: AnyConn = if let Some(tls_config) = tls_config {
             // 处理 TLS 连接
             let tls_stream =
@@ -1534,6 +1584,13 @@ impl Server {
                         return Err("TLS handshake timeout".into());
                     }
                 };
+            // P4：握手已完成，此处的对端证书链**已经过 client_ca_file 校验**
+            // （若服务端启用了 mTLS）。取其指纹用于会话接管判据。
+            peer_cert_fingerprint = peer_cert_fingerprint_of(&tls_stream);
+            match &peer_cert_fingerprint {
+                Some(fp) => log::info!("client certificate fingerprint: {}", short_fp(fp)),
+                None => log::debug!("no client certificate presented on control connection"),
+            }
             // TLS 之上仍可能是 wss 的 WebSocket 升级：预读前 4 字节判定，
             // 非升级请求则原样回放给普通控制连接解析。
             let mut tls_stream = tls_stream;
@@ -1574,6 +1631,7 @@ impl Server {
             },
             work_conn_tls,
             None,
+            peer_cert_fingerprint,
         );
 
         Ok(())
@@ -1631,6 +1689,7 @@ impl Server {
         managers: ServerManagers,
         work_conn_tls: bool,
         pre_read_login: Option<rust_frp_core::LoginMsg>,
+        peer_cert_fingerprint: Option<String>,
     ) -> tokio::task::JoinHandle<()> {
         let ServerManagers {
             control_manager,
@@ -1670,6 +1729,7 @@ impl Server {
             work_conn_tls,
             pre_read_login,
             plugin_manager,
+            peer_cert_fingerprint,
         });
 
         // 克隆 msg_tx 用于注册
@@ -1729,6 +1789,8 @@ impl Server {
         // 保持与 LoginResp 协商一致性）
         let work_conn_tls = tls_config.is_some();
 
+        // P4：mTLS 客户端证书指纹（无 TLS / 客户端未出示证书时保持 None）
+        let mut peer_cert_fingerprint: Option<String> = None;
         let io: AnyConn = if let Some(tls_config) = tls_config {
             let tls_stream = match tls_config.accept(conn).await {
                 Ok(s) => s,
@@ -1738,6 +1800,11 @@ impl Server {
                     return Err(format!("TLS accept failed: {}", e).into());
                 }
             };
+            peer_cert_fingerprint = peer_cert_fingerprint_of(&tls_stream);
+            match &peer_cert_fingerprint {
+                Some(fp) => log::info!("client certificate fingerprint (mux): {}", short_fp(fp)),
+                None => log::debug!("no client certificate presented on mux control connection"),
+            }
             Box::new(tls_stream)
         } else {
             Box::new(conn)
@@ -1769,6 +1836,7 @@ impl Server {
             },
             work_conn_tls,
             None,
+            peer_cert_fingerprint,
         );
 
         // 后续流 = 工作连接，逐条分发
@@ -1842,6 +1910,9 @@ impl Server {
             work_conn_tls,
             pre_read_login: None,
             plugin_manager,
+            // KCP 是 UDP 明文传输，没有 TLS 握手 ⇒ 无客户端证书指纹。
+            // 该路径下会话接管仍按 client_id 判定（文档已标注该传输不受 mTLS 保护）。
+            peer_cert_fingerprint: None,
         });
 
         let msg_tx_clone = control.msg_tx.clone();
@@ -1922,7 +1993,11 @@ impl Server {
         match msg {
             Message::Login(login) => {
                 // QUIC 自带 TLS 1.3：工作连接复用同连接的新流，无需再协商 work_conn_tls
-                Self::spawn_control(conn, managers, false, Some(login));
+                // P4 已知缺口：此处只拿到单条流（`QuicConn`），拿不到连接对象 ⇒ 无法读取
+                // 对端证书指纹，故传 None，该路径下会话接管仍按 client_id 判定。
+                // 线上 `transport.protocol = "tcp"`，未使用 QUIC；若将来启用 QUIC + mTLS，
+                // 需把 `quinn::Connection` 一并传进来补齐（见设计稿 §5 注）。
+                Self::spawn_control(conn, managers, false, Some(login), None);
                 Ok(())
             }
             m @ Message::NewWorkConn(_) => {

@@ -119,6 +119,7 @@
 mod api;
 mod control;
 mod error;
+mod login_throttle;
 mod metrics;
 mod proxy_manager;
 mod secrets;

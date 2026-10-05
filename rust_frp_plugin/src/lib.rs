@@ -1033,8 +1033,8 @@ impl TlsOffloadPlugin {
 
         // 证书：显式配置 crt_path/key_path 优先，否则内置自签名证书
         let tls_config = match (&config.crt_path, &config.key_path) {
-            (Some(crt), Some(key)) => rust_frp_net::TlsConfig::new_server(crt, key)?,
-            (None, None) => rust_frp_net::TlsConfig::new_server_with_runtime_cert()?,
+            (Some(crt), Some(key)) => rust_frp_net::TlsConfig::new_server(crt, key, None, false)?,
+            (None, None) => rust_frp_net::TlsConfig::new_server_with_runtime_cert(None, false)?,
             _ => {
                 return Err(invalid_input(
                     "crt_path and key_path must be configured together",
@@ -1081,8 +1081,8 @@ impl TlsBridgePlugin {
             .ok_or_else(|| invalid_input("local_addr is required for https2https plugin"))?;
 
         let server_tls = match (&config.crt_path, &config.key_path) {
-            (Some(crt), Some(key)) => rust_frp_net::TlsConfig::new_server(crt, key)?,
-            (None, None) => rust_frp_net::TlsConfig::new_server_with_runtime_cert()?,
+            (Some(crt), Some(key)) => rust_frp_net::TlsConfig::new_server(crt, key, None, false)?,
+            (None, None) => rust_frp_net::TlsConfig::new_server_with_runtime_cert(None, false)?,
             _ => {
                 return Err(invalid_input(
                     "crt_path and key_path must be configured together",

@@ -622,9 +622,28 @@ impl VisitorManager for ClientVisitorManager {
     }
 }
 
+/// 从配置提取客户端证书（mTLS：出示给服务端校验）
+///
+/// 只配一半（有证书无私钥）无法出示证书，握手必失败 ⇒ 直接报错。配置层已拦，这里
+/// 再兜一层，防止绕过配置校验的调用方（如管理端 `PUT /config`）。
+fn client_cert_of(
+    tls: &rust_frp_config::TlsConfig,
+) -> Result<Option<(&str, &str)>, Box<dyn std::error::Error>> {
+    match (&tls.cert_file, &tls.key_file) {
+        (Some(c), Some(k)) => Ok(Some((c.as_str(), k.as_str()))),
+        (None, None) => Ok(None),
+        _ => Err(
+            "transport.tls.cert_file and transport.tls.key_file must be configured together \
+             (they carry the client certificate presented for mTLS)"
+                .into(),
+        ),
+    }
+}
+
 /// 构建客户端 TLS 配置（供控制连接与工作连接复用）
 ///
-/// - 配置了 `trusted_ca_file` → 用该 CA 验证服务器证书（推荐）
+/// - 配置了 `trusted_ca_file` → 用该 CA 验证服务器证书（推荐）；
+///   若同时配了 `cert_file`/`key_file` ⇒ **mTLS**：双向认证
 /// - `trusted_ca_file` 未配置且 `skip_verify = true` → 跳过证书验证（仅加密，不认证）
 /// - `trusted_ca_file` 未配置且 `skip_verify = false`（默认）→ **报错拒绝启动**（fail-closed），
 ///   避免在用户不知情时静默退化为"只加密不认证"
@@ -633,6 +652,12 @@ impl VisitorManager for ClientVisitorManager {
 ///
 /// `skip_verify = true` 意味着任何中间人都可以冒充服务端，仅应在测试环境使用。
 /// 生产环境请务必配置 `transport.tls.trusted_ca_file`，并在服务端换用自建证书。
+///
+/// # ⚠️ mTLS 的两个方向
+///
+/// 两个方向互不相同、都不可省：`trusted_ca_file` 管"我验服务端"，`cert_file`/`key_file`
+/// 管"服务端验我"。**出示证书却不校验服务端**等于把身份递给可能冒充服务端的中间人，
+/// 因此本函数（及配置校验）拒绝 `cert_file` + `skip_verify = true` 的组合。
 ///
 /// # ⚠️ `trusted_ca_file` 的生效前提
 ///
@@ -651,10 +676,26 @@ fn build_client_tls_config(
     if !tls.enable {
         return Ok(None);
     }
+    let client_cert = client_cert_of(tls)?;
+
     if let Some(ref ca_file) = tls.trusted_ca_file {
-        return Ok(Some(TlsConfig::new_client_with_ca_file(ca_file)?));
+        return Ok(Some(match client_cert {
+            Some((cert_file, key_file)) => {
+                TlsConfig::new_client_with_ca_and_cert(ca_file, cert_file, key_file)?
+            }
+            None => TlsConfig::new_client_with_ca_file(ca_file)?,
+        }));
     }
     if tls.skip_verify {
+        if client_cert.is_some() {
+            return Err(
+                "transport.tls.skip_verify = true cannot be combined with a client certificate \
+                 (cert_file/key_file): skipping server verification would let an impostor server \
+                 collect the client certificate. Remove skip_verify and set trusted_ca_file \
+                 (fail-closed)."
+                    .into(),
+            );
+        }
         log::warn!(
             "TLS enabled with transport.tls.skip_verify = true: the server certificate \
              will NOT be verified. This provides encryption only, NOT authentication."
@@ -758,14 +799,20 @@ impl Connector {
         let tls = self.config.transport.tls.as_ref();
         let ca = tls.and_then(|t| t.trusted_ca_file.as_deref());
         let insecure = tls.map(|t| t.skip_verify).unwrap_or(false);
+        // mTLS：出示客户端证书（配置层已保证 cert/key 成对、且不与 skip_verify 同现）
+        let client_cert = tls.and_then(|t| match (&t.cert_file, &t.key_file) {
+            (Some(c), Some(k)) => Some((c.as_str(), k.as_str())),
+            _ => None,
+        });
         let opts = quic_options(&self.config);
-        let cfg = rust_frp_net::build_quic_client_config(ca, insecure, &opts).map_err(|e| {
-            format!(
-                "QUIC always uses TLS 1.3 and has no plaintext mode: {e}. \
+        let cfg = rust_frp_net::build_quic_client_config(ca, insecure, client_cert, &opts)
+            .map_err(|e| {
+                format!(
+                    "QUIC always uses TLS 1.3 and has no plaintext mode: {e}. \
                  Set transport.tls.trusted_ca_file to pin the server CA, or \
                  transport.tls.skip_verify = true to accept encryption without authentication"
-            )
-        })?;
+                )
+            })?;
         let session =
             rust_frp_net::QuicSession::connect(addr, &self.config.server_addr, cfg).await?;
         Ok(Arc::new(session))
@@ -2771,18 +2818,36 @@ pub struct Client {
     health_check_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// 确保配置中的 `client_id` 是稳定的非空值：未配置时按 `fallback` 补齐，
+/// 无 `fallback` 再随机生成。
+///
+/// 必须在**首次构造**与**配置热重载**两处都调用：热重载用文件内容整体替换
+/// `ClientConfig`，若不重新补齐，`client_id` 会退回 `None`，登录时经
+/// `unwrap_or(hostname)` 退化为主机名 —— 两台主机名相同的 frpc 会被服务端
+/// `kick_same_client` 判定为同一客户端而无限互踢（2026-10-05 线上事故，
+/// 全线端口掉线约 3 分钟）。
+///
+/// `fallback` 供热重载使用，必须是**当前生效的 client_id**：既不能退化为
+/// `None`（→ 主机名），也不能重新随机（→ 服务端视作新客户端，与旧会话抢占
+/// 同名代理）。
+fn ensure_client_id(config: &mut ClientConfig, fallback: Option<&str>) {
+    if config.client_id.is_none() {
+        config.client_id = Some(match fallback {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => rand_id(16),
+        });
+    }
+}
+
 impl Client {
     pub fn new(
         mut config: ClientConfig,
         config_path: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // client_id 是客户端进程的稳定标识（断线重连时复用，服务端据此
-        // 把同 client_id 的新登录判定为重连并踢掉旧会话）。默认必须随机
-        // 生成而非用主机名：同一台机器运行多个 frpc 时主机名相同，会被
-        // 服务端误判为同一客户端重连而互相踢下线
-        if config.client_id.is_none() {
-            config.client_id = Some(rand_id(16));
-        }
+        // client_id 是客户端进程的稳定标识（断线重连时复用，服务端据此把同
+        // client_id 的新登录判定为重连并踢掉旧会话）。未配置时随机生成而非用
+        // 主机名：同名主机上的多个 frpc 会被误判为同一客户端重连而互相踢下线
+        ensure_client_id(&mut config, None);
 
         // 动态令牌来源（auth.tokenSource）：必须先于 AuthManager 构造解析，
         // 否则 method = "token" 且 token 为空会被判为缺少令牌而拒绝启动。
@@ -3372,6 +3437,11 @@ impl Client {
             let mut new_config = rust_frp_config::ConfigLoader::load_client_config(config_path)?;
             // tokenSource 需在替换配置前重新解析（配置里 token 通常为空）
             apply_token_source(&mut new_config).map_err(|e| e.to_string())?;
+            // 热重载不得重置 client_id：文件未写时沿用当前生效值 —— 否则会退回
+            // None 并在登录时退化为主机名（多机同名 → 服务端误判重连 → 互踢）；
+            // 也不能重新随机，否则服务端会视作新客户端并与旧会话抢占同名代理。
+            let stable_client_id = self.config.client_id.clone();
+            ensure_client_id(&mut new_config, stable_client_id.as_deref());
             self.config = Arc::new(new_config);
 
             // 重新启动所有代理
@@ -4207,5 +4277,75 @@ mod token_source_tests {
         cfg.auth.token = Some("static".to_string());
         apply_token_source(&mut cfg).unwrap();
         assert_eq!(cfg.auth.token.as_deref(), Some("static"));
+    }
+}
+
+#[cfg(test)]
+mod client_id_tests {
+    use super::*;
+    use rust_frp_config::ClientConfig;
+
+    fn cfg_without_client_id() -> ClientConfig {
+        ClientConfig {
+            client_id: None,
+            ..ClientConfig::default()
+        }
+    }
+
+    /// 未配置 client_id → 随机生成 16 位（不是空、不是主机名）
+    #[test]
+    fn ensure_client_id_generates_when_absent() {
+        let mut cfg = cfg_without_client_id();
+        ensure_client_id(&mut cfg, None);
+        let id = cfg.client_id.expect("client_id 必须被补齐");
+        assert_eq!(id.len(), 16, "应为 rand_id(16) 生成的 16 位随机串");
+    }
+
+    /// 已显式配置 → 不被 fallback 覆盖
+    #[test]
+    fn ensure_client_id_keeps_explicit_value() {
+        let mut cfg = ClientConfig {
+            client_id: Some("explicit-id".to_string()),
+            ..ClientConfig::default()
+        };
+        ensure_client_id(&mut cfg, Some("inherited-id"));
+        assert_eq!(cfg.client_id.as_deref(), Some("explicit-id"));
+    }
+
+    /// 回归（2026-10-05 事故）：热重载读到的配置未写 client_id 时必须沿用当前
+    /// 生效值 —— 既不能退回 None（登录退化成主机名 → 同名主机互踢），也不能
+    /// 重新随机（服务端视作新客户端，与旧会话抢占同名代理）。
+    #[test]
+    fn ensure_client_id_inherits_current_value_on_reload() {
+        let current = "cli32-d2502b0e2ea0f26e".to_string();
+
+        let mut reloaded = cfg_without_client_id();
+        ensure_client_id(&mut reloaded, Some(&current));
+        assert_eq!(
+            reloaded.client_id.as_deref(),
+            Some(current.as_str()),
+            "热重载后必须沿用当前 client_id"
+        );
+
+        // 幂等：连续多次热重载始终是同一个 id
+        let mut reloaded2 = cfg_without_client_id();
+        ensure_client_id(&mut reloaded2, reloaded.client_id.as_deref());
+        assert_eq!(reloaded2.client_id, reloaded.client_id);
+    }
+
+    /// fallback 为空串（异常值）不得写回空串，应重新随机
+    #[test]
+    fn ensure_client_id_ignores_empty_fallback() {
+        let mut cfg = cfg_without_client_id();
+        ensure_client_id(&mut cfg, Some(""));
+        assert_eq!(cfg.client_id.as_deref().map(str::len), Some(16));
+    }
+
+    /// 启动与热重载两条路径都不得把 client_id 留空，杜绝退化为主机名
+    #[test]
+    fn ensure_client_id_never_leaves_empty() {
+        let mut startup = cfg_without_client_id();
+        ensure_client_id(&mut startup, None);
+        assert!(startup.client_id.as_deref().is_some_and(|s| !s.is_empty()));
     }
 }

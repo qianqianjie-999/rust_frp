@@ -94,12 +94,40 @@ pool_count = 10
 # cert_file = "/etc/frp/certs/server.crt"
 # key_file = "/etc/frp/certs/server.key"
 # tls_only = true
+#
+# ── 可选：mTLS（客户端证书双向认证）──
+# 配置 client_ca_file 后，服务端会在握手阶段校验客户端证书链。与 token 是"叠加"
+# 关系：mTLS 决定"谁连得上"，token 决定"连上后能做什么"。
+# client_ca_file = "/etc/frp/certs/ca.crt"   # 用于校验客户端证书的 CA
+# require_client_cert = false                # false（默认）：未出示也放行（灰度期）
+#                                            # true：必须出示且校验通过，否则握手失败
+# 灰度顺序：服务端先配 client_ca_file（require = false）→ 下发客户端证书 → 再改 true。
+# ⚠️ 没有"跳过链校验"的开关：一旦配置即严格验链，require = false 只放宽"是否允许不出示"。
 
 # --- 认证配置（二选一） ---
 # 方式一：Token（推荐）
 [auth]
 method = "token"
 token = "CHANGE_ME_RANDOM_LONG_TOKEN"
+
+# ── 控制口加固（2026-10-05 安全加固）─────────────────────────────
+# client_id 是服务端判定"同一客户端重连（应踢掉旧会话）"的依据。
+# 若客户端未配 client_id 而退化成**空**或**等于主机名**，两台同名主机会被
+# 判为同一客户端而无限互踢（2026-10-05 线上事故：1735 次互踢、端口掉线 3 分钟）。
+#   "warn"   —— 只记 WARN 放行（默认，兼容旧客户端）
+#   "reject" —— 硬拒登录，让问题在客户端配置阶段就暴露
+# 注意：**客户端必须先配好唯一 client_id 再切 reject**，否则会被拒在门外。
+client_id_policy = "warn"
+
+# 登录失败节流：同一 client_id 连续失败 N 次后锁定 M 秒（成功即清零）。
+# 以 client_id 为主维度（动态 IP + NAT 下纯按 IP 会误伤）。0 = 关闭节流。
+login_max_failures = 5
+login_lockout_secs = 600
+
+# 会话接管是否要求新旧连接**证书指纹一致**（需与 mTLS 同用才有意义）。
+# true 时，攻击者即便拿到 token 并猜到 client_id，没有对应私钥也顶不掉合法客户端。
+# 灰度期（客户端尚未出示证书）会自动退回按 client_id 判定，不影响断线重连。
+# kick_require_same_cert = true
 
 # 方式二：OIDC（服务端只做「验签」：拉取 issuer 的 discovery + JWKS 校验客户端令牌）
 # [auth]

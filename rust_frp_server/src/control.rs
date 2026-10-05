@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
+use crate::login_throttle::{LoginThrottle, ThrottleKey};
 use crate::*;
+use rust_frp_config::ClientIdPolicy;
 
 /// 控制器
 pub struct Control {
@@ -47,6 +49,8 @@ pub struct Control {
     plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
     /// 上层已读取的登录消息（QUIC 流分派复用；仅首次 run 消费）
     pre_read_login: Option<rust_frp_core::LoginMsg>,
+    /// 本连接的客户端证书指纹（见 [`ControlDeps::peer_cert_fingerprint`]）
+    peer_cert_fingerprint: Option<String>,
 }
 
 /// 构造控制会话所需的依赖集合（收敛 15 个独立参数，避免参数顺序误用）
@@ -68,6 +72,11 @@ pub struct ControlDeps {
     /// 上层已读取的登录消息（QUIC 流按首条消息分派时复用，避免重复读取）
     pub pre_read_login: Option<rust_frp_core::LoginMsg>,
     pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
+    /// 本次控制连接的客户端证书指纹（SHA-256 hex）。
+    ///
+    /// `None` = 该传输路径没有 mTLS 身份（明文/未启用 TLS、或灰度期客户端未出示证书）。
+    /// 仅用于"会话接管判据"（P4），不作为认证依据（认证始终由 TLS 握手完成）。
+    pub peer_cert_fingerprint: Option<String>,
 }
 
 impl Control {
@@ -89,6 +98,7 @@ impl Control {
             work_conn_tls,
             plugin_manager,
             pre_read_login,
+            peer_cert_fingerprint,
         } = deps;
         Self {
             conn,
@@ -111,6 +121,24 @@ impl Control {
             metas: std::collections::HashMap::new(),
             plugin_manager,
             pre_read_login,
+            peer_cert_fingerprint,
+        }
+    }
+
+    /// 发送"登录失败"响应。
+    ///
+    /// 客户端会打印 `LoginRespMsg.error` 的文本（见 `rust_frp_client` 对 `LoginResp`
+    /// 的处理），因此这里带上可读原因，现场排障不必翻服务端日志。
+    /// 发送失败只记日志——此时连接已不可用，继续返回 `Err` 终止本次控制会话即可。
+    async fn send_login_error(&mut self, message: &str) {
+        let resp = rust_frp_core::LoginRespMsg {
+            version: "0.1.0".to_string(),
+            run_id: String::new(),
+            error: message.to_string(),
+            work_conn_tls: self.work_conn_tls,
+        };
+        if let Err(e) = self.write_msg(&Message::LoginResp(resp)).await {
+            log::debug!("failed to send login error response: {:?}", e);
         }
     }
 
@@ -239,6 +267,37 @@ impl Control {
                         // 因此先取出副本
                         let client_version = login_msg.version.clone();
                         let client_hostname = login_msg.hostname.clone();
+                        let login_client_id = login_msg.client_id.clone();
+                        // 取出 Arc 克隆：后面既要读策略/节流器，又要 `&mut self` 发响应，
+                        // 直接借 `self.control_manager` 会与可变借用冲突。
+                        let cm = self.control_manager.clone();
+
+                        // P1/B4：登录失败节流。锁定期间**直接拒绝**，不做任何密码学运算。
+                        let throttle_key = ThrottleKey::new(
+                            &login_client_id,
+                            self.conn.remote_addr().map(|a| a.ip()),
+                        );
+                        if let (Some(throttle), Some(key)) =
+                            (cm.login_throttle(), throttle_key.as_ref())
+                        {
+                            if let Err(remaining) = throttle.check(key) {
+                                log::warn!(
+                                    "login rejected by throttle: {} locked for {} more second(s) \
+                                     after too many consecutive failures (limit = {})",
+                                    key,
+                                    remaining.as_secs(),
+                                    throttle.max_failures()
+                                );
+                                global_metrics().incr_login_failures();
+                                self.send_login_error(&format!(
+                                    "too many failed login attempts; retry in {} second(s)",
+                                    remaining.as_secs()
+                                ))
+                                .await;
+                                return Err("login throttled".into());
+                            }
+                        }
+
                         // 验证登录
                         let verify_result = self
                             .auth_manager
@@ -247,9 +306,34 @@ impl Control {
                         if let Err(e) = verify_result {
                             log::error!("Login verification failed: {:?}", e);
                             global_metrics().incr_login_failures();
+                            // P1/B4：累计失败次数，达到阈值即锁定该维度
+                            if let (Some(throttle), Some(key)) =
+                                (cm.login_throttle(), throttle_key.as_ref())
+                            {
+                                let failures = throttle.record_failure(key);
+                                if failures >= throttle.max_failures() {
+                                    log::warn!(
+                                        "{} locked for {}s after {} consecutive login failures",
+                                        key,
+                                        throttle.lockout().as_secs(),
+                                        failures
+                                    );
+                                }
+                            }
+                            // 回一条带原因的响应：否则客户端只会看到 "Login failed: early eof"，
+                            // 现场很容易误判成网络抖动。认证失败原因不含任何令牌信息
+                            // （`verify_login` 本就忽略 `user`，报错文本统一）。
+                            self.send_login_error("login verification failed: invalid credentials")
+                                .await;
                             return Err(format!("{:?}", e).into());
                         }
                         global_metrics().incr_login_successes();
+                        // P1/B4：登录成功，清空该维度的失败记录（避免正常客户端被"记仇"）
+                        if let (Some(throttle), Some(key)) =
+                            (cm.login_throttle(), throttle_key.as_ref())
+                        {
+                            throttle.record_success(key);
+                        }
 
                         // 服务端插件回调：Login（可拒绝登录，或用 unchange=false 覆写内容）。
                         // 安全：不向插件暴露客户端 token（仅传递业务字段）。
@@ -300,6 +384,37 @@ impl Control {
                             })
                             .unwrap_or_default();
 
+                        // 可观测性（B1）：`client_id` 退化为主机名，是"客户端热重载丢失
+                        // 随机默认值"这一已知缺陷的前兆 —— 两台主机名相同的 frpc 会被
+                        // `kick_same_client` 判定为同一客户端而无限互踢（2026-10-05 线上
+                        // 事故，全线端口掉线约 3 分钟）。此处**仅告警不拒绝**：先观察一个
+                        // 版本，确认线上不再出现该形态后再考虑硬拒。
+                        if let Some(reason) = degraded_client_id_reason(
+                            &self.client_id,
+                            &client_hostname,
+                            &self.run_id,
+                        ) {
+                            if cm.client_id_policy() == ClientIdPolicy::Reject {
+                                // P1/B1 硬拒：退化形态会让两台同名主机被 kick_same_client
+                                // 判为同一客户端而无限互踢（2026-10-05 线上事故）。
+                                // 直接拒绝能让问题**在客户端配置阶段暴露**，而不是变成线上抖动。
+                                log::warn!(
+                                    "REJECTING login: {reason}; configure an explicit unique client_id \
+                                     (auth.client_id_policy = \"reject\")"
+                                );
+                                global_metrics().incr_login_failures();
+                                self.send_login_error(
+                                    "client_id is empty or equals the hostname; set an explicit unique \
+                                     client_id in frpc config (server enforces auth.client_id_policy = reject)",
+                                )
+                                .await;
+                                return Err("client_id degraded and rejected by policy".into());
+                            }
+                            log::warn!(
+                                "{reason}; it may be kicked unexpectedly (auth.client_id_policy = warn)"
+                            );
+                        }
+
                         // 注册客户端信息到 ControlManager（含版本/主机名/IP/线协议，供管理端 API）
                         let client_ip = self
                             .conn
@@ -315,15 +430,21 @@ impl Control {
                                 hostname: client_hostname,
                                 client_ip,
                                 wire_protocol: self.conn.wire_protocol().as_str().to_string(),
+                                cert_fingerprint: self.peer_cert_fingerprint.clone(),
                             })
                             .await;
 
                         // frpc 断线重连会用新 run_id、同 client_id 再次登录。
                         // 必须先踢掉旧连接并等它释放 proxy 端口，否则新连接注册同名
                         // proxy 会因端口占用失败，旧僵尸连接还会持续制造 502。
-                        self.control_manager
-                            .kick_same_client(&self.client_id, &self.run_id)
-                            .await;
+                        // P4：`kick_require_same_cert = true` 时，若新旧双方都持有证书指纹
+                        // 且不一致则拒绝接管（见 kick_same_client 文档）。
+                        cm.kick_same_client(
+                            &self.client_id,
+                            &self.run_id,
+                            self.peer_cert_fingerprint.as_deref(),
+                        )
+                        .await;
 
                         // 注册自己的"被踢"信号（下一次同客户端登录时，本次连接会被踢）
                         let (mut kick_rx, kick_done_tx) =
@@ -885,6 +1006,8 @@ pub struct ClientInfo {
     pub client_ip: String,
     /// 线协议版本标识（v1 / v2）
     pub wire_protocol: String,
+    /// 客户端证书指纹（SHA-256 hex）；`None` = 未提供客户端证书（见 [`ClientRegistration`]）
+    pub cert_fingerprint: Option<String>,
     pub connected_at: Instant,
     pub last_heartbeat: Instant,
     /// 最近一次上线时间（Unix 秒）
@@ -907,6 +1030,23 @@ impl ClientInfo {
 }
 
 /// 登录成功时的客户端注册信息（供 [`ControlManager::add_client`] 使用）
+/// 判定 `client_id` 是否处于**退化形态**，返回可读原因（`None` = 正常）。
+///
+/// 退化形态指"为空"或"等于客户端自报主机名"：此时 `client_id` 不再具备区分度，
+/// 两台同名主机会被 [`ControlManager::kick_same_client`] 判为同一客户端而无限互踢
+/// （2026-10-05 线上事故）。该判定被抽成独立函数以便单测覆盖。
+fn degraded_client_id_reason(client_id: &str, hostname: &str, run_id: &str) -> Option<String> {
+    if client_id.is_empty() {
+        Some(format!(
+            "client_id is EMPTY (hostname='{hostname}', run_id='{run_id}')"
+        ))
+    } else if client_id == hostname {
+        Some(format!("client_id '{client_id}' equals its hostname"))
+    } else {
+        None
+    }
+}
+
 pub struct ClientRegistration {
     pub run_id: String,
     pub client_id: String,
@@ -915,6 +1055,10 @@ pub struct ClientRegistration {
     pub hostname: String,
     pub client_ip: String,
     pub wire_protocol: String,
+    /// 客户端证书指纹（SHA-256 hex）；`None` = 该连接未提供客户端证书。
+    ///
+    /// 会话接管判据（P4）依据此字段：只有指纹一致才允许顶掉旧会话。
+    pub cert_fingerprint: Option<String>,
 }
 
 /// 踢连接信号表：run_id -> (kick 通知, 清理完成回执接收端)
@@ -931,6 +1075,12 @@ pub struct ControlManager {
     offline_clients: RwLock<Vec<ClientInfo>>,
     // 踢连接信号：同一 client_id 重复登录时，用它通知旧 Control 退出并等待其释放 proxy
     kick_signals: KickSignalMap,
+    /// 控制口登录失败节流（P1/B4）；`None` = 关闭
+    login_throttle: Option<LoginThrottle>,
+    /// `client_id` 退化形态（空/主机名）的处置策略（P1/B1）
+    client_id_policy: ClientIdPolicy,
+    /// 会话接管是否要求证书指纹一致（P4）；仅在 mTLS 场景有意义
+    kick_require_same_cert: bool,
 }
 
 impl Default for ControlManager {
@@ -940,13 +1090,45 @@ impl Default for ControlManager {
 }
 
 impl ControlManager {
+    /// 默认实例：不节流、`client_id` 仅告警、接管不校验指纹（向后兼容的旧行为）
     pub fn new() -> Self {
+        Self::with_security(None, ClientIdPolicy::Warn, false)
+    }
+
+    /// 带安全策略构造（服务端按配置调用）
+    ///
+    /// - `login_throttle`：`None` = 不做登录节流
+    /// - `client_id_policy`：`Reject` 时硬拒"空 / 等于主机名"的 `client_id`
+    /// - `kick_require_same_cert`：`true` 时新旧连接**都有**证书指纹才要求一致
+    pub fn with_security(
+        login_throttle: Option<LoginThrottle>,
+        client_id_policy: ClientIdPolicy,
+        kick_require_same_cert: bool,
+    ) -> Self {
         Self {
             msg_channels: RwLock::new(std::collections::HashMap::new()),
             clients: RwLock::new(std::collections::HashMap::new()),
             kick_signals: RwLock::new(std::collections::HashMap::new()),
             offline_clients: RwLock::new(Vec::new()),
+            login_throttle,
+            client_id_policy,
+            kick_require_same_cert,
         }
+    }
+
+    /// 登录失败节流器（`None` = 未启用节流）
+    pub fn login_throttle(&self) -> Option<&LoginThrottle> {
+        self.login_throttle.as_ref()
+    }
+
+    /// `client_id` 退化形态的处置策略
+    pub fn client_id_policy(&self) -> ClientIdPolicy {
+        self.client_id_policy
+    }
+
+    /// 会话接管是否要求证书指纹一致
+    pub fn kick_require_same_cert(&self) -> bool {
+        self.kick_require_same_cert
     }
 
     pub async fn add(
@@ -1003,18 +1185,50 @@ impl ControlManager {
     /// 同一 client_id 的客户端重复登录时（frpc 断线重连），踢掉旧连接，
     /// 并同步等待旧 Control 清理完 proxy（释放服务端端口），避免新连接
     /// 注册同名 proxy 时因端口占用而失败导致长时间 502。
-    pub async fn kick_same_client(&self, client_id: &str, new_run_id: &str) {
-        // 先找出同 client_id 的旧 run_id（只读锁内不 await 其他锁，防死锁）
-        let old_run_ids: Vec<String> = {
+    /// 顶掉同 `client_id` 的旧会话。返回被成功顶掉的 `run_id` 列表（供测试断言）。
+    ///
+    /// **P4（A×B 联动）**：`kick_require_same_cert = true` 时，若**新旧两端都持有证书指纹**
+    /// 且**不一致**，则**拒绝接管**（记 WARN 并跳过）——攻击者即便拿到 token 并猜到
+    /// `client_id`，没有对应私钥就顶不掉合法客户端。
+    ///
+    /// 任一端无指纹（明文传输、未启用 mTLS，或灰度期客户端未出示证书）时**退回**按
+    /// `client_id` 判定，以保证断线重连仍能正常释放端口——否则灰度期会出现
+    /// "旧连接踢不掉 ⇒ 端口不释放 ⇒ 新连接注册失败"的可用性事故。
+    pub async fn kick_same_client(
+        &self,
+        client_id: &str,
+        new_run_id: &str,
+        requester_fingerprint: Option<&str>,
+    ) -> Vec<String> {
+        // 先找出同 client_id 的旧会话（只读锁内不 await 其他锁，防死锁）
+        let old_sessions: Vec<(String, Option<String>)> = {
             let clients = self.clients.read().await;
             clients
                 .values()
                 .filter(|c| c.client_id == client_id && c.run_id != new_run_id)
-                .map(|c| c.run_id.clone())
+                .map(|c| (c.run_id.clone(), c.cert_fingerprint.clone()))
                 .collect()
         };
 
-        for old_run_id in old_run_ids {
+        let mut kicked = Vec::new();
+        for (old_run_id, old_fp) in old_sessions {
+            if self.kick_require_same_cert {
+                // 只有"双端都有指纹且不同"才拒绝；其余情况一律放行（见上方文档）
+                if let (Some(old_fp), Some(new_fp)) = (old_fp.as_deref(), requester_fingerprint) {
+                    if old_fp != new_fp {
+                        log::warn!(
+                            "REFUSING session takeover: client_id '{}' run_id {} presented a client \
+                             certificate whose fingerprint differs from the incumbent session {}; \
+                             the old session keeps running (mTLS identity mismatch)",
+                            client_id,
+                            new_run_id,
+                            old_run_id
+                        );
+                        continue;
+                    }
+                }
+            }
+
             log::warn!(
                 "client '{}' re-logged in with new run_id {}, kicking old session {}",
                 client_id,
@@ -1040,7 +1254,9 @@ impl ControlManager {
             // 兜底：直接清掉旧连接的注册表项（正常情况下旧 Control 退出时也会自清理）
             self.msg_channels.write().await.remove(&old_run_id);
             self.clients.write().await.remove(&old_run_id);
+            kicked.push(old_run_id);
         }
+        kicked
     }
 
     pub async fn get_msg_tx(&self, run_id: &str) -> Option<mpsc::Sender<Message>> {
@@ -1059,6 +1275,7 @@ impl ControlManager {
             hostname: reg.hostname,
             client_ip: reg.client_ip,
             wire_protocol: reg.wire_protocol,
+            cert_fingerprint: reg.cert_fingerprint,
             connected_at: now,
             last_heartbeat: now,
             first_connected_at: rust_frp_util::get_timestamp(),
@@ -1202,5 +1419,170 @@ impl StcpBridgeManager {
     pub async fn cleanup(&self, bridge_id: &str) {
         let mut bridges = self.bridges.write().await;
         bridges.remove(bridge_id);
+    }
+}
+
+#[cfg(test)]
+mod security_hardening_tests {
+    //! P1（B1 硬拒 / B4 节流）与 P4（证书指纹接管判据）的回归测试。
+    //!
+    //! 这些行为都关系到"能否被冒名顶掉"，属于安全语义，**改动时必须同步更新断言**。
+
+    use super::*;
+
+    fn reg(run_id: &str, client_id: &str, fp: Option<&str>) -> ClientRegistration {
+        ClientRegistration {
+            run_id: run_id.to_string(),
+            client_id: client_id.to_string(),
+            user: "u".to_string(),
+            version: "0.1.0".to_string(),
+            hostname: "host".to_string(),
+            client_ip: "127.0.0.1".to_string(),
+            wire_protocol: "v1".to_string(),
+            cert_fingerprint: fp.map(|s| s.to_string()),
+        }
+    }
+
+    async fn online(cm: &ControlManager, run_id: &str, client_id: &str, fp: Option<&str>) {
+        cm.add_client(reg(run_id, client_id, fp)).await;
+    }
+
+    async fn is_online(cm: &ControlManager, run_id: &str) -> bool {
+        cm.clients.read().await.contains_key(run_id)
+    }
+
+    // ── B1：client_id 退化形态判定 ────────────────────────────────
+
+    #[test]
+    fn empty_client_id_is_degraded() {
+        let reason = degraded_client_id_reason("", "host-a", "run-1").expect("empty 应判为退化");
+        assert!(reason.contains("EMPTY"), "{reason}");
+        assert!(
+            reason.contains("host-a"),
+            "原因里应带主机名便于排障: {reason}"
+        );
+    }
+
+    #[test]
+    fn client_id_equal_to_hostname_is_degraded() {
+        let reason =
+            degraded_client_id_reason("localhost.localdomain", "localhost.localdomain", "run-1")
+                .expect("等于主机名应判为退化");
+        assert!(reason.contains("equals its hostname"), "{reason}");
+    }
+
+    #[test]
+    fn explicit_unique_client_id_is_fine() {
+        assert!(
+            degraded_client_id_reason("cli32-d2502b0e", "localhost.localdomain", "run-1").is_none()
+        );
+    }
+
+    // ── P4：接管判据 ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn takeover_allowed_when_fingerprint_matches() {
+        let cm = ControlManager::with_security(None, ClientIdPolicy::Warn, true);
+        online(&cm, "old", "cli-a", Some("fp-aaa")).await;
+        online(&cm, "new", "cli-a", Some("fp-aaa")).await;
+
+        let kicked = cm.kick_same_client("cli-a", "new", Some("fp-aaa")).await;
+
+        assert_eq!(kicked, vec!["old".to_string()], "同指纹应允许接管");
+        assert!(!is_online(&cm, "old").await, "旧会话应被清出注册表");
+        assert!(is_online(&cm, "new").await);
+    }
+
+    #[tokio::test]
+    async fn takeover_refused_when_fingerprint_differs() {
+        // 核心安全断言：拿到 token 并猜到 client_id，但没有对应私钥 ⇒ 顶不掉合法客户端
+        let cm = ControlManager::with_security(None, ClientIdPolicy::Warn, true);
+        online(&cm, "victim", "cli-a", Some("fp-victim")).await;
+        online(&cm, "attacker", "cli-a", Some("fp-attacker")).await;
+
+        let kicked = cm
+            .kick_same_client("cli-a", "attacker", Some("fp-attacker"))
+            .await;
+
+        assert!(
+            kicked.is_empty(),
+            "指纹不一致必须拒绝接管，实际踢了 {kicked:?}"
+        );
+        assert!(is_online(&cm, "victim").await, "合法会话必须存活");
+    }
+
+    #[tokio::test]
+    async fn takeover_falls_back_to_client_id_when_incumbent_has_no_cert() {
+        // 灰度期：旧会话未出示证书 ⇒ 必须退回旧行为，否则断线重连拿不回端口
+        let cm = ControlManager::with_security(None, ClientIdPolicy::Warn, true);
+        online(&cm, "old", "cli-a", None).await;
+        online(&cm, "new", "cli-a", Some("fp-aaa")).await;
+
+        let kicked = cm.kick_same_client("cli-a", "new", Some("fp-aaa")).await;
+
+        assert_eq!(
+            kicked,
+            vec!["old".to_string()],
+            "单侧无指纹时应退回按 client_id 判定"
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_falls_back_when_requester_has_no_cert() {
+        let cm = ControlManager::with_security(None, ClientIdPolicy::Warn, true);
+        online(&cm, "old", "cli-a", Some("fp-aaa")).await;
+        online(&cm, "new", "cli-a", None).await;
+
+        let kicked = cm.kick_same_client("cli-a", "new", None).await;
+
+        assert_eq!(
+            kicked,
+            vec!["old".to_string()],
+            "请求方无指纹时应退回按 client_id 判定"
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_ignores_fingerprint_when_not_required() {
+        // 未启用 kick_require_same_cert ⇒ 保持旧语义（指纹不影响判定）
+        let cm = ControlManager::with_security(None, ClientIdPolicy::Warn, false);
+        online(&cm, "old", "cli-a", Some("fp-aaa")).await;
+        online(&cm, "new", "cli-a", Some("fp-bbb")).await;
+
+        let kicked = cm.kick_same_client("cli-a", "new", Some("fp-bbb")).await;
+
+        assert_eq!(kicked, vec!["old".to_string()], "未开启指纹判据时应照旧踢");
+    }
+
+    #[tokio::test]
+    async fn takeover_ignores_other_client_ids() {
+        let cm = ControlManager::with_security(None, ClientIdPolicy::Warn, true);
+        online(&cm, "other", "cli-b", Some("fp-aaa")).await;
+        online(&cm, "old", "cli-a", Some("fp-aaa")).await;
+        online(&cm, "new", "cli-a", Some("fp-aaa")).await;
+
+        let kicked = cm.kick_same_client("cli-a", "new", Some("fp-aaa")).await;
+
+        assert_eq!(kicked, vec!["old".to_string()], "不得误伤别的 client_id");
+        assert!(is_online(&cm, "other").await);
+    }
+
+    // ── 策略默认值 ───────────────────────────────────────────────
+
+    #[test]
+    fn default_manager_keeps_legacy_behaviour() {
+        let cm = ControlManager::new();
+        assert!(cm.login_throttle().is_none(), "默认不节流（零破坏）");
+        assert_eq!(cm.client_id_policy(), ClientIdPolicy::Warn, "默认仅告警");
+        assert!(!cm.kick_require_same_cert(), "默认不要求指纹一致");
+    }
+
+    #[tokio::test]
+    async fn with_security_exposes_configured_values() {
+        let throttle = LoginThrottle::new(3, 60).expect("启用");
+        let cm = ControlManager::with_security(Some(throttle), ClientIdPolicy::Reject, true);
+        assert_eq!(cm.login_throttle().map(|t| t.max_failures()), Some(3));
+        assert_eq!(cm.client_id_policy(), ClientIdPolicy::Reject);
+        assert!(cm.kick_require_same_cert());
     }
 }

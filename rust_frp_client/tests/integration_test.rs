@@ -694,6 +694,7 @@ fn test_auth_config_oidc_method() {
             ..Default::default()
         }),
         additional_scopes: None,
+        ..Default::default()
     };
     assert_eq!(config.method, "oidc");
     assert!(config.oidc.is_some());
@@ -718,6 +719,7 @@ fn test_oidc_auth_manager_creation() {
             ..Default::default()
         }),
         additional_scopes: None,
+        ..Default::default()
     };
     let result = AuthManager::new(&config);
     assert!(result.is_ok());
@@ -731,6 +733,7 @@ fn test_oidc_auth_manager_missing_config() {
         oidc: None,
         token_source: None,
         additional_scopes: None,
+        ..Default::default()
     };
     let result = AuthManager::new(&config);
     assert!(result.is_err());

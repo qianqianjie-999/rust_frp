@@ -77,7 +77,7 @@ async fn start_quic_server(token: &str) -> QuicServer {
 async fn connect_quic(port: u16) -> QuicSession {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let opts = QuicOptions::default();
-    let client_cfg = build_quic_client_config(None, true, &opts).expect("client quic config");
+    let client_cfg = build_quic_client_config(None, true, None, &opts).expect("client quic config");
     for _ in 0..20 {
         if let Ok(s) = QuicSession::connect(addr, "localhost", client_cfg.clone()).await {
             return s;
