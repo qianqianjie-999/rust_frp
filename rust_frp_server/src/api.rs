@@ -312,25 +312,18 @@ fn build_closed_proxy_stats(info: &ClosedProxyInfo) -> Value {
     })
 }
 
-/// Unix 秒 → `YYYY-MM-DD HH:MM:SS`（UTC，零依赖实现）
+/// Unix 秒 → `YYYY-MM-DD HH:MM:SS`（**本地时区**，与日志时间戳同一套实现）
+///
+/// `secs <= 0`（从未启动过 / 未记录）返回空串，由前端渲染成占位符。
+///
+/// 时区来自进程的 `TZ` / `/etc/localtime`，取不到时回退 UTC —— 具体换算见
+/// [`rust_frp_util::localtime`]。此前这里是自带的一份 UTC 实现，导致管理端
+/// 显示的时间比本地时间早 8 小时。
 fn format_timestamp(secs: i64) -> String {
     if secs <= 0 {
         return String::new();
     }
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    // 民用算法（Howard Hinnant）：days since 1970-01-01 → y/m/d
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}:{s:02}")
+    rust_frp_util::localtime::format_local_datetime(secs)
 }
 
 /// 在线代理 + 离线的代理列表（`(name, stats_json, client_id, user, online)`）
@@ -1114,14 +1107,15 @@ mod tests {
         );
 
         // 记录一条离线历史后：出现在 offline 列表，DELETE 可清理
+        let closed_at = rust_frp_util::get_timestamp();
         crate::metrics::global_metrics().record_proxy_closed(crate::metrics::ClosedProxyInfo {
             name: "api-pxy-closed".to_string(),
             proxy_type: "tcp".to_string(),
             user: "alice".to_string(),
             client_id: "cli-1".to_string(),
             remote_port: Some(9002),
-            last_start_time: rust_frp_util::get_timestamp() - 60,
-            last_close_time: rust_frp_util::get_timestamp(),
+            last_start_time: closed_at - 60,
+            last_close_time: closed_at,
             traffic_in: 10,
             traffic_out: 20,
         });
@@ -1130,6 +1124,17 @@ mod tests {
         let closed_body = json_body(closed).await;
         assert_eq!(closed_body["status"], "offline");
         assert_eq!(closed_body["todayTrafficIn"], 10);
+        // 上线/下线时间按**本地时区**渲染（此前是 UTC，比本地时间早 8 小时）
+        let expected_close = rust_frp_util::localtime::format_local_datetime(closed_at);
+        assert_eq!(
+            closed_body["lastCloseTime"].as_str(),
+            Some(expected_close.as_str())
+        );
+        assert_eq!(
+            closed_body["lastStartTime"].as_str().map(str::len),
+            Some(19),
+            "expect YYYY-MM-DD HH:MM:SS: {closed_body}"
+        );
 
         // DELETE 需要 status=offline
         let bad_delete = delete_proxies_handler(query(&[("status", "online")])).await;
@@ -1218,11 +1223,26 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_formatting_matches_utc() {
-        // 1970-01-01 00:00:00 UTC 与一个已知时刻
+    fn timestamp_formatting_uses_local_timezone() {
+        // 未记录（<= 0）→ 空串，不显示 1970 年
         assert_eq!(format_timestamp(0), "");
-        assert_eq!(format_timestamp(1_000_000_000), "2001-09-09 01:46:40");
-        assert_eq!(format_timestamp(1_700_000_000), "2023-11-14 22:13:20");
+        assert_eq!(format_timestamp(-1), "");
+
+        let secs = 1_700_000_000;
+        // 与工具层的本地时间实现必须完全一致（只有一份实现，不会各自漂移）
+        assert_eq!(
+            format_timestamp(secs),
+            rust_frp_util::localtime::format_local_datetime(secs)
+        );
+        // 定长 19 字符：前端按定宽渲染
+        assert_eq!(format_timestamp(secs).len(), 19);
+
+        // 回归守护：宿主不在 UTC 时，输出不得再等于 UTC 表示（这正是本次修复的目标）。
+        // 确定性断言（各时区/跨天）在 rust_frp_util::localtime 的纯函数用例里。
+        if rust_frp_util::localtime::local_offset_secs() != 0 {
+            assert_ne!(format_timestamp(secs), "2023-11-14 22:13:20");
+            assert_ne!(format_timestamp(1_000_000_000), "2001-09-09 01:46:40");
+        }
     }
 
     #[test]
