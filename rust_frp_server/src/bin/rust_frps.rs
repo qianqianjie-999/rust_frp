@@ -3,12 +3,22 @@ use rust_frp_server::Server;
 use std::env;
 use tracing::{error, info, warn};
 
+/// 按配置的 `[log]` 段初始化日志；失败（如日志文件打不开）直接退出
+///
+/// 退出码 1 与「配置错误」一致 —— 建议 systemd 单元配
+/// `RestartPreventExitStatus=1`，避免配置写错时 3 秒一次重启风暴。
+fn init_logging_for_server(config: &rust_frp_config::ServerConfig) {
+    let log = config.resolved_log();
+    if let Err(e) =
+        rust_frp_util::init_logging(log.to.as_deref(), log.level.as_deref(), log.max_days)
+    {
+        eprintln!("[rust_frps] failed to initialize logging: {e}");
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let args: Vec<String> = env::args().collect();
 
     // 对齐原版 --strict_config（默认 true）：未知字段直接报错
@@ -33,10 +43,15 @@ async fn main() {
     let config = match ConfigLoader::load_server_config_strict(&config_path, strict_config) {
         Ok(config) => config,
         Err(e) => {
-            error!("Failed to load config: {:?}", e);
+            // 日志尚未初始化（级别/文件来自配置本身），只能走 stderr
+            eprintln!("[rust_frps] failed to load config: {e:?}");
             return;
         }
     };
+
+    // 依据配置初始化日志（stderr + 可选日志文件、按天轮转）
+    // 对齐原版 `[log]` 段；打开日志文件失败属配置错误，直接失败退出（不静默降级）
+    init_logging_for_server(&config);
 
     info!("Starting frps server...");
 

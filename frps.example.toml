@@ -76,6 +76,17 @@ pool_count = 10
 # 非法的带宽值（空串 / 0 / 负数 / 非数字）会直接报配置错误
 # bandwidth_limit = "10MB"
 
+# --- 日志配置（对齐原版 frp `[log]` 段） ---
+# 不配置 → 只输出到 stderr（systemd 由 journald 收集）；
+# 配置 to 之后 → stderr 与文件**同时**输出，按天轮转为 `<文件名>.<YYYY-MM-DD>`
+# （日期按 UTC，与日志行时间戳一致），并自动清理超过 maxDays 天的旧文件。
+# 也可用旧版 INI 风格的顶层 `log_level` / `log_file` / `log_max_days`，
+# 两者同时存在时以 `[log]` 段为准。
+# [log]
+# to = "/var/log/frps.log"
+# level = "info"        # 也接受 RUST_LOG 风格过滤表达式
+# maxDays = 3           # 0 = 不自动清理
+
 # 启用 TLS：请务必指定自建证书，否则会在启动时内存中生成自签证书（仅加密、不认证身份）
 # [transport.tls]
 # enable = true

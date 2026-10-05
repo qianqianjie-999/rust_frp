@@ -54,19 +54,19 @@
 | 数据面能力 | **11/11** | 100% | —（PROXY protocol v1/v2 已落地，见 六、数据面能力对照） |
 | 客户端插件 | **9/10** | 90% | `virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 已支持普通 HTTP 转发） |
 | 服务端插件 | **2/2** | 100% | —（reqid 贯穿已实现：每次回调生成随机 reqid，经 `X-Frp-Reqid` 头下发并注入回调错误日志，语义等价原版 tracer.go） |
-| 认证与安全 | **5/7** | 71% | SSH 隧道网关、FeatureGate/`--allow-unsafe`（`additionalScopes` 已落地） |
+| 认证与安全 | **6/7** | 86% | SSH 隧道网关（`additionalScopes` 已落地，见 七、认证与安全对照） |
 | frps 管理 API | **9/9** | 100% | —（v1 serverinfo/clients/按类型名称查询/流量 + v2 套件/分页/prune/users + DELETE offline 全部落地） |
 | frpc 管理 API | **3/5** | 60% | `/api/stop`、Store 源代理 CRUD |
 | CLI | **8/8** | 100% | —（`--strict_config` 已落地，且默认 true 与原版一致；关闭时为 WARN 模式） |
 | 配置体系 | **4/6** | 67% | Store 配置源、FeatureGates |
-| **合计** | **63/73** | **≈86%** | — |
+| **合计** | **67/73** | **≈92%** | —（数据面 26/26、控制/运维面 41/47） |
 
 **分组小结**：
 
 | 分组 | 覆盖 | 说明 |
 |------|:----:|------|
 | 数据面 / 协议（代理类型 + 传输 + 线协议 + 数据面能力） | **26/26（100%）** | 转发链路完全对齐 |
-| 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **38/47（81%）** | 剩余差距集中在个别插件/认证/配置字段 |
+| 控制 / 运维面（插件 + 认证 + API + CLI + 配置） | **41/47（87%）** | 剩余差距集中在个别插件/认证/配置字段 |
 
 > 计分口径：一项能力「确实可用且与原版等价（或更强）」记 1 分；缺失 / 仅占位 / 显著弱化 / 未强制记 0 分。
 
@@ -255,14 +255,25 @@
 
 **原版字段中 rust 未支持（会被 WARN 忽略）的部分**
 
+> 注：原版 `[log]` 段（`log.to` / `log.level` / `log.maxDays`）与旧版顶层
+> `log_file` / `log_level` / `log_max_days` **已于 2026-10-05 落地**（此前缺失导致
+> 标准原版 frps.toml 在 strict 模式下无法启动，属兼容性回归，现已修复并有回归测试守护）。
+
 | 侧 | 缺失字段（原版有，rust 无） |
 |----|------------------------------|
 | frps | `vhostHTTPTimeout`、`subDomainHost`（rust 用 `subdomain_base`）、`tcpmuxPassthrough`、`detailedErrorsToClient`、`userConnTimeout`、`maxPortsPerClient`（rust 用 `maxPortsPerUser`，命名不同）、`natholeAnalysisDataReserveHours`、`udpPacketSize`、`sshTunnelGateway`、`featureGates`、`transport.heartbeatTimeout`/`tcpKeepalive`/`maxPoolCount` |
 | frpc | `natHoleStunServer`、`dnsServer`、`loginFailExit`、`start`（按名启用代理）、`udpPacketSize`、`virtualNet`、`featureGates`、`store`、`transport.proxyURL`/`connectServerLocalIP`/`dialServerTimeout`/`dialServerKeepalive`/`tcpMuxKeepaliveInterval`/`heartbeatInterval`/`heartbeatTimeout` |
-| 代理 | HTTP/HTTPS：`requestHeaders`、`responseHeaders`、`routeByHTTPUser`；PROXY protocol v2 |
+| 代理 | HTTP/HTTPS：`requestHeaders`、`responseHeaders`、`routeByHTTPUser` |
 
-> 兼容策略差异：原版 `--strict_config` 默认 **true**（未知字段直接报错）；rust 采取
-> **解析成功 + 逐字段 WARN**（迁移更平滑，但需用户自查日志确认字段是否生效）。
+**日志配置（本轮补齐）**
+
+| 能力 | rust_frp | frp 0.71 |
+|------|:--------:|:--------:|
+| `[log] to` / `level` / `maxDays` | ✅（stderr + 文件双写、按天轮转 `<文件名>.<YYYY-MM-DD>`、清理超期文件） | ✅（配置 `to` 后仅写文件） |
+| 旧版顶层 `log_file` / `log_level` / `log_max_days` | ✅（`[log]` 段优先） | ✅（INI 时代写法，已废弃） |
+
+> 兼容策略：原版 `--strict_config` 默认 **true**（未知字段直接报错）；rust 同样默认 **true**
+> 并在 `--strict_config=false` 时退回「解析成功 + 逐字段 WARN」模式。
 
 ---
 
@@ -283,7 +294,7 @@
 | # | 缺口 | 说明 |
 |---|------|------|
 | 1 | ~~配置字段命名 snake_case vs camelCase~~ | ✅ 已落地（alias 双向兼容，原版配置可加载） |
-| 2 | 未知字段不报错（WARN 模式） | ⚠️ 设计取舍：硬拒绝会误杀原版配置；需用户自查日志 |
+| 2 | ~~未知字段不报错（WARN 模式）~~ | ✅ 已落地：`--strict_config` 默认 **true**（与原版一致），未知字段直接报错；`--strict_config=false` 才退回 WARN 模式。~~原版标准 `log.*` 段被误判为未知字段~~ → 已修复（2026-10-05） |
 | 3 | ~~无 `frpc reload/status/verify`~~ | ✅ 已落地 |
 | 4 | ~~无代理 CRUD / frpc 管理 API~~ | ✅ 已落地（`GET/PUT /config`） |
 

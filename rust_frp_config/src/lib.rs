@@ -187,6 +187,24 @@ pub struct ServerConfig {
     #[serde(alias = "custom404Page")]
     pub custom_404_page: Option<String>,
 
+    /// 日志配置（对齐原版 frp 的 `[log]` 段）
+    pub log: LogConfig,
+
+    /// 旧版 INI 风格日志文件路径（`log_file`，等价于 `log.to`）
+    ///
+    /// 原版 frp 在 INI 时代使用顶层 `log_file`；新式 TOML/YAML 使用
+    /// `log.to`。两者都接受，**`log.to` 优先**。详见 [`LogConfig`]。
+    #[serde(alias = "logFile")]
+    pub log_file: Option<String>,
+
+    /// 旧版 INI 风格日志级别（`log_level`，等价于 `log.level`）
+    #[serde(alias = "logLevel")]
+    pub log_level: Option<String>,
+
+    /// 旧版 INI 风格日志保留天数（`log_max_days`，等价于 `log.maxDays`）
+    #[serde(alias = "logMaxDays")]
+    pub log_max_days: Option<u32>,
+
     /// 配置文件包含模式（glob）
     ///
     /// # 示例
@@ -287,6 +305,10 @@ impl Default for ServerConfig {
             allow_ports: Vec::new(),
             max_ports_per_user: None,
             custom_404_page: None,
+            log: LogConfig::default(),
+            log_file: None,
+            log_level: None,
+            log_max_days: None,
             includes: None,
             proxies: Vec::new(),
             http_plugins: Vec::new(),
@@ -373,6 +395,21 @@ pub struct ClientConfig {
     /// 访问者用于访问其他客户端暴露的服务（STCP/XTCP 代理类型）
     pub visitors: Vec<VisitorConfig>,
 
+    /// 日志配置（对齐原版 frp 的 `[log]` 段）
+    pub log: LogConfig,
+
+    /// 旧版 INI 风格日志文件路径（`log_file`，等价于 `log.to`）
+    #[serde(alias = "logFile")]
+    pub log_file: Option<String>,
+
+    /// 旧版 INI 风格日志级别（`log_level`，等价于 `log.level`）
+    #[serde(alias = "logLevel")]
+    pub log_level: Option<String>,
+
+    /// 旧版 INI 风格日志保留天数（`log_max_days`，等价于 `log.maxDays`）
+    #[serde(alias = "logMaxDays")]
+    pub log_max_days: Option<u32>,
+
     /// 配置文件包含模式
     pub includes: Option<Vec<String>>,
 }
@@ -390,6 +427,10 @@ impl Default for ClientConfig {
             transport: TransportConfig::default(),
             proxies: Vec::new(),
             visitors: Vec::new(),
+            log: LogConfig::default(),
+            log_file: None,
+            log_level: None,
+            log_max_days: None,
             includes: None,
         }
     }
@@ -426,6 +467,128 @@ pub struct WebServerConfig {
     /// 置为 true，并建议同时用反向代理限制来源。
     #[serde(default, alias = "exposeMetrics")]
     pub expose_metrics: bool,
+}
+
+/// 日志配置（对齐原版 frp）
+///
+/// # 两种写法都支持
+///
+/// 原版 frp 在 INI 时代用顶层 `log_file` / `log_level` / `log_max_days`；
+/// 新式 TOML/YAML 用 `[log]` 段（`to` / `level` / `maxDays`）。本实现**同时接受**，
+/// 冲突时 **`[log]` 段优先**。
+///
+/// ```toml
+/// # 推荐（原版新式写法）
+/// [log]
+/// to = "/var/log/frps.log"
+/// level = "info"
+/// maxDays = 3
+///
+/// # 同时兼容旧写法（顶层）
+/// log_file = "/var/log/frps.log"
+/// log_level = "info"
+/// log_max_days = 3
+/// ```
+///
+/// # 语义
+///
+/// - `to` 为空 / 未配置 → 仅输出到 stderr（保持原有行为，systemd 走 journald）；
+/// - `to` 配置后 → **同时**输出到 stderr 与文件（tee），便于 journald 与文件双通道排查；
+/// - `level` 未配置 → 沿用 `RUST_LOG` 环境变量，再没有则用内置默认级别；
+/// - `maxDays` 默认 3，按天轮转，`0` 表示不自动清理；
+/// - 文件追加写入，父目录不存在时自动创建。
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct LogConfig {
+    /// 日志文件路径（空 = 仅 stderr）
+    #[serde(alias = "file", alias = "logFile")]
+    pub to: Option<String>,
+
+    /// 日志级别（如 `info` / `debug`；也接受 `RUST_LOG` 风格的过滤表达式）
+    #[serde(alias = "logLevel")]
+    pub level: Option<String>,
+
+    /// 日志文件保留天数（默认 3，0 = 不自动清理）
+    #[serde(alias = "maxDays")]
+    pub max_days: Option<u32>,
+}
+
+/// 合并 `[log]` 段与旧版顶层字段后的最终日志配置
+///
+/// 由 [`ServerConfig::resolved_log`] / [`ClientConfig::resolved_log`] 产出，
+/// 供 `rust_frp_util::logging::init` 使用（该函数只接收原始类型，避免工具 crate
+/// 反向依赖配置 crate）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLog {
+    /// 日志文件路径（None = 仅 stderr）
+    pub to: Option<String>,
+    /// 日志级别过滤表达式（None = 用 `RUST_LOG` 或内置默认）
+    pub level: Option<String>,
+    /// 日志文件保留天数（默认 3，0 = 不自动清理）
+    pub max_days: u32,
+}
+
+/// 日志文件保留天数默认值（对齐原版 frp）
+pub const DEFAULT_LOG_MAX_DAYS: u32 = 3;
+
+impl Default for ResolvedLog {
+    /// 默认：仅 stderr、级别交由 `RUST_LOG`、保留 3 天
+    fn default() -> Self {
+        Self {
+            to: None,
+            level: None,
+            max_days: DEFAULT_LOG_MAX_DAYS,
+        }
+    }
+}
+
+impl LogConfig {
+    /// 与旧版顶层字段合并；`[log]` 段优先，顶层仅在段内未配置时兜底
+    ///
+    /// 空字符串（含纯空白）视为「未配置」，避免 `log_file = ""` 被当成合法路径。
+    fn merge(
+        &self,
+        legacy_to: Option<&String>,
+        legacy_level: Option<&String>,
+        legacy_max_days: Option<u32>,
+    ) -> ResolvedLog {
+        let pick = |sect: Option<&String>, legacy: Option<&String>| -> Option<String> {
+            sect.or(legacy)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+
+        ResolvedLog {
+            to: pick(self.to.as_ref(), legacy_to),
+            level: pick(self.level.as_ref(), legacy_level),
+            max_days: self
+                .max_days
+                .or(legacy_max_days)
+                .unwrap_or(DEFAULT_LOG_MAX_DAYS),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// 合并 `[log]` 段与旧版顶层 `log_file` / `log_level` / `log_max_days`
+    pub fn resolved_log(&self) -> ResolvedLog {
+        self.log.merge(
+            self.log_file.as_ref(),
+            self.log_level.as_ref(),
+            self.log_max_days,
+        )
+    }
+}
+
+impl ClientConfig {
+    /// 合并 `[log]` 段与旧版顶层 `log_file` / `log_level` / `log_max_days`
+    pub fn resolved_log(&self) -> ResolvedLog {
+        self.log.merge(
+            self.log_file.as_ref(),
+            self.log_level.as_ref(),
+            self.log_max_days,
+        )
+    }
 }
 
 /// 认证配置 - 定义客户端认证方式
@@ -3049,8 +3212,11 @@ end = 20000
         assert_eq!(config.allow_ports[0].start, Some(10000));
     }
 
-    /// 含原版暂不支持字段（log.*、loginFailExit 等）的配置必须仍能加载，
-    /// 不支持项以 WARN 提示而非硬性拒绝。
+    /// 含原版暂不支持字段（loginFailExit、disableLogColor 等）的配置必须仍能加载，
+    /// 不支持项以 WARN 提示而非硬性拒绝（非 strict 模式）。
+    ///
+    /// 注：原版 `log.*` 段已支持（见 `test_upstream_log_section_accepted_in_strict_mode`），
+    /// 不再作为"不支持字段"的样例。
     #[test]
     fn test_upstream_config_with_unsupported_fields_still_loads() {
         let path = write_temp_config(
@@ -3059,6 +3225,7 @@ end = 20000
 serverAddr = "203.0.113.10"
 serverPort = 7000
 loginFailExit = false
+disableLogColor = true
 metasVar = "unused"
 
 log.to = "./frpc.log"
@@ -3079,6 +3246,120 @@ remotePort = 6022
 
         assert_eq!(config.server_addr, "203.0.113.10");
         assert_eq!(config.proxies.len(), 1);
+    }
+
+    /// 回归（P0-2，2026-10-05 线上核查发现）：**标准原版 frps.toml 必须能在
+    /// strict 模式下加载**。
+    ///
+    /// 背景：`log` 段此前不在已知键白名单中，导致一份完全合法的原版配置
+    /// （`[log] to/level/maxDays`）在 `--strict_config`（默认 true）下直接启动失败，
+    /// 与「原版配置可直接复用」的目标冲突。
+    #[test]
+    fn test_upstream_log_section_accepted_in_strict_mode() {
+        let path = write_temp_config(
+            "frps_upstream_log",
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 9300
+
+log.to = "/var/log/frps.log"
+log.level = "info"
+log.maxDays = 7
+
+auth.method = "token"
+auth.token = "upstream-token"
+"#,
+        );
+        let config = ConfigLoader::load_server_config_strict(&path, true)
+            .expect("standard upstream frps.toml with [log] must pass strict mode");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(config.bind_port, 9300);
+        let log = config.resolved_log();
+        assert_eq!(log.to.as_deref(), Some("/var/log/frps.log"));
+        assert_eq!(log.level.as_deref(), Some("info"));
+        assert_eq!(log.max_days, 7);
+    }
+
+    /// 旧版 INI 风格顶层字段 `log_file` / `log_level` / `log_max_days`
+    /// （线上 rust_frps.toml 即为此写法）在 strict 模式下同样必须被接受。
+    #[test]
+    fn test_legacy_log_fields_accepted_in_strict_mode() {
+        let path = write_temp_config(
+            "frps_legacy_log",
+            r#"
+bind_port = 9300
+log_level = "info"
+log_file = "/opt/rust_frp/logs/frps.log"
+log_max_days = 5
+"#,
+        );
+        let config = ConfigLoader::load_server_config_strict(&path, true)
+            .expect("legacy top-level log_* fields must pass strict mode");
+        std::fs::remove_file(&path).ok();
+
+        let log = config.resolved_log();
+        assert_eq!(log.to.as_deref(), Some("/opt/rust_frp/logs/frps.log"));
+        assert_eq!(log.level.as_deref(), Some("info"));
+        assert_eq!(log.max_days, 5);
+    }
+
+    /// `[log]` 段与旧版顶层字段的合并规则：**段内优先**，顶层仅兜底；
+    /// 空串视为未配置；都未配置时 max_days 取默认 3、文件为 None。
+    #[test]
+    fn test_log_section_takes_precedence_over_legacy_fields() {
+        // 段内优先
+        let both = write_temp_config(
+            "frpc_log_both",
+            r#"
+server_addr = "1.2.3.4"
+server_port = 9300
+log_file = "/legacy/frpc.log"
+log_level = "warn"
+log_max_days = 9
+
+[log]
+to = "/section/frpc.log"
+level = "debug"
+maxDays = 1
+"#,
+        );
+        let config = ConfigLoader::load_client_config_strict(&both, true).expect("must load");
+        std::fs::remove_file(&both).ok();
+        let log = config.resolved_log();
+        assert_eq!(log.to.as_deref(), Some("/section/frpc.log"));
+        assert_eq!(log.level.as_deref(), Some("debug"));
+        assert_eq!(log.max_days, 1);
+
+        // 顶层兜底 + 空串视为未配置（`log_file = "   "` 不应被当成合法路径）
+        let legacy_only = write_temp_config(
+            "frpc_log_legacy_only",
+            r#"
+server_addr = "1.2.3.4"
+server_port = 9300
+log_file = "   "
+log_level = "warn"
+"#,
+        );
+        let config =
+            ConfigLoader::load_client_config_strict(&legacy_only, true).expect("must load");
+        std::fs::remove_file(&legacy_only).ok();
+        let log = config.resolved_log();
+        assert_eq!(log.to, None, "blank string must be treated as unset");
+        assert_eq!(log.level.as_deref(), Some("warn"));
+        assert_eq!(log.max_days, super::DEFAULT_LOG_MAX_DAYS);
+
+        // 完全未配置 → 默认值
+        let none = write_temp_config(
+            "frpc_log_none",
+            r#"
+server_addr = "1.2.3.4"
+server_port = 9300
+"#,
+        );
+        let config = ConfigLoader::load_client_config_strict(&none, true).expect("must load");
+        std::fs::remove_file(&none).ok();
+        assert_eq!(config.resolved_log(), super::ResolvedLog::default());
     }
 }
 

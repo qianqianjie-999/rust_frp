@@ -395,6 +395,17 @@ fn load_config_or_exit(config_path: &Option<String>, strict: bool) -> ClientConf
     }
 }
 
+/// 只为初始化日志而预读配置的 `[log]` 段
+///
+/// 读不到（文件不存在 / 语法错误 / strict 校验失败）时返回默认设置，
+/// **不打印错误、不退出** —— 随后 `run_client_once` 会再加载一次并给出准确报错。
+fn peek_log_settings(config_path: &Option<String>, strict: bool) -> rust_frp_config::ResolvedLog {
+    let path = default_config_path(config_path);
+    ConfigLoader::load_client_config_strict(&path, strict)
+        .map(|config| config.resolved_log())
+        .unwrap_or_default()
+}
+
 /// `frpc verify`：校验配置文件后按结果设置退出码
 fn run_verify(config_path: &Option<String>, strict: bool) {
     let path = default_config_path(config_path);
@@ -667,10 +678,6 @@ async fn run_quick(command: &Command, opts: &QuickOpts) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = match parse_args(&args) {
         Ok(cli) => cli,
@@ -683,6 +690,21 @@ async fn main() {
     if cli.version {
         println!("rust_frpc {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+
+    // 日志初始化：`run` 模式下先读一次配置，取 `[log]` 段（stderr + 可选文件、按天轮转）；
+    // 其它子命令（verify/reload/status/stop/quick）用默认日志设置。
+    // 配置读不出来时不报错——后续正常流程会再加载一次并给出准确错误信息。
+    let log = if matches!(cli.command, Command::Run) && cli.config_dir.is_none() {
+        peek_log_settings(&cli.config_path, cli.strict_config)
+    } else {
+        rust_frp_config::ResolvedLog::default()
+    };
+    if let Err(e) =
+        rust_frp_util::init_logging(log.to.as_deref(), log.level.as_deref(), log.max_days)
+    {
+        eprintln!("frpc: failed to initialize logging: {e}");
+        exit(1);
     }
 
     match cli.command.clone() {
