@@ -86,7 +86,15 @@ mod fields {
         "exposeMetrics",
     ];
 
-    pub const AUTH: &[&str] = &["method", "token", "tokenSource", "token_source", "oidc"];
+    pub const AUTH: &[&str] = &[
+        "method",
+        "token",
+        "tokenSource",
+        "token_source",
+        "additionalScopes",
+        "additional_scopes",
+        "oidc",
+    ];
 
     pub const TOKEN_SOURCE: &[&str] = &["type", "file_path", "filePath", "exec"];
 

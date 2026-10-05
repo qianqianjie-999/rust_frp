@@ -158,6 +158,7 @@ async fn wire_v2_ping_pong_over_encrypted_channel() {
         &mut conn,
         &Message::Ping(rust_frp_core::PingMsg {
             timestamp: rust_frp_util::get_timestamp(),
+            privilege_key: String::new(),
         }),
     )
     .await

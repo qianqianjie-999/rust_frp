@@ -426,6 +426,11 @@ pub struct NewVisitorConnRespMsg {
 pub struct PingMsg {
     /// 时间戳（毫秒）
     pub timestamp: i64,
+    /// 心跳 HMAC 签名（Base64(HMAC-SHA256(token, "ping:" + timestamp))）；
+    /// `auth.additionalScopes` 含 `heartBeats` 时由客户端填充、服务端强校验，
+    /// 未启用时为空串；`#[serde(default)]` 保证旧报文仍可反序列化
+    #[serde(default)]
+    pub privilege_key: String,
 }
 
 /// Pong 消息 - 服务器对心跳请求的响应
@@ -1189,7 +1194,10 @@ mod tests {
 
     #[test]
     fn test_ping_pong_serialization() {
-        let ping = Message::Ping(PingMsg { timestamp: 999 });
+        let ping = Message::Ping(PingMsg {
+            timestamp: 999,
+            privilege_key: String::new(),
+        });
         let json = serde_json::to_string(&ping).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();
         match deserialized {
@@ -1267,7 +1275,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_write_message_roundtrip() {
-        let msg = Message::Ping(PingMsg { timestamp: 12345 });
+        let msg = Message::Ping(PingMsg {
+            timestamp: 12345,
+            privilege_key: String::new(),
+        });
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).await.unwrap();
         let deserialized = read_message(&mut buf.as_slice()).await.unwrap();
@@ -1307,7 +1318,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_v2_message_frame_roundtrip() {
-        let msg = Message::Ping(PingMsg { timestamp: 42 });
+        let msg = Message::Ping(PingMsg {
+            timestamp: 42,
+            privilege_key: String::new(),
+        });
         let mut wire = Vec::new();
         write_v2_message(&mut wire, &msg).await.unwrap();
         // v2 帧头：类型 = 16（MESSAGE），标志 = 0
@@ -1341,7 +1355,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_v2_message_enforces_size_limit() {
-        let msg = Message::Ping(PingMsg { timestamp: 1 });
+        let msg = Message::Ping(PingMsg {
+            timestamp: 1,
+            privilege_key: String::new(),
+        });
         let mut wire = Vec::new();
         write_v2_message(&mut wire, &msg).await.unwrap();
         // 上限收紧到 1 字节 → 必须拒绝
@@ -1400,9 +1417,12 @@ mod tests {
         let mut v2 = ControlConn::new_v2(Box::new(DuplexConn(b)));
         assert_eq!(v2.wire_protocol(), WireProtocol::V2);
 
-        v2.write_message(&Message::Ping(PingMsg { timestamp: 7 }))
-            .await
-            .unwrap();
+        v2.write_message(&Message::Ping(PingMsg {
+            timestamp: 7,
+            privilege_key: String::new(),
+        }))
+        .await
+        .unwrap();
         let decoded = read_v2_message(&mut a, MAX_MESSAGE_SIZE).await.unwrap();
         assert!(matches!(decoded, Message::Ping(ref p) if p.timestamp == 7));
 
@@ -1445,7 +1465,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_message_with_limit_accepts_small_frame() {
-        let msg = Message::Ping(PingMsg { timestamp: 1 });
+        let msg = Message::Ping(PingMsg {
+            timestamp: 1,
+            privilege_key: String::new(),
+        });
         let mut wire = Vec::new();
         write_message(&mut wire, &msg).await.unwrap();
         let mut buf = std::io::Cursor::new(wire);

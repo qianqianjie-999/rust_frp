@@ -693,6 +693,7 @@ fn test_auth_config_oidc_method() {
             token_endpoint_url: "https://auth.example.com/token".to_string(),
             ..Default::default()
         }),
+        additional_scopes: None,
     };
     assert_eq!(config.method, "oidc");
     assert!(config.oidc.is_some());
@@ -716,6 +717,7 @@ fn test_oidc_auth_manager_creation() {
             token_endpoint_url: "https://auth.example.com/token".to_string(),
             ..Default::default()
         }),
+        additional_scopes: None,
     };
     let result = AuthManager::new(&config);
     assert!(result.is_ok());
@@ -728,6 +730,7 @@ fn test_oidc_auth_manager_missing_config() {
         token: None,
         oidc: None,
         token_source: None,
+        additional_scopes: None,
     };
     let result = AuthManager::new(&config);
     assert!(result.is_err());
