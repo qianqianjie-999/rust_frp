@@ -7,3 +7,10 @@ lto = true
 codegen-units = 1
 strip = true
 opt-level = "z"
+
+# ── 本机磁盘收口（2026-10-05）──────────────────────────────────────
+# 根分区是 228G 的 NVMe，dev 产物曾涨到 40G、把根盘占到 91%。
+# dev 只保留行号表：产物体积可降约 2/3（40G → ~13G），backtrace 仍带
+# file:line；代价是**看不到局部变量的值**（需要时临时改回 debug = 2）。
+[profile.dev]
+debug = "line-tables-only"

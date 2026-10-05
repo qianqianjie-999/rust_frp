@@ -972,6 +972,7 @@ mod tests {
                 hostname: "host-a".to_string(),
                 client_ip: "10.0.0.7".to_string(),
                 wire_protocol: "v1".to_string(),
+                cert_fingerprint: None,
             })
             .await;
     }

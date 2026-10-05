@@ -165,12 +165,37 @@ async fn wss_rejects_wrong_token() {
     .await
     .expect("send login");
 
-    // 认证失败时服务端直接关闭连接（不回 LoginResp），读取应以错误/EOF 结束
-    let result = tokio::time::timeout(Duration::from_secs(5), rust_frp_core::read_message(&mut ws))
+    // 认证失败时服务端**回一条带原因的 LoginResp** 再关闭连接 —— 与原版 frp 一致。
+    // 这样一来客户端能打印 "login verification failed: invalid credentials"，
+    // 而不是只看到 "Login failed: early eof" 把配置错误误判成网络抖动（可诊断性）。
+    let msg = tokio::time::timeout(Duration::from_secs(5), rust_frp_core::read_message(&mut ws))
+        .await
+        .expect("read within timeout")
+        .expect("auth failure must answer with a LoginResp carrying the reason");
+    match msg {
+        Message::LoginResp(resp) => {
+            assert!(!resp.error.is_empty(), "auth failure must carry a reason");
+            assert!(
+                resp.run_id.is_empty(),
+                "a failed login must not hand out a run_id, got {:?}",
+                resp.run_id
+            );
+            // 错误文本不得回显客户端送来的令牌（防日志泄露）
+            assert!(
+                !resp.error.contains("wrong-token"),
+                "error text must not echo the token: {}",
+                resp.error
+            );
+        }
+        other => panic!("expected LoginResp on auth failure, got {other:?}"),
+    }
+
+    // 回完错误响应后连接应立即关闭（读取以错误/EOF 结束）
+    let after = tokio::time::timeout(Duration::from_secs(5), rust_frp_core::read_message(&mut ws))
         .await
         .expect("read within timeout");
     assert!(
-        result.is_err(),
-        "expected connection to be closed on auth failure, got {result:?}"
+        after.is_err(),
+        "connection should be closed after the auth-failure response, got {after:?}"
     );
 }

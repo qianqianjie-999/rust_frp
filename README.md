@@ -83,6 +83,9 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 应用层加密 | ✅ **已实现**：`use_encryption` 对工作连接做 AES-256-GCM 加密（密钥派生自 token，**仅加密不认证**）；代理端启用时访问端须同步启用 | 与 TLS 叠加使用即可；如需认证服务端身份仍须配置 `trusted_ca_file` |
 | Dashboard 凭据 | `web_server.user/password` 必须成对配置且非空，否则服务端拒绝启动；未配置则鉴权关闭并告警 | 用强密码，只监听 `127.0.0.1` 并前置 Nginx 提供 HTTPS |
 | 会话机制 | 随机会话令牌 + 服务端存储 + 8 小时过期 + `HttpOnly; SameSite=Strict` | 反向代理声明 `X-Forwarded-Proto: https` 时会自动附加 `Secure` |
+| 控制口登录节流 | ✅ **已实现**：`auth.login_max_failures`（默认 5）次连续失败后锁定 `auth.login_lockout_secs`（默认 600）秒，按 **`client_id` 为主维度**（动态 IP + NAT 下纯按 IP 会误伤），成功即清零；锁定期内**不做任何密码学运算**直接拒绝；置 `0` 关闭 | 保持默认即可；被爆破时可下调阈值 |
+| `client_id` 退化防护 | `client_id` 为空或等于主机名时不再具备区分度，两台同名主机会被互踢（2026-10-05 线上事故）。`auth.client_id_policy = "warn"`（默认）仅告警；`"reject"` 则**硬拒**此类登录 | **客户端先配好唯一 `client_id`**，再把服务端切到 `reject` |
+| 会话接管判据 | `auth.kick_require_same_cert`：与 mTLS 同用时，把"同 `client_id` 即踢"收紧为"**同证书指纹才允许接管**"——仅拿到 token 无法顶掉合法客户端。任一端无证书指纹（灰度期）自动退回按 `client_id` 判定，不影响断线重连 | mTLS 强制（`require_client_cert = true`）后再打开此项 |
 | 配置文件 | `frpc.toml` / `frps.toml` 已被 `.gitignore` 忽略，仅提供 `*.example.toml` | 不要把含 token/密码的配置提交进版本库 |
 | STCP/XTCP 访问鉴权 | 已实现 `secret_key` 签名校验（fail-closed：代理未配 `secret_key` 时拒绝一切访问请求）；支持跨客户端访问 | 代理与访问者配置一致的强 `secret_key` |
 | 插件认证 | ✅ **已强制**：`http_proxy` 校验 `Proxy-Authorization: Basic`（失败 407），`socks5` 按 RFC 1929 校验 `username`/`password`（失败回 `0x01/0x01`）；凭据一律**常量时间比较**；未配置凭据时为匿名 / 无认证 | 需要访问控制时配置强凭据；`http_proxy` 已同时支持 `CONNECT` 隧道与普通 HTTP 正向代理（目标支持绝对形式 / origin 形式） |
@@ -561,6 +564,28 @@ skipIssuerCheck = false
 # trustedCaFile = "/etc/ssl/idp-ca.pem"      # IdP 使用私有 CA 时
 ```
 
+### 控制口加固（frps.toml 的 `[auth]` 附加项）
+
+```toml
+[auth]
+method = "token"
+token = "CHANGE_ME_RANDOM_LONG_TOKEN"
+
+# 客户端 client_id 为空/等于主机名时的处置："warn"（默认，仅告警）| "reject"（硬拒登录）
+client_id_policy = "warn"
+
+# 登录失败节流：连续失败 N 次后锁定 M 秒（成功即清零）；0 = 关闭
+login_max_failures = 5
+login_lockout_secs = 600
+
+# 会话接管是否要求新旧连接证书指纹一致（需配合 mTLS 的 client_ca_file 使用）
+# kick_require_same_cert = true
+```
+
+> ⚠️ 切 `client_id_policy = "reject"` 前，**务必确认每一台 frpc 都显式配了唯一的 `client_id`**
+> （未配置时客户端会随机生成，通常不会触发；但一旦因热重载等原因退化为空/主机名，就会被拒在门外）。
+> 逃生方式：把该值改回 `"warn"` 并重启服务端。
+
 ---
 
 ## 客户端配置 (frpc.toml)
@@ -579,10 +604,13 @@ token = "your_secure_token"
 [transport]
 protocol = "tcp"
 bandwidth_limit = "10MB"  # 全局带宽限制
-tls = { enable = true, skip_verify = true }  # 自签名环境：显式跳过证书验证（默认 skip_verify = false 时未配 CA 会拒绝启动）
+# 生产推荐：用自建 CA 校验服务端身份（真认证，非仅加密）。
+# ⚠️ 证书 SAN 必须匹配 server_addr —— 用 IP 连接，SAN 里就要有该 IP。
+tls = { enable = true, trusted_ca_file = "/etc/frp/certs/ca.crt" }
 
-# 可选：配置自定义 CA 证书进行验证（防止中间人攻击，生产推荐）
-# tls = { enable = true, trusted_ca_file = "/path/to/ca.crt" }
+# 仅测试/自签名环境才用下面这种：只加密、不认证（启动时打印 WARN）。
+# 默认（无 trusted_ca_file 且未显式 skip_verify）客户端会拒绝启动（fail-closed）。
+# tls = { enable = true, skip_verify = true }
 
 # 可选：用 tokenSource 替代明文 token（与上面 token 互斥）
 # [auth.tokenSource]
@@ -1385,8 +1413,156 @@ process_work_conn          get_work_conn (访客到达时)
   - 配置了 TLS 但既无 `trusted_ca_file` 又未显式 `skip_verify = true` 时，客户端**拒绝启动**
   - 自定义 CA 验证模式（`trusted_ca_file = "/path/to/ca.crt"`）：使用自定义 CA 证书验证服务器证书，可有效防止中间人攻击（生产推荐）
   - 显式跳过模式（`skip_verify = true`）：仅加密、不认证，任何中间人可冒充服务端，仅限测试环境
-  - **安全建议**：公网生产环境配置 `trusted_ca_file` 使用自签名证书验证
+  - **安全建议**：公网生产环境在服务端配 `cert_file`/`key_file` 使用自建证书，
+    客户端配 `trusted_ca_file` 校验；证书 SAN 必须包含客户端连接用的地址
+  - **现状（2026-10-05 已完成收口）**：线上服务端使用自建 CA 签发的证书
+    （SAN 含 `IP:123.57.86.80`），客户端以 `trusted_ca_file` 校验、**已移除 `skip_verify`** ——
+    由"只加密"升级为"真认证（CA 验签 + SAN 匹配 server_addr）"。详见下方「生产 TLS 证书」。
+- **mTLS / 双向证书认证**（2026-10-05 支持）：服务端配 `client_ca_file` 即校验客户端证书，
+  把"客户端身份"从共享 token 升级为证书私钥 —— token 再次泄露，没有客户端私钥也连不上。
+  客户端用 `cert_file`/`key_file` 出示自己的证书。⚠️ 两条硬约束：服务端侧的链校验**不可跳过**
+  （`require_client_cert = false` 只表示"未出示也放行"，不是"不校验"）；客户端证书与
+  `skip_verify = true` **互斥**（配置校验直接拒绝）。详见下方「mTLS（双向证书认证）」。
 - **Token 认证**：所有连接必须通过 token 验证，即使绕过 TLS 证书验证，攻击者也无法通过认证
+
+---
+
+## 生产 TLS 证书
+
+线上已于 **2026-10-05** 完成 TLS 收口：服务端换用自建 CA 签发的证书，客户端改用
+`trusted_ca_file` 校验并移除 `skip_verify`。
+
+### 证书
+
+```
+subject   = CN=rust_frp-server, O=rust_frp
+issuer    = CN=rust_frp Internal CA, O=rust_frp
+notBefore = 2026-10-04 06:36:46 GMT（回拨 1 天，防目标机时钟偏差）
+notAfter  = 2036-10-02 06:36:46 GMT（10 年）
+SAN       = IP:123.57.86.80, IP:127.0.0.1, DNS:localhost, DNS:frp-server.local
+sha256    = 5A:87:36:95:D2:B0:9A:A8:BD:FE:81:0C:C0:5E:4D:76:3F:22:6F:24:A6:DC:4C:F5:BE:FC:BC:9D:5D:BF:9D:6E
+```
+
+> **SAN 必须匹配 `server_addr`**。客户端用 `connect_tls(&config.server_addr)` 连接，
+> `server_addr` 是 IP 字面量时 rustls 按 IP 校验 —— 链能验通但名字不匹配一样会失败：
+> `certificate not valid for name "127.0.0.2"; certificate is only valid for IpAddress(...)`。
+> 这也是**运行时自签证书无法被 `trusted_ca_file` 固定**的原因（它每次重启重生成、
+> SAN 只有 `frp-server.local`/`localhost`）。
+
+### 线上落位
+
+| 目标 | 路径 | 文件 |
+|---|---|---|
+| 服务端 `123.57.86.80` | `/opt/rust_frp/certs/` | `server.crt`(644) `server.key`(600, root) |
+| 客户端 `192.168.31.32` | `/opt/rust_frp/certs/` | `ca.crt`(644) |
+
+CA 私钥 `ca.key` **不下发**，只保留在本地 `/home/qianqianjie/.rust_frp-certs/`（仓库外，
+避免误提交到 GitHub）。该目录含生成脚本 `gen-certs.sh` 与轮换说明。
+
+服务端配置：
+
+```toml
+[transport.tls]
+enable = true
+cert_file = "/opt/rust_frp/certs/server.crt"
+key_file  = "/opt/rust_frp/certs/server.key"
+```
+
+客户端配置：
+
+```toml
+[transport.tls]
+enable = true
+trusted_ca_file = "/opt/rust_frp/certs/ca.crt"
+```
+
+### 轮换
+
+```bash
+cd /home/qianqianjie/.rust_frp-certs && SERVER_IP=123.57.86.80 ./gen-certs.sh
+```
+
+重新生成会换新 CA ⇒ 客户端 `ca.crt` 必须同步更新。
+**升级顺序**：先服务端（换证书，旧客户端因 `skip_verify` 不受影响）→ 再客户端（切 CA）。
+
+---
+
+## mTLS（双向证书认证）
+
+**定位**：把"客户端 = 持有 token 的人"改成"客户端 = 持有指定私钥的人"。
+即便 token 再次泄露，攻击者没有客户端私钥在 TLS 握手阶段就会被拒。
+
+### 两个方向（互不相同，都不可省）
+
+| 方向 | 校验对象 | 配置项 |
+|---|---|---|
+| 客户端 → 服务端 | 服务端证书链 + SAN | 客户端 `trusted_ca_file`（或 `skip_verify`） |
+| **服务端 → 客户端** | 客户端证书链 | 服务端 **`client_ca_file`** |
+
+> ⚠️ **服务端侧的链校验不可跳过**：一旦配 `client_ca_file` 即严格验链，没有"只查有无证书"
+> 的开关（那样的 mTLS 比 token 认证更弱）。`require_client_cert` 只决定"**未出示**是否放行"。
+> ⚠️ **客户端证书与 `skip_verify = true` 互斥**：同时配置会被配置校验直接拒绝 ——
+> 不校验服务端却出示证书，等于把身份递给可能冒充服务端的中间人。
+
+### 配置
+
+服务端：
+
+```toml
+[transport.tls]
+enable = true
+cert_file = "/opt/rust_frp/certs/server.crt"
+key_file  = "/opt/rust_frp/certs/server.key"
+client_ca_file = "/opt/rust_frp/certs/ca.crt"
+require_client_cert = false   # 灰度期；铺开后改 true
+```
+
+客户端（`cert_file`/`key_file` 在客户端即表示**客户端证书**，每机一张）：
+
+```toml
+[transport.tls]
+enable = true
+trusted_ca_file = "/opt/rust_frp/certs/ca.crt"
+cert_file = "/opt/rust_frp/certs/client-<主机>.crt"
+key_file  = "/opt/rust_frp/certs/client-<主机>.key"
+```
+
+签发客户端证书（脚本已内建，`EKU = clientAuth`，无 SAN）：
+
+```bash
+cd /home/qianqianjie/.rust_frp-certs
+CLIENTS="cli32 cli75" SERVER_IP=123.57.86.80 ./gen-certs.sh
+```
+
+### 三阶段灰度（可随时回滚）
+
+```
+Phase 1  服务端只加 client_ca_file，require_client_cert = false
+         → 未出示也放行，但日志会记录 mTLS 已启用；观察 3~7 天
+Phase 2  下发客户端证书到各客户端（每机唯一），重启客户端
+Phase 3  require_client_cert = true → 此后无证书者握手即失败
+```
+
+回滚：把 `require_client_cert` 置回 `false` 并重启服务端（约 3 秒中断）。
+⚠️ 若某台机器的**唯一运维入口就是它自己的 frpc 代理**，下发证书必须走
+"预置配置 + `systemd-run --on-active=N` 定时重启"，否则会自断通道。
+
+### 覆盖矩阵
+
+| 传输 | mTLS 是否生效 |
+|---|---|
+| `tcp` / `websocket` / `wss` | ✅ |
+| `quic` | ✅（在 `quic.rs` 单独接线，勿漏） |
+| `kcp` | ❌ 明文 UDP，不受保护（线上未用） |
+
+### 回归测试
+
+`rust_frp_net/tests/mtls.rs`（9 例，自签证书 + 真实握手）：正例、必须失败的负例
+（无证书 / 别家 CA / EKU 为 serverAuth）、`require = false` 的灰度语义，
+以及 QUIC 路径的正负例。
+
+> ⚠️ **`ca.key` 是 mTLS 之后的最高价值资产**（拿到即可签发任意客户端证书，
+> mTLS 归零）。必须离线备份到密码管理器，绝不下发。
 
 ---
 

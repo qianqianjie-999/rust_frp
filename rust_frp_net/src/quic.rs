@@ -122,17 +122,19 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, NetError> {
 ///
 /// - 提供 `cert_file` + `key_file` 时使用自定义证书；
 /// - 否则使用**运行时生成**的自签证书（仅加密，不认证身份）。
+/// - `client_ca_file` 非空即启用 **mTLS**（校验客户端证书链）；
+///   `require_client_cert` 决定"未出示证书是否放行"（`false` = 灰度期放行）。
 pub fn build_server_config(
     cert_file: Option<&str>,
     key_file: Option<&str>,
+    client_ca_file: Option<&str>,
+    require_client_cert: bool,
     opts: &QuicOptions,
 ) -> Result<quinn::ServerConfig, NetError> {
     crate::ensure_crypto_provider();
-    let mut rustls_cfg = match (cert_file, key_file) {
-        (Some(c), Some(k)) => rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(load_certs(c)?, load_key(k)?)
-            .map_err(|e| NetError::Other(format!("QUIC server cert rejected: {e}")))?,
+    // 先备好"服务端证书 + 私钥"（自定义或运行时自签），再决定是否要求客户端证书
+    let (cert_chain, key_der) = match (cert_file, key_file) {
+        (Some(c), Some(k)) => (load_certs(c)?, load_key(k)?),
         _ => {
             log::warn!(
                 "QUIC is using a RUNTIME-GENERATED self-signed certificate: \
@@ -146,12 +148,29 @@ pub fn build_server_config(
             .map_err(|e| NetError::Other(format!("generate self-signed certificate: {e}")))?;
             let cert_der = cert.cert.der().to_owned();
             let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-            rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![cert_der], key_der.into())
-                .map_err(|e| NetError::Other(format!("QUIC self-signed cert rejected: {e}")))?
+            (vec![cert_der], PrivateKeyDer::from(key_der))
         }
     };
+
+    let builder = rustls::ServerConfig::builder();
+    let builder = match client_ca_file {
+        Some(ca) => {
+            log::info!(
+                "mTLS enabled (QUIC server side): verifying client certificates against {} \
+                 (require_client_cert = {})",
+                ca,
+                require_client_cert
+            );
+            builder.with_client_cert_verifier(crate::build_client_cert_verifier(
+                ca,
+                require_client_cert,
+            )?)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut rustls_cfg = builder
+        .with_single_cert(cert_chain, key_der)
+        .map_err(|e| NetError::Other(format!("QUIC server cert rejected: {e}")))?;
     rustls_cfg.alpn_protocols = vec![QUIC_ALPN.to_vec()];
 
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
@@ -164,13 +183,26 @@ pub fn build_server_config(
 /// 构造 QUIC 客户端配置
 ///
 /// - 提供 `ca_file`：用该 CA 校验服务端证书（认证）；
-/// - `insecure = true`：跳过证书校验（仅加密，**不认证**，慎用）。
+/// - `insecure = true`：跳过证书校验（仅加密，**不认证**，慎用）；
+/// - `client_cert = Some((cert, key))`：出示客户端证书（mTLS）。**必须与 `ca_file` 同用** ——
+///   不校验服务端却出示证书，等于把身份递给可能冒充服务端的中间人。
 pub fn build_client_config(
     ca_file: Option<&str>,
     insecure: bool,
+    client_cert: Option<(&str, &str)>,
     opts: &QuicOptions,
 ) -> Result<quinn::ClientConfig, NetError> {
     crate::ensure_crypto_provider();
+    if let Some(_cert) = client_cert {
+        if insecure || ca_file.is_none() {
+            return Err(NetError::Other(
+                "QUIC client certificate (mTLS) requires trusted_ca_file and cannot be combined \
+                 with skip_verify = true: without verifying the server, an impostor could collect \
+                 the client certificate"
+                    .into(),
+            ));
+        }
+    }
     let mut rustls_cfg = if let Some(ca) = ca_file {
         let mut roots = rustls::RootCertStore::empty();
         for cert in load_certs(ca)? {
@@ -178,9 +210,18 @@ pub fn build_client_config(
                 .add(cert)
                 .map_err(|e| NetError::Other(format!("QUIC trusted CA rejected: {e}")))?;
         }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(Arc::new(roots))
-            .with_no_client_auth()
+        let builder = rustls::ClientConfig::builder().with_root_certificates(Arc::new(roots));
+        match client_cert {
+            Some((cert_file, key_file)) => {
+                log::info!(
+                    "mTLS enabled (QUIC client side): presenting a client certificate to the server"
+                );
+                builder
+                    .with_client_auth_cert(load_certs(cert_file)?, load_key(key_file)?)
+                    .map_err(|e| NetError::Other(format!("QUIC client cert rejected: {e}")))?
+            }
+            None => builder.with_no_client_auth(),
+        }
     } else if insecure {
         log::warn!(
             "QUIC client configured with certificate verification DISABLED: \
@@ -451,12 +492,13 @@ mod tests {
 
     #[tokio::test]
     async fn quic_stream_roundtrip_echo() {
-        let server_cfg = build_server_config(None, None, &opts()).expect("server config");
+        let server_cfg =
+            build_server_config(None, None, None, false, &opts()).expect("server config");
         let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = spawn_echo(listener, 11).await;
 
-        let client_cfg = build_client_config(None, true, &opts()).expect("client config");
+        let client_cfg = build_client_config(None, true, None, &opts()).expect("client config");
         let session = QuicSession::connect(addr, "localhost", client_cfg)
             .await
             .expect("connect");
@@ -471,7 +513,8 @@ mod tests {
 
     #[tokio::test]
     async fn quic_multiple_streams_are_independent() {
-        let server_cfg = build_server_config(None, None, &opts()).expect("server config");
+        let server_cfg =
+            build_server_config(None, None, None, false, &opts()).expect("server config");
         let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -494,7 +537,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
         });
 
-        let client_cfg = build_client_config(None, true, &opts()).expect("client config");
+        let client_cfg = build_client_config(None, true, None, &opts()).expect("client config");
         let session = Arc::new(
             QuicSession::connect(addr, "localhost", client_cfg)
                 .await
@@ -520,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn quic_rejects_unverified_client_without_ca() {
         // 未提供 CA 且未显式 insecure → 拒绝构造客户端配置（fail-closed）
-        let err = build_client_config(None, false, &opts()).err();
+        let err = build_client_config(None, false, None, &opts()).err();
         assert!(err.is_some());
     }
 
@@ -528,12 +571,13 @@ mod tests {
     async fn quic_large_payload_flows_across_stream() {
         // 1 MiB 载荷，验证流控下不丢字节
         const N: usize = 1024 * 1024;
-        let server_cfg = build_server_config(None, None, &opts()).expect("server config");
+        let server_cfg =
+            build_server_config(None, None, None, false, &opts()).expect("server config");
         let listener = QuicListener::bind("127.0.0.1:0".parse().unwrap(), server_cfg).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = spawn_echo(listener, N).await;
 
-        let client_cfg = build_client_config(None, true, &opts()).expect("client config");
+        let client_cfg = build_client_config(None, true, None, &opts()).expect("client config");
         let session = QuicSession::connect(addr, "localhost", client_cfg)
             .await
             .expect("connect");

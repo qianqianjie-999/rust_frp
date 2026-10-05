@@ -9,7 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn runtime_cert_supports_tls_handshake() {
-    let server_tls = TlsConfig::new_server_with_runtime_cert().expect("runtime cert generated");
+    let server_tls =
+        TlsConfig::new_server_with_runtime_cert(None, false).expect("runtime cert generated");
     let client_tls = TlsConfig::new_client_insecure().expect("client tls config");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -41,6 +42,6 @@ async fn runtime_cert_supports_tls_handshake() {
 #[test]
 fn runtime_cert_generation_succeeds_repeatedly() {
     // 两次生成都不应失败（此前内置证书方案是编译期固定 PEM，无法体现该性质）
-    let _a = TlsConfig::new_server_with_runtime_cert().expect("first generation");
-    let _b = TlsConfig::new_server_with_runtime_cert().expect("second generation");
+    let _a = TlsConfig::new_server_with_runtime_cert(None, false).expect("first generation");
+    let _b = TlsConfig::new_server_with_runtime_cert(None, false).expect("second generation");
 }

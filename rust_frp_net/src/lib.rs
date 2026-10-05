@@ -41,8 +41,11 @@ use tokio_rustls::rustls::pki_types::UnixTime;
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
 };
+use tokio_rustls::rustls::server::danger::ClientCertVerifier;
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::DigitallySignedStruct;
 use tokio_rustls::rustls::Error as TlsError;
+use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::SignatureScheme;
 use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -597,23 +600,107 @@ pub fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// 读取 PEM 证书链（文件可含多个证书）
+fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, NetError> {
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| NetError::PemDecode(e.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| NetError::PemDecode(e.to_string()))
+}
+
+/// 读取 PEM 私钥（`from_pem` 自动识别 PKCS8 / RSA(PKCS1) / SEC1）
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, NetError> {
+    PrivateKeyDer::from_pem_file(path).map_err(|e| NetError::PemDecode(e.to_string()))
+}
+
+/// 构造"校验客户端证书"的 verifier（mTLS 的**服务端侧**）
+///
+/// - `require = true`：客户端必须出示证书且链校验通过，否则握手失败
+/// - `require = false`：**出示则校验、未出示也放行**（灰度期过渡语义）
+///
+/// ⚠️ 这里不存在"只查有没有证书、不验链"的档位 —— 那会让任意自签证书通过，
+/// 比 token 认证更弱，还会给出"已启用 mTLS"的错觉。`require = false` 只放宽
+/// "是否允许不出示"，**不**放宽"链是否可信"。
+/// 计算证书 DER 的 SHA-256 指纹（小写 hex）。
+///
+/// 用于 mTLS 场景下把"客户端身份"从可被冒用的 `client_id` 收敛到**只有私钥持有者
+/// 才能产生**的证书指纹（会话接管判据，见服务端 `kick_same_client`）。
+pub fn cert_fingerprint_sha256(der: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, der);
+    let mut out = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        // write! 到 String 不会失败
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// 取出 TLS 对端（客户端）证书的 SHA-256 指纹。
+///
+/// 返回 `None` 表示对端未出示证书 —— 可能是未启用 mTLS，或 `require_client_cert = false`
+/// 灰度期客户端没带证书。**不要**把 `None` 当作认证失败：认证由 TLS 握手负责
+/// （启用 mTLS 且要求证书时，握手阶段就会失败），这里只服务于"会话接管判据"。
+pub fn peer_cert_fingerprint<S>(stream: &tokio_rustls::server::TlsStream<S>) -> Option<String> {
+    stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|der| cert_fingerprint_sha256(der.as_ref()))
+}
+
+fn build_client_cert_verifier(
+    ca_file: &str,
+    require: bool,
+) -> Result<Arc<dyn ClientCertVerifier>, NetError> {
+    let mut roots = RootCertStore::empty();
+    for cert in load_cert_chain(ca_file)? {
+        roots.add(cert).map_err(NetError::Tls)?;
+    }
+    let builder = WebPkiClientVerifier::builder(Arc::new(roots));
+    let builder = if require {
+        builder
+    } else {
+        builder.allow_unauthenticated()
+    };
+    builder
+        .build()
+        .map_err(|e| NetError::Other(format!("client CA verifier: {e}")))
+}
+
 impl TlsConfig {
     /// 从文件创建服务器 TLS 配置
-    pub fn new_server(cert_file: &str, key_file: &str) -> Result<Self, NetError> {
+    ///
+    /// `client_ca_file` 非空即启用 **mTLS**：服务端用该 CA 校验客户端证书链。
+    /// `require_client_cert` 决定"未出示证书是否放行"（`false` = 灰度期放行）。
+    pub fn new_server(
+        cert_file: &str,
+        key_file: &str,
+        client_ca_file: Option<&str>,
+        require_client_cert: bool,
+    ) -> Result<Self, NetError> {
         ensure_crypto_provider();
-        let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert_file)
-            .map_err(|e| NetError::PemDecode(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| NetError::PemDecode(e.to_string()))?;
+        let cert_chain: Vec<CertificateDer<'static>> = load_cert_chain(cert_file)?;
+        let key = load_private_key(key_file)?;
 
-        // from_pem 自动识别 PKCS8 / RSA(PKCS1) / SEC1，取文件中第一段私钥，
-        // 与旧实现「先 pkcs8 后 rsa 兜底」语义一致
-        let key = PrivateKeyDer::from_pem_file(key_file)
-            .map_err(|e| NetError::PemDecode(e.to_string()))?;
-
-        let config = tokio_rustls::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)?;
+        // 配了 client_ca_file 即走"服务端校验客户端证书"的构建分支；require_client_cert
+        // 只决定"未出示证书是否放行"（false = 灰度期放行），不改变链校验的严格性。
+        let builder = tokio_rustls::rustls::ServerConfig::builder();
+        let builder = match client_ca_file {
+            Some(ca) => {
+                log::info!(
+                    "mTLS enabled (server side): verifying client certificates against {} \
+                     (require_client_cert = {})",
+                    ca,
+                    require_client_cert
+                );
+                builder
+                    .with_client_cert_verifier(build_client_cert_verifier(ca, require_client_cert)?)
+            }
+            None => builder.with_no_client_auth(),
+        };
+        let config = builder.with_single_cert(cert_chain, key)?;
 
         Ok(Self {
             server_config: Some(Arc::new(config)),
@@ -624,12 +711,9 @@ impl TlsConfig {
     /// 创建客户端 TLS 配置，信任自定义 CA 证书文件
     pub fn new_client_with_ca_file(ca_file: &str) -> Result<Self, NetError> {
         ensure_crypto_provider();
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(ca_file)
-            .map_err(|e| NetError::PemDecode(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| NetError::PemDecode(e.to_string()))?;
+        let certs: Vec<CertificateDer<'static>> = load_cert_chain(ca_file)?;
 
-        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        let mut root_store = RootCertStore::empty();
         for cert in certs {
             root_store.add(cert).map_err(NetError::Tls)?;
         }
@@ -637,6 +721,35 @@ impl TlsConfig {
         let config = tokio_rustls::rustls::ClientConfig::builder()
             .with_root_certificates(Arc::new(root_store))
             .with_no_client_auth();
+
+        Ok(Self {
+            server_config: None,
+            client_config: Some(Arc::new(config)),
+        })
+    }
+
+    /// 创建客户端 TLS 配置：信任指定 CA，**并出示客户端证书**（mTLS 的客户端侧）
+    ///
+    /// 两个方向在此同时成立：`ca_file` 用于校验服务端身份，`cert_file`/`key_file`
+    /// 用于向服务端证明自己的身份。二者缺一即退化为单向认证（甚至无认证）。
+    pub fn new_client_with_ca_and_cert(
+        ca_file: &str,
+        cert_file: &str,
+        key_file: &str,
+    ) -> Result<Self, NetError> {
+        ensure_crypto_provider();
+        let mut root_store = RootCertStore::empty();
+        for cert in load_cert_chain(ca_file)? {
+            root_store.add(cert).map_err(NetError::Tls)?;
+        }
+        let cert_chain = load_cert_chain(cert_file)?;
+        let key = load_private_key(key_file)?;
+
+        let config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(Arc::new(root_store))
+            .with_client_auth_cert(cert_chain, key)?;
+
+        log::info!("mTLS enabled (client side): presenting a client certificate to the server");
 
         Ok(Self {
             server_config: None,
@@ -695,7 +808,10 @@ impl TlsConfig {
     /// - 但仍是自签名证书，客户端默认不验证时仅提供加密不提供认证；
     ///   需要认证请配置 `transport.tls.cert_file` / `key_file`（服务端）
     ///   与 `transport.tls.trusted_ca_file`（客户端）
-    pub fn new_server_with_runtime_cert() -> Result<Self, NetError> {
+    pub fn new_server_with_runtime_cert(
+        client_ca_file: Option<&str>,
+        require_client_cert: bool,
+    ) -> Result<Self, NetError> {
         ensure_crypto_provider();
         log::warn!(
             "Using a RUNTIME-GENERATED self-signed TLS certificate (fresh per process): \
@@ -714,9 +830,20 @@ impl TlsConfig {
         let cert_der = cert.cert.der().to_owned();
         let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
 
-        let config = tokio_rustls::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der.into())?;
+        let builder = tokio_rustls::rustls::ServerConfig::builder();
+        let builder = match client_ca_file {
+            Some(ca) => {
+                log::warn!(
+                    "mTLS is enabled while the server still uses its RUNTIME self-signed certificate: \
+                     client certificates ARE verified, but clients cannot pin the server identity. \
+                     Configure transport.tls.cert_file/key_file for full mutual authentication."
+                );
+                builder
+                    .with_client_cert_verifier(build_client_cert_verifier(ca, require_client_cert)?)
+            }
+            None => builder.with_no_client_auth(),
+        };
+        let config = builder.with_single_cert(vec![cert_der], key_der.into())?;
 
         Ok(Self {
             server_config: Some(Arc::new(config)),

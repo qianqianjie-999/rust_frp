@@ -372,6 +372,13 @@ pub struct ClientConfig {
     pub user: Option<String>,
 
     /// 客户端 ID（可选，用于多客户端场景）
+    ///
+    /// # 说明
+    ///
+    /// - 未设置时客户端进程会**随机生成**一个，并在整个进程生命周期（含配置热重载）
+    ///   内保持不变；**不会**退化为主机名
+    /// - 同一 `client_id` 的新登录会被服务端判定为"同一客户端重连"，踢掉旧会话并等其
+    ///   释放端口 —— 因此多台主机部署时应显式配置**互不相同**的 `client_id`
     #[serde(alias = "clientID")]
     pub client_id: Option<String>,
 
@@ -591,6 +598,19 @@ impl ClientConfig {
     }
 }
 
+/// 服务端对 `client_id` 退化形态（为空 / 等于主机名）的处置策略
+///
+/// 见 [`AuthConfig::client_id_policy`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIdPolicy {
+    /// 仅 WARN 放行（默认）：兼容旧客户端，先观察一个版本
+    #[default]
+    Warn,
+    /// 硬拒登录（fail-closed）：从根上消除同名主机的"自伤互踢"
+    Reject,
+}
+
 /// 认证配置 - 定义客户端认证方式
 ///
 /// # 认证方法
@@ -621,6 +641,37 @@ pub struct AuthConfig {
     #[serde(alias = "additionalScopes")]
     pub additional_scopes: Option<Vec<String>>,
 
+    /// 服务端对 `client_id` 退化形态的处置策略（`warn` / `reject`）
+    ///
+    /// 客户端未配 `client_id` 时本应随机生成；一旦退化为**主机名**或**空**，
+    /// 两台同名主机就会被 `kick_same_client` 判为同一客户端而无限互踢
+    /// （2026-10-05 线上事故，全线端口掉线约 3 分钟）。
+    ///
+    /// - `warn`（默认）：只打 WARN 放行 —— 兼容旧客户端，先观察一个版本；
+    /// - `reject`：硬拒登录，从根上消除"自伤互踢"。
+    #[serde(alias = "clientIdPolicy")]
+    pub client_id_policy: ClientIdPolicy,
+
+    /// 控制口登录失败节流：同一 `client_id` 连续失败多少次后锁定。`0` = 关闭节流。
+    ///
+    /// 以 `client_id` 为主维度（线上两台均为动态 IP + NAT，纯按 IP 会误伤）。
+    /// 登录成功即清零。
+    #[serde(alias = "loginMaxFailures")]
+    pub login_max_failures: u32,
+
+    /// 登录失败锁定时长（秒）。仅在 `login_max_failures > 0` 时生效。
+    #[serde(alias = "loginLockoutSecs")]
+    pub login_lockout_secs: u64,
+
+    /// 会话接管（kick）是否要求新旧连接**证书指纹一致**。
+    ///
+    /// 仅在与 mTLS 同用时才有意义：`true` 时，若新旧两端**都有**证书指纹，
+    /// 则只有指纹相同才允许接管（攻击者拿到 token + 猜到 client_id 也踢不掉合法客户端）；
+    /// 任一端无指纹（灰度期客户端未出示证书）则退回旧的按 `client_id` 判定，
+    /// 以保证断线重连仍能正常释放端口。
+    #[serde(alias = "kickRequireSameCert")]
+    pub kick_require_same_cert: bool,
+
     /// OIDC 配置（当 method = "oidc" 时使用）
     pub oidc: Option<OidcConfig>,
 }
@@ -632,6 +683,11 @@ impl Default for AuthConfig {
             token: None,
             token_source: None,
             additional_scopes: None,
+            client_id_policy: ClientIdPolicy::Warn,
+            // 默认开启节流但阈值宽松（正常客户端不会连续 5 次登录失败）；置 0 可完全关闭。
+            login_max_failures: 5,
+            login_lockout_secs: 600,
+            kick_require_same_cert: false,
             oidc: None,
         }
     }
@@ -909,11 +965,17 @@ pub struct TlsConfig {
     /// **true** - TLS 默认启用
     pub enable: bool,
 
-    /// TLS 证书文件路径（服务器用）
+    /// TLS 证书文件路径
+    ///
+    /// - **服务器**：服务端叶证书
+    /// - **客户端**：客户端证书（mTLS 时出示给服务端校验；须与 `key_file` 成对）
     #[serde(alias = "certFile")]
     pub cert_file: Option<String>,
 
-    /// TLS 私钥文件路径（服务器用）
+    /// TLS 私钥文件路径
+    ///
+    /// - **服务器**：服务端证书私钥
+    /// - **客户端**：客户端证书私钥（须与 `cert_file` 成对）
     #[serde(alias = "keyFile")]
     pub key_file: Option<String>,
 
@@ -933,6 +995,30 @@ pub struct TlsConfig {
     #[serde(alias = "skipVerify")]
     pub skip_verify: bool,
 
+    /// 用于校验**客户端证书**的 CA 文件（服务器用）—— 配置后即启用 mTLS
+    ///
+    /// 服务端在握手阶段用该 CA 校验客户端证书链。两个方向互不相同：
+    /// 本项管"服务端验客户端"，`trusted_ca_file` 管"客户端验服务端"。
+    ///
+    /// ⚠️ **本项不可跳过**：一旦配置，证书链校验即强制生效，不存在"只看有没有证书、
+    /// 不验链"的开关 —— 那样的 mTLS 比 token 认证更弱。
+    ///
+    /// 灰度语义由 `require_client_cert` 决定：`false`（默认）时"出示则校验、未出示放行"，
+    /// 便于先铺客户端证书；`true` 时未出示者握手即失败。
+    #[serde(alias = "clientCaFile")]
+    pub client_ca_file: Option<String>,
+
+    /// 是否强制要求客户端出示证书（服务器用）
+    ///
+    /// 仅在配置了 `client_ca_file` 时有意义。`false` 仅表示"未出示也放行"这一**过渡**
+    /// 语义（灰度铺开用），**不是**"跳过校验"；一旦客户端出示证书，仍严格校验链。
+    ///
+    /// # 默认值
+    ///
+    /// **false**
+    #[serde(alias = "requireClientCert")]
+    pub require_client_cert: bool,
+
     /// 强制使用 TLS（即使协议不支持 TLS）
     pub force: bool,
 }
@@ -945,6 +1031,8 @@ impl Default for TlsConfig {
             key_file: None,
             trusted_ca_file: None,
             skip_verify: false,
+            client_ca_file: None,
+            require_client_cert: false,
             force: false,
         }
     }
@@ -1862,6 +1950,65 @@ impl ConfigLoader {
         Ok(())
     }
 
+    /// 校验登录节流配置：开了节流就必须给出锁定时长，避免"锁 0 秒"这种歧义配置。
+    ///
+    /// `login_max_failures = 0` 表示**显式关闭**节流；一旦大于 0，
+    /// `login_lockout_secs` 必须为正 —— 否则会被理解为"立刻解锁"，等于没节流。
+    fn validate_auth_throttle(auth: &AuthConfig) -> Result<(), Box<dyn std::error::Error>> {
+        if auth.login_max_failures > 0 && auth.login_lockout_secs == 0 {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "auth.login_max_failures > 0 requires auth.login_lockout_secs > 0 \
+                 (a zero lockout window would make the throttle a no-op)",
+            )));
+        }
+        Ok(())
+    }
+
+    /// 校验服务端 mTLS 配置：要"强制"客户端证书，必须先有可校验它的 CA。
+    ///
+    /// 这条校验的意义：`require_client_cert = true` 而无 `client_ca_file` 是**无意义**的
+    /// 组合（无法校验就不存在可强制的对象），若静默放行会给人"已启用 mTLS"的错觉。
+    fn validate_tls_server_mtls(tls: &Option<TlsConfig>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(tls) = tls else { return Ok(()) };
+        if tls.require_client_cert && tls.client_ca_file.as_deref().unwrap_or("").is_empty() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "transport.tls.require_client_cert = true requires transport.tls.client_ca_file \
+                 (client certificates cannot be enforced without a CA to verify them)",
+            )));
+        }
+        Ok(())
+    }
+
+    /// 校验客户端 mTLS 配置：`cert_file`/`key_file` 必须成对，且不得与 `skip_verify` 同现。
+    ///
+    /// 两条规则都指向同一件事 —— 别让"以为开了 mTLS"落空：
+    /// - 只配一半（有证书无私钥）无法出示证书，握手必失败，应尽早报错；
+    /// - `skip_verify = true` 表示"不校验服务端身份"，与 mTLS 同时使用会留下**假服务端
+    ///   钓鱼**的口子（客户端会照样向冒充者出示证书），因此直接拒绝（设计稿 D7）。
+    fn validate_tls_client_mtls(tls: &Option<TlsConfig>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(tls) = tls else { return Ok(()) };
+        let (cert, key) = (tls.cert_file.as_deref(), tls.key_file.as_deref());
+        if cert.is_some() != key.is_some() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "transport.tls.cert_file and transport.tls.key_file must be configured together \
+                 (they carry the client certificate presented for mTLS)",
+            )));
+        }
+        if cert.is_some() && tls.skip_verify {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "transport.tls.skip_verify = true cannot be combined with a client certificate \
+                 (cert_file/key_file): skipping server verification would let an impostor server \
+                 collect the client certificate. Remove skip_verify and set trusted_ca_file to \
+                 pin the server CA instead.",
+            )));
+        }
+        Ok(())
+    }
+
     /// 验证服务器配置
     ///
     /// # 必填字段
@@ -1874,6 +2021,9 @@ impl ConfigLoader {
                 "bind_port is required",
             )));
         }
+
+        Self::validate_tls_server_mtls(&config.transport.tls)?;
+        Self::validate_auth_throttle(&config.auth)?;
 
         // Web 管理端凭据必须成对配置：只填一半会导致鉴权被静默关闭，
         // dashboard 直接对全网暴露，因此这里直接拒绝启动。
@@ -2145,6 +2295,8 @@ impl ConfigLoader {
                 "server_port is required",
             )));
         }
+
+        Self::validate_tls_client_mtls(&config.transport.tls)?;
 
         // 带宽限制：非法值直接报错，而不是运行期被静默丢弃
         if let Some(limit) = &config.transport.bandwidth_limit {
@@ -3617,5 +3769,208 @@ client_secret = "s"
                 .expect_err("heartBeats scope with oidc must be rejected");
             assert!(err.to_string().contains("heartBeats"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod mtls_config_tests {
+    use super::*;
+
+    fn parse_server(toml: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+        let cfg = ConfigLoader::parse_config::<ServerConfig>(toml, ConfigKind::Server, false)?;
+        ConfigLoader::validate_server_config(&cfg)?;
+        Ok(cfg)
+    }
+
+    fn parse_client(toml: &str) -> Result<ClientConfig, Box<dyn std::error::Error>> {
+        let cfg = ConfigLoader::parse_config::<ClientConfig>(toml, ConfigKind::Client, false)?;
+        ConfigLoader::validate_client_config(&cfg)?;
+        Ok(cfg)
+    }
+
+    fn server_toml(tls: &str) -> String {
+        format!(
+            "bind_port = 9300\n\n[auth]\nmethod = \"token\"\ntoken = \"t\"\n\n[transport.tls]\nenable = true\n{tls}\n"
+        )
+    }
+
+    fn client_toml(tls: &str) -> String {
+        format!(
+            "server_addr = \"127.0.0.1\"\nserver_port = 9300\n\n[auth]\nmethod = \"token\"\ntoken = \"t\"\n\n[transport.tls]\nenable = true\n{tls}\n"
+        )
+    }
+
+    #[test]
+    fn mtls_defaults_are_off() {
+        let tls = TlsConfig::default();
+        assert!(tls.client_ca_file.is_none());
+        assert!(!tls.require_client_cert);
+        assert!(!tls.skip_verify);
+    }
+
+    #[test]
+    fn server_require_client_cert_without_ca_is_rejected() {
+        let toml = server_toml("require_client_cert = true");
+        let err = parse_server(&toml).expect_err("require without client_ca_file must be rejected");
+        assert!(
+            err.to_string().contains("client_ca_file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn server_mtls_accepts_camel_case_aliases() {
+        let toml = server_toml(
+            "certFile = \"/tmp/s.crt\"\nkeyFile = \"/tmp/s.key\"\nclientCaFile = \"/tmp/ca.crt\"\nrequireClientCert = true",
+        );
+        let cfg = parse_server(&toml).expect("camelCase aliases must be accepted");
+        let tls = cfg.transport.tls.expect("tls section");
+        assert_eq!(tls.client_ca_file.as_deref(), Some("/tmp/ca.crt"));
+        assert!(tls.require_client_cert);
+    }
+
+    #[test]
+    fn server_mtls_snake_case_roundtrip() {
+        let toml = server_toml("client_ca_file = \"/tmp/ca.crt\"");
+        let cfg = parse_server(&toml).expect("valid");
+        let tls = cfg.transport.tls.expect("tls section");
+        assert_eq!(tls.client_ca_file.as_deref(), Some("/tmp/ca.crt"));
+        // 只配 CA 不强制 => 灰度语义，必须放行
+        assert!(!tls.require_client_cert);
+    }
+
+    #[test]
+    fn client_cert_without_key_is_rejected() {
+        let toml = client_toml("cert_file = \"/tmp/c.crt\"");
+        let err = parse_client(&toml).expect_err("cert without key must be rejected");
+        assert!(err.to_string().contains("key_file"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn client_key_without_cert_is_rejected() {
+        let toml = client_toml("key_file = \"/tmp/c.key\"");
+        let err = parse_client(&toml).expect_err("key without cert must be rejected");
+        assert!(err.to_string().contains("cert_file"), "unexpected: {err}");
+    }
+
+    /// D7：mTLS 客户端证书与 skip_verify 同时出现必须被拒绝 —— 否则等于给
+    /// "假服务端"留了收集客户端证书的口子。
+    #[test]
+    fn client_cert_with_skip_verify_is_rejected() {
+        let toml = client_toml(
+            "cert_file = \"/tmp/c.crt\"\nkey_file = \"/tmp/c.key\"\nskip_verify = true",
+        );
+        let err = parse_client(&toml).expect_err("mTLS cert + skip_verify must be rejected");
+        assert!(err.to_string().contains("skip_verify"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn client_mtls_with_trusted_ca_is_accepted() {
+        let toml = client_toml(
+            "cert_file = \"/tmp/c.crt\"\nkey_file = \"/tmp/c.key\"\ntrusted_ca_file = \"/tmp/ca.crt\"",
+        );
+        let cfg = parse_client(&toml).expect("mTLS client config must be accepted");
+        let tls = cfg.transport.tls.expect("tls section");
+        assert_eq!(tls.cert_file.as_deref(), Some("/tmp/c.crt"));
+        assert_eq!(tls.trusted_ca_file.as_deref(), Some("/tmp/ca.crt"));
+    }
+
+    #[test]
+    fn server_without_mtls_still_valid() {
+        let toml = server_toml("cert_file = \"/tmp/s.crt\"\nkey_file = \"/tmp/s.key\"");
+        parse_server(&toml).expect("plain TLS server config must remain valid");
+    }
+}
+
+#[cfg(test)]
+mod auth_hardening_config_tests {
+    //! P1（B1 `client_id` 策略 / B4 登录节流）与 P4（接管指纹判据）的配置回归。
+    //!
+    //! 重点守住两条：**默认值必须零破坏**（不改变既有部署行为），
+    //! 以及严格模式下新字段必须被白名单识别（否则老配置会报未知字段）。
+
+    use super::*;
+
+    fn parse_server(toml: &str) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+        let cfg = ConfigLoader::parse_config::<ServerConfig>(toml, ConfigKind::Server, false)?;
+        ConfigLoader::validate_server_config(&cfg)?;
+        Ok(cfg)
+    }
+
+    fn server_toml(auth_extra: &str) -> String {
+        format!("bind_port = 9300\n\n[auth]\nmethod = \"token\"\ntoken = \"t\"\n{auth_extra}\n")
+    }
+
+    #[test]
+    fn defaults_are_backward_compatible() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.auth.client_id_policy, ClientIdPolicy::Warn);
+        assert_eq!(cfg.auth.login_max_failures, 5);
+        assert_eq!(cfg.auth.login_lockout_secs, 600);
+        assert!(!cfg.auth.kick_require_same_cert);
+    }
+
+    #[test]
+    fn config_without_new_fields_still_valid() {
+        let cfg = parse_server(&server_toml("")).expect("未写新字段的旧配置必须照常可用");
+        assert_eq!(cfg.auth.client_id_policy, ClientIdPolicy::Warn);
+    }
+
+    #[test]
+    fn reject_policy_parses() {
+        let cfg = parse_server(&server_toml("client_id_policy = \"reject\""))
+            .expect("snake_case 应可解析");
+        assert_eq!(cfg.auth.client_id_policy, ClientIdPolicy::Reject);
+    }
+
+    #[test]
+    fn camel_case_aliases_parse() {
+        let cfg = parse_server(&server_toml(
+            "clientIdPolicy = \"reject\"\nloginMaxFailures = 2\nloginLockoutSecs = 30\nkickRequireSameCert = true",
+        ))
+        .expect("camelCase 别名应可解析");
+        assert_eq!(cfg.auth.client_id_policy, ClientIdPolicy::Reject);
+        assert_eq!(cfg.auth.login_max_failures, 2);
+        assert_eq!(cfg.auth.login_lockout_secs, 30);
+        assert!(cfg.auth.kick_require_same_cert);
+    }
+
+    #[test]
+    fn snake_case_roundtrip() {
+        let cfg = parse_server(&server_toml(
+            "client_id_policy = \"warn\"\nlogin_max_failures = 7\nlogin_lockout_secs = 120\nkick_require_same_cert = true",
+        ))
+        .expect("snake_case 应可解析");
+        assert_eq!(cfg.auth.login_max_failures, 7);
+        assert_eq!(cfg.auth.login_lockout_secs, 120);
+        assert!(cfg.auth.kick_require_same_cert);
+    }
+
+    #[test]
+    fn unknown_policy_value_is_rejected() {
+        let err = parse_server(&server_toml("client_id_policy = \"explode\""))
+            .expect_err("非法枚举值必须报错，不能静默降级");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("client_id_policy") || msg.contains("unknown variant"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn throttle_on_without_lockout_is_rejected() {
+        let err = parse_server(&server_toml(
+            "login_max_failures = 5\nlogin_lockout_secs = 0",
+        ))
+        .expect_err("开了节流却没给锁定时长属于歧义配置，应拒绝");
+        assert!(err.to_string().contains("login_lockout_secs"), "{err}");
+    }
+
+    #[test]
+    fn throttle_can_be_disabled_explicitly() {
+        let cfg = parse_server(&server_toml("login_max_failures = 0"))
+            .expect("显式关闭节流应合法（0 = 关闭）");
+        // 0 表示关闭：此时 lockout 取什么值都不该报错
+        assert_eq!(cfg.auth.login_max_failures, 0);
     }
 }
