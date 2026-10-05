@@ -280,7 +280,9 @@
 ## 十一、rust_frp 更严格 / 更优的项（保留优势）
 
 1. **安全默认值更保守**：端口白名单默认「空即拒绝」；`web_server.user/password` 不成对则拒绝启动；TLS fail-closed；`/metrics` 默认关闭；Dashboard 登录 5 次失败锁 5 分钟。
-2. **无 C 依赖**：rustls/ring + quinn（`rustls-ring` backend），无 OpenSSL、无 `aws-lc-rs`，Alpine/musl 天然友好。
+2. **无 C 库依赖**：rustls/ring + quinn（`rustls-ring` backend），无 OpenSSL、无 `aws-lc-rs`，Alpine/musl 天然友好。
+   （唯一的 C 交互是 `libc` crate —— 纯 FFI 声明、无 C 代码、不需要 C 工具链，且本就是 tokio 的传递依赖；
+   仅用于读本地时区偏移。这不新增任何 C 库，静态 musl 构建照旧。）
 3. **内存安全 + 无 GC**：Rust 所有权模型，无 STW 停顿。
 4. **TLS 客户端校验 fail-closed**：原版「未配 CA 时是否校验」语义弱于 rust 的显式拒绝。
 5. **代码量仅 1/3**：19k vs 57k 行，服务端拆 10 模块，可读性更高。

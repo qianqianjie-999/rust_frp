@@ -51,7 +51,8 @@ token = "CHANGE_ME_RANDOM_LONG_TOKEN"
 # --- 日志配置（对齐原版 frp `[log]` 段） ---
 # 不配置 → 只输出到 stderr（systemd 由 journald 收集）；
 # 配置 to 之后 → stderr 与文件**同时**输出，按天轮转为 `<文件名>.<YYYY-MM-DD>`
-# （日期按 UTC，与日志行时间戳一致），并自动清理超过 maxDays 天的旧文件。
+# （日期与日志行时间戳均按**本地时区**，如 `2026-10-05T12:29:28.427312+08:00`），
+# 并自动清理超过 maxDays 天的旧文件。想强制时区就给进程设 TZ（如 TZ=Asia/Shanghai）。
 # 也可用旧版 INI 风格的顶层 `log_level` / `log_file` / `log_max_days`，
 # 两者同时存在时以 `[log]` 段为准。
 # [log]
