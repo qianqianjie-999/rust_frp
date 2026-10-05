@@ -77,6 +77,7 @@
 //! ```
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use rust_frp_config::PluginConfig;
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -95,7 +96,7 @@ impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
 
 /// 常量时间字节比较，避免凭据比对出现时序侧信道
 fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
-    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
+    rust_frp_util::constant_time_eq(a, b)
 }
 
 /// 常量时间字符串比较
@@ -298,7 +299,7 @@ impl StaticFilePlugin {
             return false;
         };
 
-        let Ok(decoded) = base64::decode(encoded.trim()) else {
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
             return false;
         };
         let Ok(decoded) = String::from_utf8(decoded) else {
@@ -475,7 +476,7 @@ impl HttpProxyPlugin {
             return false;
         }
 
-        let Ok(decoded) = base64::decode(encoded.trim()) else {
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
             return false;
         };
         let Ok(decoded) = String::from_utf8(decoded) else {
@@ -1319,7 +1320,7 @@ mod static_file_auth_tests {
     fn basic_header(user: &str, password: &str) -> String {
         format!(
             "Authorization: Basic {}",
-            base64::encode(format!("{}:{}", user, password))
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, password))
         )
     }
 
@@ -1356,7 +1357,10 @@ mod static_file_auth_tests {
     /// 解码后无冒号分隔 → 拒绝
     #[test]
     fn malformed_credentials_rejected() {
-        let h = format!("Authorization: Basic {}", base64::encode("nocolon"));
+        let h = format!(
+            "Authorization: Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("nocolon")
+        );
         assert!(!check(&plugin(Some("u"), Some("p")), &[h]));
     }
 
@@ -1380,7 +1384,10 @@ mod static_file_auth_tests {
     /// 头名与 scheme 大小写不敏感
     #[test]
     fn case_insensitive_header_and_scheme() {
-        let h = format!("authorization: basic {}", base64::encode("u:p"));
+        let h = format!(
+            "authorization: basic {}",
+            base64::engine::general_purpose::STANDARD.encode("u:p")
+        );
         assert!(check(&plugin(Some("u"), Some("p")), &[h]));
     }
 
@@ -1452,7 +1459,10 @@ mod http_proxy_plain_http_tests {
     async fn absolute_form_target_forwarded() {
         let (addr, origin_task) = spawn_origin("pong").await;
         let mut plugin = http_plugin(Some("u"), Some("p"));
-        let auth = format!("Proxy-Authorization: Basic {}", base64::encode("u:p"));
+        let auth = format!(
+            "Proxy-Authorization: Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("u:p")
+        );
         let request = format!(
             "GET http://{addr}/ping?x=1 HTTP/1.1\r\nHost: example.com\r\n{auth}\r\nConnection: close\r\n\r\n"
         );
@@ -1660,7 +1670,7 @@ mod proxy_plugin_auth_tests {
     fn proxy_auth_header(user: &str, password: &str) -> String {
         format!(
             "Proxy-Authorization: Basic {}",
-            base64::encode(format!("{}:{}", user, password))
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, password))
         )
     }
 
@@ -1698,7 +1708,10 @@ mod proxy_plugin_auth_tests {
             &http_plugin(Some("u"), Some("p")),
             &["Proxy-Authorization: Basic !!!".to_string()]
         ));
-        let h = format!("Proxy-Authorization: Basic {}", base64::encode("nocolon"));
+        let h = format!(
+            "Proxy-Authorization: Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("nocolon")
+        );
         assert!(!check_http(&http_plugin(Some("u"), Some("p")), &[h]));
     }
 
@@ -1722,7 +1735,10 @@ mod proxy_plugin_auth_tests {
     /// 头名与 scheme 大小写不敏感
     #[test]
     fn http_proxy_case_insensitive() {
-        let h = format!("proxy-authorization: basic {}", base64::encode("u:p"));
+        let h = format!(
+            "proxy-authorization: basic {}",
+            base64::engine::general_purpose::STANDARD.encode("u:p")
+        );
         assert!(check_http(&http_plugin(Some("u"), Some("p")), &[h]));
     }
 

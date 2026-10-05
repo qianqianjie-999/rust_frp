@@ -38,11 +38,14 @@
 //!
 //! ## 使用示例
 //!
-//! ```rust,ignore
+//! ```rust,no_run
+//! # use rust_frp_util::{retry, RetryConfig};
+//! # async fn example() {
 //! let config = RetryConfig::default();
 //! let result = retry(&config, "connect", || async {
 //!     tokio::net::TcpStream::connect("127.0.0.1:8080").await
 //! }).await;
+//! # }
 //! ```
 //!
 //! ## 安全性

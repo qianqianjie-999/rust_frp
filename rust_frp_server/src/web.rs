@@ -17,7 +17,7 @@ pub(crate) const WEB_SESSION_COOKIE: &str = "frp_session";
 
 /// 常量时间字符串比较，避免凭据/签名比对的时序侧信道
 pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
-    ring::constant_time::verify_slices_are_equal(a.as_bytes(), b.as_bytes()).is_ok()
+    rust_frp_util::constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
 /// 管理端鉴权状态
@@ -175,10 +175,11 @@ pub(crate) fn purge_expired_sessions(sessions: &mut std::collections::HashMap<St
 
 /// 生成 32 字节随机会话令牌（base64 编码）
 pub(crate) fn new_session_token() -> Option<String> {
+    use base64::Engine as _;
     use ring::rand::{SecureRandom, SystemRandom};
     let mut buf = [0u8; 32];
     SystemRandom::new().fill(&mut buf).ok()?;
-    Some(base64::encode(buf))
+    Some(base64::engine::general_purpose::STANDARD.encode(buf))
 }
 
 /// 从请求头中提取会话令牌
@@ -217,15 +218,15 @@ fn create_routes(
         .route("/api/serverinfo", axum::routing::get(serverinfo_handler))
         .route("/api/clients", axum::routing::get(clients_handler))
         .route(
-            "/api/clients/:key",
+            "/api/clients/{key}",
             axum::routing::get(client_detail_handler),
         )
         .route(
-            "/api/proxy/:type",
+            "/api/proxy/{type}",
             axum::routing::get(proxy_by_type_handler),
         )
         .route(
-            "/api/proxy/:type/:name",
+            "/api/proxy/{type}/{name}",
             axum::routing::get(proxy_by_type_and_name_handler),
         )
         .route(
@@ -233,11 +234,11 @@ fn create_routes(
             axum::routing::get(proxies_handler).delete(delete_proxies_handler),
         )
         .route(
-            "/api/proxies/:name",
+            "/api/proxies/{name}",
             axum::routing::get(proxy_by_name_handler),
         )
         .route(
-            "/api/traffic/:name",
+            "/api/traffic/{name}",
             axum::routing::get(proxy_traffic_handler),
         )
         // 管理端 API（v2，统一 {code,msg,data} 信封）
@@ -252,16 +253,16 @@ fn create_routes(
         )
         .route("/api/v2/clients", axum::routing::get(v2_clients_handler))
         .route(
-            "/api/v2/clients/:key",
+            "/api/v2/clients/{key}",
             axum::routing::get(v2_client_detail_handler),
         )
         .route("/api/v2/proxies", axum::routing::get(v2_proxies_handler))
         .route(
-            "/api/v2/proxies/:name",
+            "/api/v2/proxies/{name}",
             axum::routing::get(v2_proxy_detail_handler),
         )
         .route(
-            "/api/v2/proxies/:name/traffic",
+            "/api/v2/proxies/{name}/traffic",
             axum::routing::get(v2_proxy_traffic_handler),
         )
         .route("/", axum::routing::get(index_handler))

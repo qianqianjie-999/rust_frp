@@ -552,9 +552,19 @@ impl Server {
 
                         match classify_work_conn(first_byte[0], tls_config.is_some(), tls_only) {
                             WorkConnClass::Tls => {
+                                // classify_work_conn 仅在 tls_available=true 时返回 Tls，
+                                // 此处必然为 Some；若违反则按拒绝处理而非 panic
                                 let tls_config = match tls_config {
                                     Some(c) => c,
-                                    None => unreachable!(),
+                                    None => {
+                                        global_metrics().incr_tls_rejects();
+                                        log::warn!(
+                                            "TLS work conn from {:?} but no TLS config (unexpected), rejected",
+                                            addr
+                                        );
+                                        let _ = conn.shutdown().await;
+                                        return;
+                                    }
                                 };
                                 log::info!("New TLS work connection from: {:?}", addr);
                                 match tls_config.accept(conn).await {

@@ -1,5 +1,6 @@
 //! 控制连接：登录会话、消息循环、客户端与 STCP 桥接管理
 
+use base64::Engine as _;
 use rust_frp_auth::AuthManager;
 use rust_frp_core::{
     ControlConn, Message, ProxyManager, ReqWorkConnMsg, StcpVisitorRespMsg, XtcpHolePunchMsg,
@@ -900,10 +901,8 @@ impl ClientInfo {
     /// 与 `/api/clients/{key}` 的 key 语义对应；用 URL 安全字母表是为了让
     /// key 可以直接放进路径而无需额外转义。
     pub fn key(&self) -> String {
-        base64::encode_config(
-            format!("{}|{}|{}", self.user, self.client_id, self.run_id),
-            base64::URL_SAFE_NO_PAD,
-        )
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{}|{}|{}", self.user, self.client_id, self.run_id))
     }
 }
 

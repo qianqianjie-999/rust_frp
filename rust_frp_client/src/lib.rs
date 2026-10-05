@@ -92,6 +92,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::Engine as _;
 use rust_frp_auth::AuthManager;
 use rust_frp_config::ClientConfig;
 use rust_frp_core::{ControlConn, Message, NewWorkConnMsg, ProxyManager, VisitorManager};
@@ -1274,7 +1275,7 @@ fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
     let msg = format!("work_conn:{}", run_id);
     let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, encryption_key.as_ref());
     let tag = hmac::sign(&hmac_key, msg.as_bytes());
-    base64::encode(tag.as_ref())
+    base64::engine::general_purpose::STANDARD.encode(tag.as_ref())
 }
 
 /// 派生应用层加密密钥（SHA-256(token)，与服务端 AuthManager::generate_encryption_key 一致）
@@ -2393,7 +2394,9 @@ async fn basic_auth_middleware(
 /// 解析 `Authorization: Basic <base64(user:password)>` 头
 fn parse_basic_credentials(value: &str) -> Option<(String, String)> {
     let encoded = value.strip_prefix("Basic ")?;
-    let decoded = base64::decode(encoded).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
     let decoded = String::from_utf8(decoded).ok()?;
     let (user, password) = decoded.split_once(':')?;
     Some((user.to_string(), password.to_string()))
@@ -3608,7 +3611,10 @@ mod web_admin_tests {
     }
 
     fn auth_header(user: &str, pass: &str) -> String {
-        format!("Basic {}", base64::encode(format!("{user}:{pass}")))
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+        )
     }
 
     #[tokio::test]
@@ -3792,7 +3798,7 @@ mod web_admin_tests {
 
     #[test]
     fn test_parse_basic_credentials() {
-        let encoded = base64::encode("user:pass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
         assert_eq!(
             parse_basic_credentials(&format!("Basic {encoded}")),
             Some(("user".to_string(), "pass".to_string()))
@@ -3801,7 +3807,10 @@ mod web_admin_tests {
         assert_eq!(parse_basic_credentials("Basic !!!not-base64"), None);
         // 无冒号分隔的解码结果
         assert_eq!(
-            parse_basic_credentials(&format!("Basic {}", base64::encode("nocolon"))),
+            parse_basic_credentials(&format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode("nocolon")
+            )),
             None
         );
     }

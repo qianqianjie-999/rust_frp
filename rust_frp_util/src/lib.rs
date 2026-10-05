@@ -74,6 +74,22 @@ pub fn parse_addr(addr: &str) -> Result<SocketAddr, std::io::Error> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid address"))
 }
 
+/// 常量时间字节比较（用于 token / 签名 / 密钥等敏感数据比较）
+///
+/// 通过 XOR 累积差异避免提前返回，防止 timing 攻击推断内容。
+/// 注意：长度不等时立即返回 false，会泄露长度信息——对 token 比较而言可接受
+/// （ring 0.16 的 `constant_time::verify_slices_are_equal` 行为一致）。
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// 生成随机 ID
 pub fn rand_id(len: usize) -> String {
     use rand::Rng;

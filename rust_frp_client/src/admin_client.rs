@@ -8,6 +8,7 @@
 //!
 //! 支持：Content-Length 与 chunked 两种响应体、Basic 认证头。
 
+use base64::Engine as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 向 frpc 管理端口发起一次 HTTP 请求，返回 (状态码, 响应体)。
@@ -26,7 +27,7 @@ pub async fn admin_http_request(
     let mut req =
         format!("{method} {path} HTTP/1.1\r\nHost: {addr}:{port}\r\nConnection: close\r\n");
     if let Some((user, pass)) = basic_auth {
-        let encoded = base64::encode(format!("{user}:{pass}"));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
         req.push_str(&format!("Authorization: Basic {encoded}\r\n"));
     }
     req.push_str("\r\n");
