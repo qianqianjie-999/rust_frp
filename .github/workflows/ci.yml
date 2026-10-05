@@ -30,6 +30,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features
 
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    # 依赖漏洞扫描（RustSec 数据库）；continue-on-error 避免数据库误报阻塞主流程，
+    # 但告警仍会显示在 PR 检查中
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
+
   test:
     name: Test
     runs-on: ubuntu-latest

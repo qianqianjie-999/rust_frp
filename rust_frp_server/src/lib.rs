@@ -145,6 +145,7 @@ pub use work_conn::*;
 #[cfg(test)]
 mod web_auth_tests {
     use super::*;
+    use base64::Engine as _;
     use rust_frp_util::get_timestamp;
     use std::time::Duration;
 
@@ -277,7 +278,7 @@ mod web_auth_tests {
         assert_ne!(t1, t2, "sessions must not repeat");
 
         // 旧实现把 base64("user:password") 直接当 cookie，这里必须不再出现
-        let legacy = base64::encode("boss:s3cret");
+        let legacy = base64::engine::general_purpose::STANDARD.encode("boss:s3cret");
         assert_ne!(t1, legacy);
         assert!(!t1.contains(&legacy));
         assert!(!t1.contains("boss"));

@@ -37,7 +37,7 @@
 //! ```
 
 use async_trait::async_trait;
-use ring::constant_time;
+use base64::Engine as _;
 use ring::digest;
 use ring::hmac;
 use ring::signature;
@@ -91,10 +91,7 @@ pub enum AuthError {
 /// - `true`: 两个切片相等
 /// - `false`: 长度不同或不相等
 pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    constant_time::verify_slices_are_equal(a, b).is_ok()
+    rust_frp_util::constant_time_eq(a, b)
 }
 
 /// 认证验证器 trait - 定义认证接口
@@ -189,7 +186,7 @@ impl TokenAuthVerifier {
         let msg = format!("{}{}", self.token, timestamp);
         let key = hmac::Key::new(hmac::HMAC_SHA256, self.token.as_bytes());
         let tag = hmac::sign(&key, msg.as_bytes());
-        base64::encode(tag.as_ref())
+        base64::engine::general_purpose::STANDARD.encode(tag.as_ref())
     }
 }
 
@@ -221,7 +218,7 @@ pub fn generate_stcp_sign_key(secret_key: &str, proxy_name: &str, timestamp: i64
     let msg = format!("stcp:{}:{}", proxy_name, timestamp);
     let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, secret_key.as_bytes());
     let tag = hmac::sign(&hmac_key, msg.as_bytes());
-    base64::encode(tag.as_ref())
+    base64::engine::general_purpose::STANDARD.encode(tag.as_ref())
 }
 
 #[async_trait]
@@ -685,11 +682,11 @@ fn normalize_issuer(issuer: &str) -> &str {
 
 /// base64 解码：兼容 JOSE 的 base64url（无填充）与标准 base64
 fn b64_decode(s: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    base64::decode_config(s, base64::STANDARD_NO_PAD)
-        .or_else(|_| base64::decode_config(s, base64::URL_SAFE_NO_PAD))
-        .or_else(|_| base64::decode_config(s, base64::STANDARD))
-        .or_else(|_| base64::decode_config(s, base64::URL_SAFE))
-        .or_else(|_| base64::decode(s))
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(s)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(s))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
         .map_err(|e| deny(format!("Failed to decode base64: {e}")))
 }
 
@@ -927,7 +924,7 @@ impl AuthManager {
         let msg = format!("ping:{timestamp}");
         let key = hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes());
         let tag = hmac::sign(&key, msg.as_bytes());
-        Some(base64::encode(tag.as_ref()))
+        Some(base64::engine::general_purpose::STANDARD.encode(tag.as_ref()))
     }
 
     /// 校验心跳签名（常量时间比较；未启用 scope 或无 token 时返回 `Ok`）
@@ -947,11 +944,7 @@ impl AuthManager {
                 "heartbeats scope enabled but no static token configured",
             )
         })?;
-        let ok = ring::constant_time::verify_slices_are_equal(
-            expected.as_bytes(),
-            privilege_key.as_bytes(),
-        )
-        .is_ok();
+        let ok = rust_frp_util::constant_time_eq(expected.as_bytes(), privilege_key.as_bytes());
         if ok {
             Ok(())
         } else {
@@ -1063,7 +1056,7 @@ impl AuthManager {
             let msg = format!("work_conn:{}", run_id);
             let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
             let tag = hmac::sign(&hmac_key, msg.as_bytes());
-            Ok(base64::encode(tag.as_ref()))
+            Ok(base64::engine::general_purpose::STANDARD.encode(tag.as_ref()))
         } else {
             Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1297,7 +1290,7 @@ ifGHE5azp2Lav/Kni6rRwBQ=
     const RSA_TEST_E_B64: &str = "AQAB";
 
     fn b64u(bytes: &[u8]) -> String {
-        base64::encode_config(bytes, base64::URL_SAFE_NO_PAD)
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
     fn b64u_json(v: &serde_json::Value) -> String {
@@ -1309,7 +1302,9 @@ ifGHE5azp2Lav/Kni6rRwBQ=
             .lines()
             .filter(|l| !l.starts_with("-----"))
             .collect();
-        let der = base64::decode(der_b64).unwrap();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(der_b64)
+            .unwrap();
         signature::RsaKeyPair::from_pkcs8(&der).unwrap()
     }
 
@@ -1330,6 +1325,7 @@ ifGHE5azp2Lav/Kni6rRwBQ=
         let key = signature::EcdsaKeyPair::from_pkcs8(
             &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
             pkcs8.as_ref(),
+            &rng,
         )
         .unwrap();
         let point = key.public_key().as_ref();
@@ -1343,7 +1339,7 @@ ifGHE5azp2Lav/Kni6rRwBQ=
         let header = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
         let signing_input = format!("{}.{}", b64u_json(&header), b64u_json(claims));
         let rng = ring::rand::SystemRandom::new();
-        let mut sig = vec![0u8; key.public_modulus_len()];
+        let mut sig = vec![0u8; key.public().modulus_len()];
         key.sign(
             &signature::RSA_PKCS1_SHA256,
             &rng,

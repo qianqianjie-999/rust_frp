@@ -92,7 +92,7 @@ impl HttpRequestInfo {
 
     /// 生成 WebSocket 接受密钥
     pub fn generate_websocket_accept_key(key: &str) -> String {
-        use base64::encode;
+        use base64::Engine as _;
         use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY};
 
         let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -102,7 +102,7 @@ impl HttpRequestInfo {
         context.update(combined.as_bytes());
         let digest = context.finish();
 
-        encode(digest.as_ref())
+        base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
     }
 }
 

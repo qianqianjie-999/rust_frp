@@ -688,15 +688,18 @@ pub async fn server_handshake<S: FrpConn>(
 ///
 /// 对齐原版 frp 中 `[]byte` 经 `encoding/json` 编码为 base64 字符串的语义。
 mod b64_bytes {
+    use base64::Engine as _;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(value: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&base64::encode(value))
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(value))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let text = String::deserialize(deserializer)?;
-        base64::decode(&text).map_err(serde::de::Error::custom)
+        base64::engine::general_purpose::STANDARD
+            .decode(&text)
+            .map_err(serde::de::Error::custom)
     }
 }
 

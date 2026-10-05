@@ -1275,8 +1275,10 @@ impl ConfigLoader {
     ///
     /// # 示例
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
+    /// # use rust_frp_config::ConfigLoader;
     /// let config = ConfigLoader::load_server_config("frps.toml")?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn load_server_config<P: AsRef<Path>>(
         path: P,

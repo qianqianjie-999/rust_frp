@@ -9,6 +9,7 @@
 //! HTTP 请求，而是「先 CONNECT 建隧道、随后跑任意 TCP 协议」，因此不走
 //! HTTP 响应改写路径，仅做 200/4xx 应答后原样桥接。
 
+use base64::Engine as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -259,7 +260,9 @@ fn parse_basic_credentials(value: &str) -> Option<(String, String)> {
     if !scheme.eq_ignore_ascii_case("basic") {
         return None;
     }
-    let decoded = base64::decode(encoded.trim()).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
     let text = String::from_utf8(decoded).ok()?;
     let (user, password) = text.split_once(':')?;
     Some((user.to_string(), password.to_string()))
@@ -480,7 +483,10 @@ mod tests {
     }
 
     fn basic(user: &str, password: &str) -> String {
-        format!("Basic {}", base64::encode(format!("{}:{}", user, password)))
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, password))
+        )
     }
 
     #[test]
