@@ -42,6 +42,9 @@ out/
 *.tmp
 *.temp
 
+# 沙箱安全删除产生的回收站目录（勿入库）
+.Trash-*/
+
 # TLS 私钥/证书不得入库（运行时自签或用户自配）
 rust_frp_net/cert/*.crt
 rust_frp_net/cert/*.key
