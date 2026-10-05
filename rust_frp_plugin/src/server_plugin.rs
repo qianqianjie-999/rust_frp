@@ -148,10 +148,11 @@ impl HttpPlugin {
             rust_frp_net::http::post_json(&url, &body, &[("X-Frp-Reqid", req_id)], &opts).await?;
         if !resp.is_success() {
             return Err(format!(
-                "plugin [{}] returned HTTP {}: {}",
+                "plugin [{}] returned HTTP {}: {} (reqid={})",
                 self.name,
                 resp.status,
-                resp.body.trim()
+                resp.body.trim(),
+                req_id
             ));
         }
         serde_json::from_str::<PluginResponse>(&resp.body)
@@ -237,9 +238,10 @@ impl Manager {
         for plugin in &self.close_proxy {
             if let Err(e) = plugin.handle(OP_CLOSE_PROXY, content, &req_id).await {
                 log::warn!(
-                    "send CloseProxy request to plugin [{}] error: {}",
+                    "send CloseProxy request to plugin [{}] error: {} (reqid={})",
                     plugin.name,
-                    e
+                    e,
+                    req_id
                 );
             }
         }
@@ -289,10 +291,12 @@ impl Manager {
         }
         let req_id = new_req_id();
         for plugin in plugins {
-            let resp = plugin
-                .handle(op, content, &req_id)
-                .await
-                .map_err(|e| format!("send {op} request to plugin [{}] error: {e}", plugin.name))?;
+            let resp = plugin.handle(op, content, &req_id).await.map_err(|e| {
+                format!(
+                    "send {op} request to plugin [{}] error: {e} (reqid={req_id})",
+                    plugin.name
+                )
+            })?;
             if resp.reject {
                 return Err(reject_reason(&plugin.name, op, &resp));
             }
