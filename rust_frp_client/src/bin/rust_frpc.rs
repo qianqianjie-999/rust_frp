@@ -406,6 +406,37 @@ fn peek_log_settings(config_path: &Option<String>, strict: bool) -> rust_frp_con
         .unwrap_or_default()
 }
 
+/// 多实例模式（`--config_dir`）下预读日志设置：取目录内**排序后第一个**配置文件的 `[log]` 段
+///
+/// 进程级日志订阅器只能初始化一次（`try_init`），多实例取启动顺序最前的实例，
+/// 与 [`run_multiple_clients`] 的文件排序一致。目录读不出 / 为空 / 首个文件解析失败时
+/// 返回默认设置，**不打印错误、不退出** —— 随后实例启动流程会给出准确报错。
+fn peek_log_settings_from_dir(dir: &str, strict: bool) -> rust_frp_config::ResolvedLog {
+    match list_config_files(dir) {
+        Ok(paths) => paths
+            .first()
+            .and_then(|path| {
+                ConfigLoader::load_client_config_strict(path, strict)
+                    .map(|config| config.resolved_log())
+                    .ok()
+            })
+            .unwrap_or_default(),
+        Err(_) => Default::default(),
+    }
+}
+
+/// 列举配置目录下的配置文件（仅文件，按路径排序；与原版多实例遍历顺序对齐）
+fn list_config_files(dir: &str) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("read config dir {dir} failed: {e}"))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 /// `frpc verify`：校验配置文件后按结果设置退出码
 fn run_verify(config_path: &Option<String>, strict: bool) {
     let path = default_config_path(config_path);
@@ -693,10 +724,14 @@ async fn main() {
     }
 
     // 日志初始化：`run` 模式下先读一次配置，取 `[log]` 段（stderr + 可选文件、按天轮转）；
+    // 多实例模式取目录内第一个配置文件的 `[log]` 段（对齐原版各实例自带日志设置）；
     // 其它子命令（verify/reload/status/stop/quick）用默认日志设置。
     // 配置读不出来时不报错——后续正常流程会再加载一次并给出准确错误信息。
-    let log = if matches!(cli.command, Command::Run) && cli.config_dir.is_none() {
-        peek_log_settings(&cli.config_path, cli.strict_config)
+    let log = if matches!(cli.command, Command::Run) {
+        match cli.config_dir.as_deref() {
+            Some(dir) => peek_log_settings_from_dir(dir, cli.strict_config),
+            None => peek_log_settings(&cli.config_path, cli.strict_config),
+        }
     } else {
         rust_frp_config::ResolvedLog::default()
     };
@@ -761,18 +796,13 @@ async fn main() {
 /// 对齐原版 `runMultipleClients`：目录下所有**文件**各起一个 frpc，
 /// 任一实例失败只打印错误，不影响其他实例。
 async fn run_multiple_clients(dir: &str, strict: bool) {
-    let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .collect(),
+    let paths = match list_config_files(dir) {
+        Ok(paths) => paths,
         Err(e) => {
-            eprintln!("frpc: read config dir {dir} failed: {e}");
+            eprintln!("frpc: {e}");
             exit(1);
         }
     };
-    paths.sort();
     if paths.is_empty() {
         eprintln!("frpc: no config file found in directory {dir}");
         exit(1);
@@ -1060,5 +1090,66 @@ mod cli_tests {
         let cli = parse_args(&args(&["stcp", "visitor", "--server_name", "ssh"])).unwrap();
         let err = run_quick(&cli.command, &cli.opts).await.unwrap_err();
         assert!(err.contains("--bind_port"), "unexpected: {err}");
+    }
+
+    /// 建一个带随机后缀的临时目录（不引入 tempfile 依赖），返回路径
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "frpc-test-{tag}-{}",
+            std::process::id() as u64 ^ rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_list_config_files_sorted_files_only() {
+        let dir = temp_dir("list");
+        std::fs::write(dir.join("b.toml"), "").unwrap();
+        std::fs::write(dir.join("a.toml"), "").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap(); // 目录应被排除
+
+        let paths = list_config_files(dir.to_str().unwrap()).unwrap();
+        let names: Vec<_> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.toml", "b.toml"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_peek_log_settings_from_dir_takes_first_file() {
+        let dir = temp_dir("peek");
+        // a.toml 排序在前，其 `[log]` 应胜出
+        std::fs::write(
+            dir.join("a.toml"),
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\n\n[log]\nto = \"/tmp/frpc-a.log\"\nlevel = \"debug\"\nmaxDays = 7\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.toml"),
+            "server_addr = \"127.0.0.1\"\nserver_port = 7000\n\n[log]\nto = \"/tmp/frpc-b.log\"\nlevel = \"warn\"\nmaxDays = 1\n",
+        )
+        .unwrap();
+
+        let log = peek_log_settings_from_dir(dir.to_str().unwrap(), true);
+        assert_eq!(log.to.as_deref(), Some("/tmp/frpc-a.log"));
+        assert_eq!(log.level.as_deref(), Some("debug"));
+        assert_eq!(log.max_days, 7);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_peek_log_settings_from_dir_falls_back_to_default() {
+        // 目录不存在 → 默认设置，不报错不退出
+        let log = peek_log_settings_from_dir("/nonexistent-frpc-test-dir", true);
+        assert_eq!(log, rust_frp_config::ResolvedLog::default());
+
+        // 目录为空 → 同样回退默认
+        let dir = temp_dir("empty");
+        let log = peek_log_settings_from_dir(dir.to_str().unwrap(), true);
+        assert_eq!(log, rust_frp_config::ResolvedLog::default());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
