@@ -29,7 +29,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~322 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 能力覆盖率 | **≈ 90%（66/73）** ｜ 数据面 **100%（26/26）**、控制/运维面 **85%（40/47）** | 100%（基线） | 见第二节 |
+| 能力覆盖率 | **≈ 92%（67/73）** ｜ 数据面 **100%（26/26）**、控制/运维面 **87%（41/47）** | 100%（基线） | 见第二节 |
 | 配置字段兼容 | ⚠️ 双向 alias 兼容，但**约 25+ 个原版字段未支持**（解析成功 + WARN） | camelCase + 严格模式 | 原版配置**可加载**但部分字段不生效 |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify / reload / status / stop / nathole / 每类代理与访客 / `--config_dir` | reload / status / stop / verify / nathole / 每类代理 | rust 已基本对齐 |
@@ -53,7 +53,7 @@
 | 内部线协议 | **2/2** | 100% | —（v1 与 v2 双版本均已落地，见 五、传输与协议对照） |
 | 数据面能力 | **11/11** | 100% | —（PROXY protocol v1/v2 已落地，见 六、数据面能力对照） |
 | 客户端插件 | **9/10** | 90% | `virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 已支持普通 HTTP 转发） |
-| 服务端插件 | **1/2** | 50% | tracer 链路追踪 |
+| 服务端插件 | **2/2** | 100% | —（reqid 贯穿已实现：每次回调生成随机 reqid，经 `X-Frp-Reqid` 头下发并注入回调错误日志，语义等价原版 tracer.go） |
 | 认证与安全 | **5/7** | 71% | SSH 隧道网关、FeatureGate/`--allow-unsafe`（`additionalScopes` 已落地） |
 | frps 管理 API | **9/9** | 100% | —（v1 serverinfo/clients/按类型名称查询/流量 + v2 套件/分页/prune/users + DELETE offline 全部落地） |
 | frpc 管理 API | **3/5** | 60% | `/api/stop`、Store 源代理 CRUD |
@@ -166,7 +166,7 @@
 |------|:--------:|:--------:|
 | 服务端插件机制 | ✅ `rust_frp_plugin::server_plugin` | ✅ `plugin/server/manager` |
 | 通用 HTTP 回调插件（6 类钩子） | ✅ Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn（含 reject / unchange 覆写） | ✅ 同名六类钩子 |
-| **链路追踪 tracer** | ❌ | ✅ |
+| **链路追踪 tracer** | ✅ | ✅ |（rust：每次 op 回调生成 16 位 hex reqid，`X-Frp-Reqid` 头 + 回调失败日志 `(reqid=…)` 关联；上一轮重核时漏记） |
 
 ---
 
