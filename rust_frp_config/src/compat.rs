@@ -366,6 +366,25 @@ pub(crate) fn warn_unknown_fields(kind: ConfigKind, root: &Value) {
     }
 }
 
+/// 严格模式（原版 `--strict_config`）：未知字段构成错误信息，无未知字段时返回 `None`。
+pub(crate) fn strict_unknown_error(kind: ConfigKind, root: &Value) -> Option<String> {
+    let unknown = collect_unknown_fields(kind, root);
+    if unknown.is_empty() {
+        return None;
+    }
+    let mut msg = format!(
+        "strict config mode: {} unrecognized field(s) that are not supported:",
+        unknown.len()
+    );
+    for field in unknown.iter().take(10) {
+        msg.push_str(&format!("\n  - `{field}`"));
+    }
+    if unknown.len() > 10 {
+        msg.push_str(&format!("\n  - ... and {} more", unknown.len() - 10));
+    }
+    Some(msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
