@@ -244,10 +244,25 @@ impl Server {
             ProxyManagerOptions {
                 allow_ports: config.allow_ports.clone(),
                 max_ports_per_user: config.max_ports_per_user,
+                custom_domains_allowlist: config.custom_domains_allowlist.clone(),
                 tcpmux_port: config.tcpmux_http_connect_port,
                 plugin_manager: plugin_manager.clone(),
             },
         ));
+        // 安全评审 P2：开启 vhost/tcpmux 却没配域名白名单时，任何已认证客户端
+        // 都能注册任意 custom_domains 抢占 Host 匹配。默认允许但显式告警。
+        if config.custom_domains_allowlist.is_empty()
+            && (config.vhost_http_port.is_some()
+                || config.vhost_https_port.is_some()
+                || config.tcpmux_http_connect_port.is_some())
+        {
+            log::warn!(
+                "custom_domains_allowlist is empty while vhost/tcpmux ports are enabled: \
+                 any authenticated client may register arbitrary custom_domains for Host \
+                 matching. Set custom_domains_allowlist in frps.toml to restrict this."
+            );
+        }
+
         let visitor_manager = Arc::new(ServerVisitorManager::new());
         let metrics = Arc::new(MonitorMetrics::new());
         // 注册进程级单例，供 Control::run 等深层调用点使用
@@ -2195,6 +2210,7 @@ mod graceful_shutdown_tests {
                 ProxyManagerOptions {
                     allow_ports: Vec::new(),
                     max_ports_per_user: None,
+                    custom_domains_allowlist: Vec::new(),
                     tcpmux_port: None,
                     plugin_manager: Arc::new(rust_frp_plugin::server_plugin::Manager::default()),
                 },

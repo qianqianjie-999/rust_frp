@@ -59,12 +59,16 @@ cert_file = "/etc/frp/certs/client-<主机>.crt"   # 服务端验我
 key_file  = "/etc/frp/certs/client-<主机>.key"
 ```
 
-签证书（`gen-certs.sh` 已内建客户端证书分支）：
+签证书（用 `gen-client-certs.sh` —— **复用现有 CA**，不重建）：
 
 ```bash
-CLIENTS="cli32 cli75" SERVER_IP=1.2.3.4 ./gen-certs.sh
+CLIENTS="cli32 cli75" ./gen-client-certs.sh
 # 产出 client-<名字>.crt/key（EKU = clientAuth，无 SAN）
 ```
+
+> ⚠️ **不要用 `gen-certs.sh` 补签客户端证书**：它会**重建 CA**，导致线上已部署的
+> `server.crt` / `client-*.crt` 全部失效并丢弃旧 CA 私钥；该脚本现在检测到已有 CA 时
+> 会拒绝执行（需 `CA_FORCE=1`）。CA 材料备份见 `ca_backup.sh`。
 
 ⚠️ 三条硬约束：
 

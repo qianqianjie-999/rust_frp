@@ -246,6 +246,8 @@ pub struct ServerProxyManager {
     allow_ports: Vec<rust_frp_config::PortRange>,
     /// 单用户最大端口配额（None = 不限制，对应 max_ports_per_user 配置）
     max_ports_per_user: Option<usize>,
+    /// 自定义域名白名单（空 = 不限制归属，仅做语法校验）
+    custom_domains_allowlist: Vec<String>,
     /// 用户已占用端口计数 (user -> ports_used)
     user_port_counts: RwLock<std::collections::HashMap<String, usize>>,
     /// 代理归属与端口占用记录 (proxy_name -> (user, ports_used))，用于移除时释放配额
@@ -268,6 +270,8 @@ pub struct ProxyManagerOptions {
     pub allow_ports: Vec<rust_frp_config::PortRange>,
     /// 单用户最大端口数
     pub max_ports_per_user: Option<usize>,
+    /// 自定义域名白名单（空 = 不限制归属，仅做语法校验）
+    pub custom_domains_allowlist: Vec<String>,
     /// tcpmux HTTP CONNECT 复用端口
     pub tcpmux_port: Option<u16>,
     /// 服务端 HTTP 插件管理器
@@ -298,6 +302,69 @@ pub(crate) fn port_allowed(port: u16, ranges: &[rust_frp_config::PortRange]) -> 
     false
 }
 
+/// 域名是否被白名单放行（白名单为空 = 不限制归属，仅做语法校验）
+///
+/// # 匹配规则
+///
+/// - 精确匹配：`example.com` 只放行 `example.com`；
+/// - 白名单通配 `*.example.com`：放行 `example.com` 的**严格子域**——
+///   含客户端注册的通配域名 `*.example.com` 自身，**不含 apex `example.com`**
+///   （apex 需另写一条精确条目；从严以免通配意外放宽到裸域）。
+///
+/// 比较前统一转小写（DNS 大小写不敏感），避免 `Example.com` 绕过白名单；
+/// 后缀比较带 `.` 边界，`notcorp.example.com` 不会被 `*.corp.example.com` 放行。
+pub(crate) fn domain_allowed(domain: &str, allowlist: &[String]) -> bool {
+    if allowlist.is_empty() {
+        return true;
+    }
+    let req = domain.trim().to_ascii_lowercase();
+    let req_is_wildcard = req.starts_with("*.");
+    let req_body = req.strip_prefix("*.").unwrap_or(&req).to_string();
+    for entry in allowlist {
+        let e = entry.trim().to_ascii_lowercase();
+        if e == req {
+            return true;
+        }
+        let Some(base) = e.strip_prefix("*.") else {
+            continue;
+        };
+        // 严格子域：必须以 ".{base}" 结尾
+        let is_subdomain = req_body.ends_with(&format!(".{base}"));
+        // 客户端注册的是通配域名时，其 base 落在 base 之下（含 base 自身）即视为被覆盖
+        if is_subdomain || (req_is_wildcard && req_body == base) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 校验并放行一组自定义域名：任一语法非法或不在白名单内即拒绝该代理注册。
+///
+/// 安全评审 P2：此前 `custom_domains` 被**原样**写进 vhost 路由表，服务端既
+/// 不校验语法也不校验归属 ⇒ 任意客户端可注册任意域名抢占 Host 匹配。
+fn check_domains(
+    proxy_name: &str,
+    domains: &[String],
+    allowlist: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for domain in domains {
+        if let Err(reason) = rust_frp_config::validate_custom_domain(domain) {
+            return Err(format!(
+                "proxy [{proxy_name}] rejected: custom domain {domain:?} is invalid ({reason})"
+            )
+            .into());
+        }
+        if !domain_allowed(domain, allowlist) {
+            return Err(format!(
+                "proxy [{proxy_name}] rejected: custom domain {domain:?} is not covered by \
+                 the server custom_domains_allowlist"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// 汇总 tcpmux 代理的域名（custom_domains 优先，附加 subdomain）
 fn build_tcpmux_domains(config: &rust_frp_config::ProxyConfig) -> Vec<String> {
     let mut domains = config.custom_domains.clone().unwrap_or_default();
@@ -317,6 +384,7 @@ impl ServerProxyManager {
         let ProxyManagerOptions {
             allow_ports,
             max_ports_per_user,
+            custom_domains_allowlist,
             tcpmux_port,
             plugin_manager,
         } = options;
@@ -336,6 +404,7 @@ impl ServerProxyManager {
             work_conn_manager,
             allow_ports,
             max_ports_per_user,
+            custom_domains_allowlist,
             user_port_counts: RwLock::new(std::collections::HashMap::new()),
             proxy_user_ports: RwLock::new(std::collections::HashMap::new()),
             accept_handles: RwLock::new(std::collections::HashMap::new()),
@@ -404,6 +473,7 @@ impl ServerProxyManager {
         }
 
         let domains = build_tcpmux_domains(config);
+        check_domains(&config.name, &domains, &self.custom_domains_allowlist)?;
         if domains.is_empty() {
             return Err(format!(
                 "proxy [{}] rejected: tcpmux requires custom_domains or subdomain",
@@ -543,6 +613,9 @@ impl ServerProxyManager {
         if let Some(subdomain) = &config.subdomain {
             domains.push(subdomain.clone());
         }
+
+        // 先校验域名（语法 + 白名单归属），不通过直接拒绝注册
+        check_domains(&config.name, &domains, &self.custom_domains_allowlist)?;
 
         if !domains.is_empty() {
             self.http_vhost_router
@@ -1228,5 +1301,65 @@ impl ProxyManager for ServerProxyManager {
         } else {
             Err(format!("UDP proxy session not found: {}", proxy_name).into())
         }
+    }
+}
+
+#[cfg(test)]
+mod domain_gate_tests {
+    use super::{check_domains, domain_allowed};
+
+    fn owned(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn empty_allowlist_means_no_ownership_restriction() {
+        // 默认行为零破坏：未配白名单时不限制归属
+        assert!(domain_allowed("any.example.com", &[]));
+        assert!(check_domains("p", &owned(&["any.example.com"]), &[]).is_ok());
+    }
+
+    #[test]
+    fn exact_and_wildcard_allowlist_matching() {
+        let wl = owned(&["app.example.com", "*.corp.example.com"]);
+        assert!(domain_allowed("app.example.com", &wl));
+        // 大小写不敏感，避免 Example.com 绕过
+        assert!(domain_allowed("APP.Example.COM", &wl));
+        // 通配条目覆盖子域
+        assert!(domain_allowed("a.corp.example.com", &wl));
+        assert!(domain_allowed("deep.a.corp.example.com", &wl));
+        assert!(domain_allowed("*.corp.example.com", &wl));
+        // 精确条目不放行子域；通配条目**不覆盖 apex**（需另写精确条目）
+        assert!(!domain_allowed("evil.app.example.com", &wl));
+        assert!(!domain_allowed("corp.example.com", &wl));
+        assert!(!domain_allowed("example.com", &wl));
+        // apex 想要放行必须显式写出来
+        let with_apex = owned(&["app.example.com", "corp.example.com", "*.corp.example.com"]);
+        assert!(domain_allowed("corp.example.com", &with_apex));
+        // 典型攻击：注册别人的域名
+        assert!(!domain_allowed("victim.com", &wl));
+        // 后缀混淆：notcorp.example.com 不能被 *.corp.example.com 放行
+        assert!(!domain_allowed("notcorp.example.com", &wl));
+    }
+
+    #[test]
+    fn malformed_domain_is_rejected_even_without_allowlist() {
+        let err = check_domains("p", &owned(&["evil..example.com"]), &[]).unwrap_err();
+        assert!(err.to_string().contains("is invalid"), "{err}");
+    }
+
+    #[test]
+    fn allowlist_violation_is_rejected_with_clear_reason() {
+        let wl = owned(&["*.corp.example.com"]);
+        let err = check_domains("p", &owned(&["victim.com"]), &wl).unwrap_err();
+        assert!(
+            err.to_string().contains("custom_domains_allowlist"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn empty_domain_list_passes() {
+        assert!(check_domains("p", &[], &owned(&["a.example.com"])).is_ok());
     }
 }

@@ -1476,13 +1476,18 @@ enable = true
 trusted_ca_file = "/opt/rust_frp/certs/ca.crt"
 ```
 
-### 轮换
+### 轮换 / 重签
 
 ```bash
-cd /home/qianqianjie/.rust_frp-certs && SERVER_IP=123.57.86.80 ./gen-certs.sh
+cd /home/qianqianjie/.rust_frp-certs
+sudo ./ca_backup.sh                                 # ① 先备份（重建会丢弃旧 CA 私钥）
+CA_FORCE=1 SERVER_IP=123.57.86.80 ./gen-certs.sh    # ② 重建整套 PKI
 ```
 
-重新生成会换新 CA ⇒ 客户端 `ca.crt` 必须同步更新。
+⚠️ `gen-certs.sh` 会**重建 CA**：线上已部署的 `server.crt` / `client-*.crt` 立即全部失效，
+客户端 `ca.crt` 必须同步更新，且**旧 CA 私钥不可恢复**。因此脚本检测到已有
+`ca.key`/`ca.crt` 时会**拒绝执行**，必须显式 `CA_FORCE=1`。
+
 **升级顺序**：先服务端（换证书，旧客户端因 `skip_verify` 不受影响）→ 再客户端（切 CA）。
 
 ---
@@ -1527,12 +1532,16 @@ cert_file = "/opt/rust_frp/certs/client-<主机>.crt"
 key_file  = "/opt/rust_frp/certs/client-<主机>.key"
 ```
 
-签发客户端证书（脚本已内建，`EKU = clientAuth`，无 SAN）：
+签发客户端证书（**复用现有 CA**，`EKU = clientAuth`，无 SAN）：
 
 ```bash
 cd /home/qianqianjie/.rust_frp-certs
-CLIENTS="cli32 cli75" SERVER_IP=123.57.86.80 ./gen-certs.sh
+CLIENTS="cli32 cli75" ./gen-client-certs.sh
 ```
+
+> ⚠️ **补签客户端证书必须用 `gen-client-certs.sh`，不要用 `gen-certs.sh`**：后者会
+> **重建 CA**，使线上已部署的全部证书立即失效并丢弃旧 CA 私钥。现在 `gen-certs.sh`
+> 检测到已有 CA 会拒绝执行（需 `CA_FORCE=1`）。CA 材料备份用 `sudo ./ca_backup.sh`。
 
 ### 三阶段灰度（可随时回滚）
 

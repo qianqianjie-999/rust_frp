@@ -114,8 +114,25 @@ jobs:
 
       - name: Verify static linking
         run: |
-          file target/x86_64-unknown-linux-musl/release/rust_frps | grep -q "statically linked" || exit 1
-          file target/x86_64-unknown-linux-musl/release/rust_frpc | grep -q "statically linked" || exit 1
+          # 判据修正（2026-10-05）：musl 产物 PIE 化后 `file` 输出为 "static-pie linked"，
+          # 原判据只认 "statically linked" ⇒ 永远匹配不上、永久假红（实测确认）。
+          # 现改为「措辞兼容 + 实质校验」双轨：
+          #   1) file 接受两种措辞（快速失败，给出可读原因）
+          #   2) readelf 断言无 DT_NEEDED —— 这才是"换机即跑"的真正判据
+          for bin in rust_frps rust_frpc; do
+            f="target/x86_64-unknown-linux-musl/release/$bin"
+            [ -f "$f" ] || { echo "ERROR: 缺少产物 $f"; exit 1; }
+            if ! file "$f" | grep -qE "statically linked|static-pie linked"; then
+              echo "ERROR: $bin 非静态链接：$(file "$f")"
+              exit 1
+            fi
+            if readelf -d "$f" 2>/dev/null | grep -q "(NEEDED)"; then
+              echo "ERROR: $bin 含 DT_NEEDED 动态依赖，换机可能报 GLIBC not found："
+              readelf -d "$f" | grep "(NEEDED)"
+              exit 1
+            fi
+            echo "$bin: static OK（无 DT_NEEDED）"
+          done
 
       - name: Upload server binary (static)
         uses: actions/upload-artifact@v4
