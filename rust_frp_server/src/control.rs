@@ -463,6 +463,11 @@ impl Control {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.last_heartbeat = Instant::now();
 
+        // additionalScopes 含 heartBeats 时强校验心跳签名（fail-closed：
+        // 缺失/错误签名 → 断开控制连接，对齐原版 VerifyPing 语义）
+        self.auth_manager
+            .verify_ping_privilege_key(ping_msg.timestamp, &ping_msg.privilege_key)?;
+
         // 服务端插件回调：Ping（reject 时回带 error 的 Pong，客户端据此重连）
         let mut plugin_content = serde_json::json!({
             "user": self.plugin_user_info(),

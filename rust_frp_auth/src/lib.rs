@@ -841,6 +841,12 @@ pub struct AuthManager {
 
     /// 加密密钥（SHA256(token)）
     encryption_key: Option<Vec<u8>>,
+
+    /// 静态 token（`auth.additionalScopes` 含 heartBeats 时用于心跳签名）
+    token: Option<String>,
+
+    /// 额外签名范围（对齐原版 `auth.additionalScopes`）
+    additional_scopes: Vec<String>,
 }
 
 impl AuthManager {
@@ -894,7 +900,66 @@ impl AuthManager {
         Ok(Self {
             verifier,
             encryption_key,
+            token: auth_config.token.clone(),
+            additional_scopes: auth_config.additional_scopes.clone().unwrap_or_default(),
         })
+    }
+
+    /// `additionalScopes` 是否包含 `heartBeats`
+    pub fn heartbeats_scope_enabled(&self) -> bool {
+        self.additional_scopes.iter().any(|s| s == "heartBeats")
+    }
+
+    /// 生成心跳签名（`additionalScopes` 含 `heartBeats` 且配置了静态 token 时）
+    ///
+    /// # 算法
+    ///
+    /// ```text
+    /// privilege_key = Base64(HMAC-SHA256(token, "ping:" + timestamp))
+    /// ```
+    ///
+    /// 域分隔前缀 `ping:` 与工作连接签名隔离，避免签名跨协议重放。
+    pub fn ping_privilege_key(&self, timestamp: i64) -> Option<String> {
+        if !self.heartbeats_scope_enabled() {
+            return None;
+        }
+        let token = self.token.as_deref()?;
+        let msg = format!("ping:{timestamp}");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes());
+        let tag = hmac::sign(&key, msg.as_bytes());
+        Some(base64::encode(tag.as_ref()))
+    }
+
+    /// 校验心跳签名（常量时间比较；未启用 scope 或无 token 时返回 `Ok`）
+    ///
+    /// fail-closed：启用 `heartBeats` scope 后，缺少/错误的签名都会被拒绝。
+    pub fn verify_ping_privilege_key(
+        &self,
+        timestamp: i64,
+        privilege_key: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.heartbeats_scope_enabled() {
+            return Ok(());
+        }
+        let expected = self.ping_privilege_key(timestamp).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "heartbeats scope enabled but no static token configured",
+            )
+        })?;
+        let ok = ring::constant_time::verify_slices_are_equal(
+            expected.as_bytes(),
+            privilege_key.as_bytes(),
+        )
+        .is_ok();
+        if ok {
+            Ok(())
+        } else {
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "token in heartbeat doesn't match token from configuration",
+            )))
+        }
     }
 
     /// 生成加密密钥
@@ -1100,6 +1165,7 @@ mod tests {
             token: Some("my_token".to_string()),
             oidc: None,
             token_source: None,
+            additional_scopes: None,
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_ok());
@@ -1112,6 +1178,7 @@ mod tests {
             token: None,
             oidc: None,
             token_source: None,
+            additional_scopes: None,
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_err());
@@ -1124,6 +1191,7 @@ mod tests {
             token: Some("token".to_string()),
             oidc: None,
             token_source: None,
+            additional_scopes: None,
         };
         let manager = AuthManager::new(&config);
         assert!(manager.is_err());
@@ -1136,6 +1204,7 @@ mod tests {
             token: Some("my_token".to_string()),
             oidc: None,
             token_source: None,
+            additional_scopes: None,
         };
         let manager = AuthManager::new(&config).unwrap();
         assert!(manager.encryption_key().is_some());
@@ -1149,6 +1218,7 @@ mod tests {
             token: Some("my_token".to_string()),
             oidc: None,
             token_source: None,
+            additional_scopes: None,
         };
         let manager = AuthManager::new(&config).unwrap();
         assert!(manager.verify_login("user", "my_token").await.is_ok());
@@ -1162,6 +1232,7 @@ mod tests {
             token: Some("my_token".to_string()),
             oidc: None,
             token_source: None,
+            additional_scopes: None,
         };
         let manager = AuthManager::new(&config).unwrap();
         let key1 = manager
@@ -1613,6 +1684,7 @@ ifGHE5azp2Lav/Kni6rRwBQ=
             token: None,
             oidc: Some(oidc_cfg("https://issuer.example.com", "frp-server")),
             token_source: None,
+            additional_scopes: None,
         };
         assert!(AuthManager::new(&ok).is_ok());
 
@@ -1621,7 +1693,46 @@ ifGHE5azp2Lav/Kni6rRwBQ=
             token: None,
             oidc: None,
             token_source: None,
+            additional_scopes: None,
         };
         assert!(AuthManager::new(&missing).is_err());
+    }
+    /// additionalScopes heartBeats：签名与校验闭环、错误签名拒绝、未启用放行
+    #[test]
+    fn test_ping_privilege_key_scope() {
+        let cfg_with_scope = AuthConfig {
+            method: "token".to_string(),
+            token: Some("secret-token".to_string()),
+            additional_scopes: Some(vec!["heartBeats".to_string()]),
+            ..Default::default()
+        };
+        let manager = AuthManager::new(&cfg_with_scope).unwrap();
+        assert!(manager.heartbeats_scope_enabled());
+
+        let key = manager
+            .ping_privilege_key(1728000000)
+            .expect("key generated");
+        manager
+            .verify_ping_privilege_key(1728000000, &key)
+            .expect("valid signature must verify");
+        manager
+            .verify_ping_privilege_key(1728000000, "bad-signature")
+            .expect_err("wrong signature must be rejected");
+        manager
+            .verify_ping_privilege_key(9999999999, &key)
+            .expect_err("timestamp mismatch must be rejected");
+
+        // 未启用 scope：不生成、不校验
+        let cfg_plain = AuthConfig {
+            method: "token".to_string(),
+            token: Some("secret-token".to_string()),
+            ..Default::default()
+        };
+        let manager = AuthManager::new(&cfg_plain).unwrap();
+        assert!(!manager.heartbeats_scope_enabled());
+        assert!(manager.ping_privilege_key(1).is_none());
+        manager
+            .verify_ping_privilege_key(1, "anything")
+            .expect("scope disabled must not verify");
     }
 }

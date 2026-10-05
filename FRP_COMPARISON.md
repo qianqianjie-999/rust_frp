@@ -29,7 +29,7 @@
 | 语言 / 构建 | Rust（cargo workspace，8 crate） | Go（单 module） | — |
 | 核心代码量 | ~19,000 行 | ~57,400 行（不含 web） | rust 约为原版 **1/3** |
 | 单元测试 | ~322 个 | ~300 个 `Test` 函数 | 基本相当 |
-| 能力覆盖率 | **≈ 89%（65/73）** ｜ 数据面 **100%（26/26）**、控制/运维面 **83%（39/47）** | 100%（基线） | 见第二节 |
+| 能力覆盖率 | **≈ 90%（66/73）** ｜ 数据面 **100%（26/26）**、控制/运维面 **85%（40/47）** | 100%（基线） | 见第二节 |
 | 配置字段兼容 | ⚠️ 双向 alias 兼容，但**约 25+ 个原版字段未支持**（解析成功 + WARN） | camelCase + 严格模式 | 原版配置**可加载**但部分字段不生效 |
 | 管理前端 | 原生 HTML/JS（内嵌） | Vue 3 + TS + Element Plus | 原版更强 |
 | CLI 子命令 | verify / reload / status / stop / nathole / 每类代理与访客 / `--config_dir` | reload / status / stop / verify / nathole / 每类代理 | rust 已基本对齐 |
@@ -54,7 +54,7 @@
 | 数据面能力 | **11/11** | 100% | —（PROXY protocol v1/v2 已落地，见 六、数据面能力对照） |
 | 客户端插件 | **9/10** | 90% | `virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 已支持普通 HTTP 转发） |
 | 服务端插件 | **1/2** | 50% | tracer 链路追踪 |
-| 认证与安全 | **4/7** | 57% | `additionalScopes`、SSH 隧道网关、FeatureGate/`--allow-unsafe` |
+| 认证与安全 | **5/7** | 71% | SSH 隧道网关、FeatureGate/`--allow-unsafe`（`additionalScopes` 已落地） |
 | frps 管理 API | **9/9** | 100% | —（v1 serverinfo/clients/按类型名称查询/流量 + v2 套件/分页/prune/users + DELETE offline 全部落地） |
 | frpc 管理 API | **3/5** | 60% | `/api/stop`、Store 源代理 CRUD |
 | CLI | **8/8** | 100% | —（`--strict_config` 已落地，且默认 true 与原版一致；关闭时为 WARN 模式） |
@@ -178,7 +178,7 @@
 | 工作连接签名 | ✅ HMAC-SHA256 + run_id | ✅ `GetAuthKey(token,ts)` | 等价（rust fail-closed：配了 token 就强制验签） |
 | OIDC 认证 | ✅ | ✅ 完整 | rust：Discovery + JWKS + RS256/ES256 验签 + 客户端 `client_credentials` |
 | tokenSource（file/exec 动态取 token） | ✅ | ✅ | 与静态 `token` 互斥，解析结果仅存内存 |
-| **auth additionalScopes** | ❌ | ✅ HeartBeats / NewWorkConns | 原版会在心跳/新工作连接上追加刷新令牌 |
+| **auth additionalScopes** | ✅ | ✅ HeartBeats / NewWorkConns | rust：`heartBeats` 心跳 Ping 附带 HMAC 签名（域分隔 `ping:` 前缀）+ 服务端常量时间校验、错误即断连（fail-closed，要求 token 认证）；`newWorkConns` 为兼容值（rust 工作连接签名始终强制，强于原版可选语义） |
 | **SSH 隧道网关** | ❌ | ✅ `SSHTunnelGateway`（forwarded-tcpip） | 原版独有 |
 | **FeatureGate / `--allow-unsafe`** | ❌ | ✅ | 原版独有 |
 | 登录防爆破 | ✅ 5 次失败锁 5 分钟 | ❌ 无 | **rust 更严** |
@@ -257,8 +257,8 @@
 
 | 侧 | 缺失字段（原版有，rust 无） |
 |----|------------------------------|
-| frps | `vhostHTTPTimeout`、`subDomainHost`（rust 用 `subdomain_base`）、`tcpmuxPassthrough`、`detailedErrorsToClient`、`userConnTimeout`、`maxPortsPerClient`（rust 用 `maxPortsPerUser`，命名不同）、`natholeAnalysisDataReserveHours`、`udpPacketSize`、`sshTunnelGateway`、`featureGates`、`auth.additionalScopes`、`transport.heartbeatTimeout`/`tcpKeepalive`/`maxPoolCount` |
-| frpc | `natHoleStunServer`、`dnsServer`、`loginFailExit`、`start`（按名启用代理）、`udpPacketSize`、`virtualNet`、`featureGates`、`store`、`auth.additionalScopes`、`transport.proxyURL`/`connectServerLocalIP`/`dialServerTimeout`/`dialServerKeepalive`/`tcpMuxKeepaliveInterval`/`heartbeatInterval`/`heartbeatTimeout` |
+| frps | `vhostHTTPTimeout`、`subDomainHost`（rust 用 `subdomain_base`）、`tcpmuxPassthrough`、`detailedErrorsToClient`、`userConnTimeout`、`maxPortsPerClient`（rust 用 `maxPortsPerUser`，命名不同）、`natholeAnalysisDataReserveHours`、`udpPacketSize`、`sshTunnelGateway`、`featureGates`、`transport.heartbeatTimeout`/`tcpKeepalive`/`maxPoolCount` |
+| frpc | `natHoleStunServer`、`dnsServer`、`loginFailExit`、`start`（按名启用代理）、`udpPacketSize`、`virtualNet`、`featureGates`、`store`、`transport.proxyURL`/`connectServerLocalIP`/`dialServerTimeout`/`dialServerKeepalive`/`tcpMuxKeepaliveInterval`/`heartbeatInterval`/`heartbeatTimeout` |
 | 代理 | HTTP/HTTPS：`requestHeaders`、`responseHeaders`、`routeByHTTPUser`；PROXY protocol v2 |
 
 > 兼容策略差异：原版 `--strict_config` 默认 **true**（未知字段直接报错）；rust 采取
@@ -292,7 +292,7 @@
 |---|------|------|
 | 5 | ~~QUIC 传输~~ | ✅ 已落地（quinn 0.11 + rustls-ring，TLS 1.3 强制、fail-closed） |
 | 6 | ~~`use_compression` 压缩~~ | ✅ 已落地（snappy） |
-| 7 | ~~OIDC 完整流程~~ | ✅ 已落地（Discovery + JWKS + RS256/ES256）。**残留**：`additionalScopes` 未做 |
+| 7 | ~~OIDC 完整流程~~ | ✅ 已落地（Discovery + JWKS + RS256/ES256）。~~残留：additionalScopes 未做~~ → 已落地（2026-10-05，heartBeats 签名 + 强校验） |
 | 8 | ~~tcpmux 代理~~ | ✅ 已落地 |
 | 9 | ~~sudp 代理~~ | ✅ 已落地 |
 | 10 | ~~服务端插件机制~~ | ✅ 已落地（6 类回调钩子）。**残留**：tracer 未做 |

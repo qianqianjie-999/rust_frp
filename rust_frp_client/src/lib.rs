@@ -909,8 +909,14 @@ impl ClientControl {
         loop {
             // 定期发送 ping 消息
             if last_ping_time.elapsed() > std::time::Duration::from_secs(heartbeat_interval_secs) {
+                let timestamp = get_timestamp();
+                // additionalScopes 含 heartBeats 时附带 HMAC 签名（未启用则为空串）
                 let ping_msg = rust_frp_core::PingMsg {
-                    timestamp: get_timestamp(),
+                    timestamp,
+                    privilege_key: self
+                        .auth_manager
+                        .ping_privilege_key(timestamp)
+                        .unwrap_or_default(),
                 };
                 log::debug!("Sending ping message, count: {}", msg_count);
                 if let Err(e) = self.conn.write_message(&Message::Ping(ping_msg)).await {
@@ -1947,8 +1953,10 @@ fn spawn_sudp_heartbeat(out_tx: mpsc::Sender<Message>) -> tokio::task::JoinHandl
         ticker.tick().await; // 跳过 interval 的立即首次 tick
         loop {
             ticker.tick().await;
+            // sudp 隧道内 keepalive（frpc↔frpc），非控制面心跳，不做 additionalScopes 签名
             let ping = Message::Ping(rust_frp_core::PingMsg {
                 timestamp: get_timestamp(),
+                privilege_key: String::new(),
             });
             if out_tx.send(ping).await.is_err() {
                 break;

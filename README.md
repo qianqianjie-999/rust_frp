@@ -57,6 +57,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 客户端插件认证 | ✅ | `http_proxy` 校验 `Proxy-Authorization: Basic`（失败 407）；`socks5` 按 RFC 1929 校验 `username`/`password`（失败回 `0x01/0x01`）；未配置凭据时为匿名 / 无认证（与原版一致） |
 | OIDC 认证 | ✅ | 服务端：issuer Discovery + JWKS 拉取 + RS256/ES256 验签（按 `kid` 选钥、支持密钥轮转）；客户端：`client_credentials` 换取 `access_token` |
 | tokenSource 动态令牌 | ✅ | `auth.tokenSource`：`type = "file"` 读文件 / `type = "exec"` 执行命令取 stdout；与静态 `token` 互斥，客户端启动与配置重载时解析（仅存内存） |
+| additionalScopes | ✅ | `auth.additionalScopes`：`heartBeats` 心跳 Ping 附带 HMAC 签名并由服务端强校验（fail-closed，要求 token 认证）；`newWorkConns` 兼容值（rust 工作连接签名始终强制） |
 | 配置热重载 | ✅ | 支持 SIGHUP/文件监听/API |
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
@@ -1227,8 +1228,11 @@ pub struct QuicOptions {
 + `client_secret`，可选 `audience` / `scope` / `additionalEndpointParams`），
 把返回的 `access_token` 作为登录令牌；每次登录/重连都会重新获取。
 
-**已知限制**：尚未实现 `auth.additionalScopes`（原版会在心跳 / 新工作连接上
-追加刷新令牌）；工作连接的认证依赖服务端签发的 `run_id` 会话绑定。
+**additionalScopes**（`auth.additionalScopes`，已实现）：`heartBeats` 启用后
+客户端每次心跳 Ping 附带 HMAC 签名（`Base64(HMAC-SHA256(token, "ping:" + timestamp))`），
+服务端常量时间校验，缺失 / 错误签名直接断开控制连接（fail-closed，要求
+`auth.method = "token"`）；`newWorkConns` 为兼容值——rust 的工作连接签名**始终强制**，
+强于原版的可选语义。
 
 ### 配置热重载
 

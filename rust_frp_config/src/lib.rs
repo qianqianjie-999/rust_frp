@@ -450,6 +450,14 @@ pub struct AuthConfig {
     #[serde(alias = "tokenSource")]
     pub token_source: Option<TokenSource>,
 
+    /// 额外签名范围（对齐原版 frp 的 `auth.additionalScopes`）
+    ///
+    /// 可选值：`"heartBeats"`（心跳 Ping 附带 HMAC 签名并由服务端强校验）、
+    /// `"newWorkConns"`（工作连接签名；rust 始终强制签名，此值仅为配置兼容）。
+    /// `heartBeats` 需要 `auth.method = "token"`（签名密钥来自 token，fail-closed）。
+    #[serde(alias = "additionalScopes")]
+    pub additional_scopes: Option<Vec<String>>,
+
     /// OIDC 配置（当 method = "oidc" 时使用）
     pub oidc: Option<OidcConfig>,
 }
@@ -460,6 +468,7 @@ impl Default for AuthConfig {
             method: "token".to_string(),
             token: None,
             token_source: None,
+            additional_scopes: None,
             oidc: None,
         }
     }
@@ -1876,6 +1885,43 @@ impl ConfigLoader {
     }
 
     /// 校验 `auth.tokenSource`：与静态 token 互斥、类型合法、必填字段到位。
+    /// 校验 `auth.additional_scopes`（对齐原版 `auth.additionalScopes`）
+    ///
+    /// - 值仅允许 `heartBeats` / `newWorkConns`；
+    /// - `heartBeats` 的 Ping 签名密钥来自静态 token，必须 `method = "token"`
+    ///   且 token 非空（fail-closed，OIDC 动态令牌不支持心跳签名）。
+    fn validate_additional_scopes(auth: &AuthConfig) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(scopes) = auth.additional_scopes.as_ref() else {
+            return Ok(());
+        };
+        for scope in scopes {
+            if !["heartBeats", "newWorkConns"].contains(&scope.as_str()) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "auth.additional_scopes value {:?} is not supported (expected \"heartBeats\" or \"newWorkConns\")",
+                        scope
+                    ),
+                )));
+            }
+        }
+        if scopes.iter().any(|s| s == "heartBeats")
+            && (auth.method != "token"
+                || auth
+                    .token
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty())
+        {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "auth.additional_scopes \"heartBeats\" requires auth.method = \"token\" with a non-empty token",
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_token_source(auth: &AuthConfig) -> Result<(), Box<dyn std::error::Error>> {
         let Some(ts) = auth.token_source.as_ref() else {
             return Ok(());
@@ -2044,6 +2090,9 @@ impl ConfigLoader {
                 }
             }
         }
+
+        // additionalScopes：值必须合法；heartBeats 签名依赖静态 token（fail-closed）
+        Self::validate_additional_scopes(&config.auth)?;
 
         // OIDC 客户端：client_credentials 需要 client_id 与绝对 http(s) 的令牌端点。
         match config.auth.method.as_str() {
@@ -3205,5 +3254,85 @@ remote_port = 6000
         let err = ConfigLoader::validate_client_config_content(&toml)
             .expect_err("unknown proxy protocol version must be rejected");
         assert!(err.to_string().contains("proxy_protocol_version"), "{err}");
+    }
+    #[cfg(test)]
+    mod additional_scopes_tests {
+        use super::*;
+
+        /// camelCase 别名解析 + 合法值
+        #[test]
+        fn camel_case_alias_parses() {
+            let toml = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth]
+method = "token"
+token = "t"
+additionalScopes = ["heartBeats", "newWorkConns"]
+"#;
+            let cfg = ConfigLoader::validate_client_config_content(toml)
+                .expect("additionalScopes must validate with token auth");
+            assert_eq!(
+                cfg.auth.additional_scopes.as_deref(),
+                Some(&["heartBeats".to_string(), "newWorkConns".to_string()][..])
+            );
+        }
+
+        /// 非法值被拒绝
+        #[test]
+        fn unknown_scope_rejected() {
+            let toml = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth]
+method = "token"
+token = "t"
+additional_scopes = ["logins"]
+"#;
+            let err = ConfigLoader::validate_client_config_content(toml)
+                .expect_err("unknown scope must be rejected");
+            assert!(err.to_string().contains("additional_scopes"), "{err}");
+        }
+
+        /// heartBeats + 空静态 token 被拒绝（签名密钥依赖非空 token，fail-closed）
+        #[test]
+        fn heartbeats_scope_requires_nonempty_token() {
+            let toml = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth]
+method = "token"
+additional_scopes = ["heartBeats"]
+"#;
+            let err = ConfigLoader::validate_client_config_content(toml)
+                .expect_err("heartBeats without token must be rejected");
+            assert!(err.to_string().contains("heartBeats"), "{err}");
+        }
+
+        /// heartBeats + OIDC 被拒绝（签名密钥依赖静态 token）
+        #[test]
+        fn heartbeats_with_oidc_rejected() {
+            let toml = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[auth]
+method = "oidc"
+additional_scopes = ["heartBeats"]
+
+[auth.oidc]
+client_id = "cid"
+token_endpoint_url = "https://idp.example.com/token"
+
+[auth.oidc.client_credentials]
+client_secret = "s"
+"#;
+            let err = ConfigLoader::validate_client_config_content(toml)
+                .expect_err("heartBeats scope with oidc must be rejected");
+            assert!(err.to_string().contains("heartBeats"), "{err}");
+        }
     }
 }
