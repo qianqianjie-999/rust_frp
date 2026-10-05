@@ -52,7 +52,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 应用层压缩 | ✅ | `use_compression`：工作连接 snappy 压缩（**需两端配置一致**；与 `use_encryption` 可叠加，顺序为先压缩后加密） |
 | tcpmux 代理 | ✅ | HTTP CONNECT 复用：服务器在 `tcpmux_http_connect_port` 单端口按域名（+ 可选 `route_by_http_user` / `http_user` / `http_password`）路由，多个 tcpmux 代理共享同一端口 |
 | sudp 代理 | ✅ | 安全 UDP：经 STCP 隧道承载 UDP 报文（`secret_key` 签名校验与 STCP 一致），代理端/访问端各自监听本地 UDP |
-| 客户端插件 | ✅ | `unix_domain_socket`、`static_file`（路径遍历防护）、`http_proxy`（仅 CONNECT）、`socks5`、`https2http`/`tls2raw`、`https2https`、`http2http`、`http2https`（Host 改写 + 请求头注入）；认证类凭据常量时间比较 |
+| 客户端插件 | ✅ | `unix_domain_socket`、`static_file`（路径遍历防护）、`http_proxy`（CONNECT 隧道 + 普通 HTTP 正向代理）、`socks5`、`https2http`/`tls2raw`、`https2https`、`http2http`、`http2https`（Host 改写 + 请求头注入）；认证类凭据常量时间比较 |
 | 服务端 HTTP 插件 | ✅ | `[[http_plugins]]`：六类事件回调（Login/NewProxy/CloseProxy/Ping/NewWorkConn/NewUserConn），支持 `reject` 拒绝 + `unchange` 覆写；https 地址可用 `tls_verify` 控制证书校验 |
 | 客户端插件认证 | ✅ | `http_proxy` 校验 `Proxy-Authorization: Basic`（失败 407）；`socks5` 按 RFC 1929 校验 `username`/`password`（失败回 `0x01/0x01`）；未配置凭据时为匿名 / 无认证（与原版一致） |
 | OIDC 认证 | ✅ | 服务端：issuer Discovery + JWKS 拉取 + RS256/ES256 验签（按 `kid` 选钥、支持密钥轮转）；客户端：`client_credentials` 换取 `access_token` |
@@ -68,7 +68,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 
 > **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 81%。尚未支持的主要项：
 > 客户端插件 `virtual_net`
-> （另：`http_proxy` 仅支持 `CONNECT` 隧道，普通 HTTP 转发未实现）、服务端 tracer、
+> 服务端 tracer、
 > `auth.additionalScopes`、SSH 隧道网关、`--strict_config`、Store 配置源等。
 > 逐项源码级对照与本项目更严格的安全默认值，见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md)。
 
@@ -85,7 +85,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 会话机制 | 随机会话令牌 + 服务端存储 + 8 小时过期 + `HttpOnly; SameSite=Strict` | 反向代理声明 `X-Forwarded-Proto: https` 时会自动附加 `Secure` |
 | 配置文件 | `frpc.toml` / `frps.toml` 已被 `.gitignore` 忽略，仅提供 `*.example.toml` | 不要把含 token/密码的配置提交进版本库 |
 | STCP/XTCP 访问鉴权 | 已实现 `secret_key` 签名校验（fail-closed：代理未配 `secret_key` 时拒绝一切访问请求）；支持跨客户端访问 | 代理与访问者配置一致的强 `secret_key` |
-| 插件认证 | ✅ **已强制**：`http_proxy` 校验 `Proxy-Authorization: Basic`（失败 407），`socks5` 按 RFC 1929 校验 `username`/`password`（失败回 `0x01/0x01`）；凭据一律**常量时间比较**；未配置凭据时为匿名 / 无认证 | 需要访问控制时配置强凭据；`http_proxy` 目前仅支持 `CONNECT` 隧道（普通 HTTP 转发未实现） |
+| 插件认证 | ✅ **已强制**：`http_proxy` 校验 `Proxy-Authorization: Basic`（失败 407），`socks5` 按 RFC 1929 校验 `username`/`password`（失败回 `0x01/0x01`）；凭据一律**常量时间比较**；未配置凭据时为匿名 / 无认证 | 需要访问控制时配置强凭据；`http_proxy` 已同时支持 `CONNECT` 隧道与普通 HTTP 正向代理（目标支持绝对形式 / origin 形式） |
 
 ---
 
@@ -1031,7 +1031,7 @@ ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewWorkConn", "NewUserConn"]
 |------|------|----------|
 | `unix_domain_socket` | 转发到本地 Unix 域套接字 | `unix_path` |
 | `static_file` | 提供静态文件（含路径遍历防护） | `local_path`、`strip_prefix`；可选 `http_user` / `http_password` 强制 Basic Auth |
-| `http_proxy` | HTTP CONNECT 隧道代理 | `http_user` / `http_password`：校验 `Proxy-Authorization: Basic`，失败返回 407 |
+| `http_proxy` | HTTP 代理（CONNECT 隧道 + 普通 HTTP 正向代理，绝对形式 / origin 形式目标；`https://` 目标以验证模式建立 TLS） | `http_user` / `http_password`：校验 `Proxy-Authorization: Basic`，失败返回 407 |
 | `socks5` | SOCKS5 代理（CONNECT，支持 IPv4 / 域名 / IPv6） | `username` / `password`：按 RFC 1929 强制认证，失败回 `0x01/0x01` |
 | `https2http` / `tls2raw` | 访客 TLS 接入 → 终止 TLS → 明文桥接本地服务 | `local_addr`；`crt_path` / `key_path`（缺省内置自签证书，仅加密不认证） |
 | `https2https` | 访客 TLS 接入 → 终止 TLS → 再次 TLS 连接本地服务 | 同上 |
@@ -1063,7 +1063,7 @@ request_headers.set.x-from-where = "frp"
 ```
 
 > 认证凭据一律**常量时间比较**；未配置凭据时保持匿名（`http_proxy`）/ 无认证（`socks5`）语义，与原版一致。
-> `http_proxy` 当前仅实现 `CONNECT`（HTTPS 隧道），非 CONNECT 请求返回 `405`（普通 HTTP 转发未实现）。
+> `http_proxy` 普通 HTTP 转发对齐原版 `removeProxyHeaders` 语义（剥离 `Connection` / `Proxy-*` / `TE` / `Trailers` / `Upgrade`），代理凭据绝不透传给源站；`https://` 绝对形式目标以内置根证书验证 TLS。
 > `http2http` / `http2https` 支持 `Content-Length` 与 `chunked` 报文体、访客侧 keep-alive 复用；
 > 到本地服务的连接按「每请求一条」建立（不做上游连接池复用），与原版行为有性能差异但语义一致。
 

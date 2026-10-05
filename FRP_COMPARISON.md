@@ -52,7 +52,7 @@
 | 传输协议 | **5/5** | 100% | —（`wss` 已落地，见 五、传输与协议对照） |
 | 内部线协议 | **2/2** | 100% | —（v1 与 v2 双版本均已落地，见 五、传输与协议对照） |
 | 数据面能力 | **10/11** | 91% | PROXY protocol v2（rust 仅 v1 布尔开关） |
-| 客户端插件 | **9/10** | 90% | `virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 仍仅支持 CONNECT） |
+| 客户端插件 | **9/10** | 90% | `virtual_net`（`http_proxy`/`socks5` 认证已强制；`http_proxy` 已支持普通 HTTP 转发） |
 | 服务端插件 | **1/2** | 50% | tracer 链路追踪 |
 | 认证与安全 | **4/7** | 57% | `additionalScopes`、SSH 隧道网关、FeatureGate/`--allow-unsafe` |
 | frps 管理 API | **9/9** | 100% | —（v1 serverinfo/clients/按类型名称查询/流量 + v2 套件/分页/prune/users + DELETE offline 全部落地） |
@@ -148,7 +148,7 @@
 |------|:--------:|:--------:|------|
 | unix_domain_socket | ✅ | ✅ | 等价 |
 | static_file | ✅（含路径遍历防护 + Basic Auth） | ✅（gorilla/mux） | rust 安全加固更强 |
-| http_proxy | ✅（认证已强制） | ✅ | rust 校验 `Proxy-Authorization: Basic`（常量时间），失败 407；**仅支持 CONNECT**，普通 HTTP 转发未实现 |
+| http_proxy | ✅（认证已强制） | ✅ | rust 校验 `Proxy-Authorization: Basic`（常量时间），失败 407；普通 HTTP 转发已实现（绝对形式 / origin 形式目标，对齐原版 `removeProxyHeaders`；`https://` 目标以验证模式 TLS） |
 | socks5 | ✅（认证已强制，已支持 IPv6） | ✅（支持认证 + IPv6） | rust 按 RFC 1929 校验 `username`/`password`（常量时间）；本轮补齐 IPv6 |
 | https2http | ✅（`TlsOffloadPlugin`） | ✅ | 等价 |
 | tls2raw | ✅（与 https2http 同实现） | ✅ | 等价 |
@@ -298,7 +298,7 @@
 | 10 | ~~服务端插件机制~~ | ✅ 已落地（6 类回调钩子）。**残留**：tracer 未做 |
 | 11 | ~~优雅关闭~~ | ✅ 已落地 |
 | 12 | ~~流量统计~~ | ✅ 已落地 |
-| 13 | ~~`http_proxy`/`socks5` 插件级认证未强制~~ | ✅ 已落地（http_proxy → 407；socks5 → RFC 1929）。**残留**：`http_proxy` 仅支持 CONNECT |
+| 13 | ~~`http_proxy`/`socks5` 插件级认证未强制~~ | ✅ 已落地（http_proxy → 407；socks5 → RFC 1929）。~~残留：仅支持 CONNECT~~ → 普通 HTTP 转发已补齐（2026-10-05） |
 | 14 | ~~`wss` 传输~~ | ✅ 已落地（TLS + WebSocket，`/~!frp` 路径，双端嗅探升级；3 个 e2e 测试） |
 | 15 | ~~frpc `stop` / `nathole` / 每类代理子命令 / `--config_dir`~~ | ✅ 已落地（`stop` 走管理端 `POST /stop`；`nathole discover` 含 NAT 行为分类；9 类代理 + 3 类 visitor 快速启动；`--config_dir` 多实例；`--api-timeout`） |
 | 16 | ~~frps API 补齐~~（serverinfo / 按类型名称查询 / clients / v2 套件 / DELETE offline） | ✅ 已落地（v1 全端点 + v2 `{code,msg,data}` 信封 + 分页 + prune + users 聚合） |
@@ -329,10 +329,10 @@ PROXY protocol v2、`dnsServer`、`natHoleStunServer`、`loginFailExit`、`start
 2. ~~**frps API 补齐**（serverinfo、按类型/名称查询、clients、DELETE offline）~~ —— ✅ 已完成（v1 + v2 套件、分页信封、离线历史）。
 3. ~~**frpc CLI 补齐**（`stop`、`--config_dir`）~~ —— ✅ 已完成（另含 `nathole discover`、9 类代理/3 类 visitor 快速启动、`--api-timeout`）。
 4. ~~**`http2http` / `http2https` 插件**~~ —— ✅ 已完成（手写 HTTP/1.1 反代桥接，零新依赖）。
-5. **`http_proxy` 普通 HTTP 转发** —— 补齐与原版的最后一处插件语义差异。
+5. ~~**`http_proxy` 普通 HTTP 转发**~~ —— ✅ 已完成（绝对形式 / origin 形式目标，剥离代理头后转发并回写响应，keep-alive 复用；代理凭据不透传源站）。
 6. ~~**wire protocol v2**~~ —— ✅ 已完成（`transport.wire_protocol = "v2"` 可选启用，默认 v1 向后兼容；服务端自动嗅探魔数）。
 
-> ✅ 已完成：`http_proxy` / `socks5` 插件级认证；`wss` 传输（原建议路线第 1 项）；
+> ✅ 已完成：`http_proxy` / `socks5` 插件级认证；**`http_proxy` 普通 HTTP 转发**（原建议路线第 5 项）；`wss` 传输（原建议路线第 1 项）；
 > **frps 管理 API 补齐**（第 2 项）；**frpc CLI 补齐**（第 3 项）；
 > **`http2http` / `http2https` 插件**（第 4 项）；**wire protocol v2**（第 6 项）。
 
