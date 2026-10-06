@@ -356,16 +356,21 @@ mod tests {
         let path = dir.join("frps.log");
 
         let mut w = DailyFileWriter::new(&path, 3).expect("create writer");
+        // 轮转后的文件名用的是"被轮转内容所属日期"（= 写入时的当天），
+        // 因此必须从 writer 里取 —— 硬编码日期会让这个测试只在某一天通过
+        // （2026-10-06 实测：硬编码 "2026-10-05" 在次日必失败）。
+        let today = w.lock().date.clone();
+        let rotated = dir.join(format!("frps.log.{today}"));
+
         w.write_all(b"day-old\n").expect("write");
         w.flush().expect("flush");
 
-        // 模拟跨天：把"当前日期"设成 2026-10-05 触发轮转
+        // 触发一次轮转（跨天判定在 rotate_if_needed 里；这里直接调轮转原语）
         {
             let mut state = w.lock();
-            state.rotate_to("2026-10-05");
+            state.rotate_to(&today);
         }
 
-        let rotated = dir.join("frps.log.2026-10-05");
         assert!(rotated.exists(), "rotated file must exist");
         assert_eq!(read_to_string(&rotated), "day-old\n");
         // 新文件已重建且为空

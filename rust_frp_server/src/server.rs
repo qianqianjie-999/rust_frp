@@ -140,6 +140,27 @@ fn build_server_tls_config(
     Ok(net_tls)
 }
 
+/// P1 准入策略：服务端是否必须**拒绝**明文 WebSocket 控制连接。
+///
+/// 明文 ws 分支（`handle_connection` 首字节嗅探命中 `GET `）走的是
+/// `accept_websocket_stream`（不套 TLS）+ `spawn_control(..., None)`，
+/// **不校验客户端证书** —— 也就是说 `require_client_cert = true` 管不到它，
+/// 持 token 者可用 `ws://<frps>:<bind_port>` 绕过 mTLS 层。
+///
+/// 因此在这两种"服务端要求更强传输保证"的配置下直接拒绝：
+/// - `transport.tls.force`（本实现的 `tls_only`）：强制 TLS，明文一律拒绝；
+/// - `transport.tls.require_client_cert = true`：强制客户端证书。
+///
+/// 抽成纯函数是为了能被单测覆盖（`handle_connection` 内部无法单测）。
+fn plaintext_ws_must_be_rejected(tls_only: bool, tls: Option<&rust_frp_config::TlsConfig>) -> bool {
+    // `enable = false` 时全局就没有 TLS，拒绝明文 ws 只会造成"一半客户端连不上"，
+    // 不产生任何安全收益（该场景应靠配置校验解决，见 REFERENCE §12.3 后续项）。
+    let require_client_cert = tls
+        .map(|t| t.enable && t.require_client_cert)
+        .unwrap_or(false);
+    tls_only || require_client_cert
+}
+
 /// 服务器服务
 pub struct Server {
     config: ServerConfig,
@@ -1391,6 +1412,24 @@ impl Server {
                 Some(tls) if tls.enable => Some(build_server_tls_config(tls)?),
                 _ => None,
             };
+            // P1：明文 ws 控制连接的准入策略（需要更强的传输保证时直接拒绝）
+            let reject_plaintext_ws = plaintext_ws_must_be_rejected(
+                self.config.transport.tls_only,
+                self.config.transport.tls.as_ref(),
+            );
+            if reject_plaintext_ws {
+                log::info!(
+                    "Plaintext websocket control connections are rejected \
+                     (tls_only = {}, require_client_cert = {})",
+                    self.config.transport.tls_only,
+                    self.config
+                        .transport
+                        .tls
+                        .as_ref()
+                        .map(|t| t.require_client_cert)
+                        .unwrap_or(false)
+                );
+            }
 
             let mut reload_rx = self.reload_rx.take();
             let config_path = self.config_path.clone();
@@ -1429,7 +1468,13 @@ impl Server {
                             tokio::spawn(async move {
                                 let _conn_permit = permit;
                                 if let Err(e) =
-                                    Self::handle_connection(conn, managers, tls_config).await
+                                    Self::handle_connection(
+                                        conn,
+                                        managers,
+                                        tls_config,
+                                        reject_plaintext_ws,
+                                    )
+                                    .await
                                 {
                                     log::error!("handle connection error: {:?}", e);
                                 }
@@ -1478,7 +1523,10 @@ impl Server {
 
                     tokio::spawn(async move {
                         let _conn_permit = permit;
-                        if let Err(e) = Self::handle_connection(conn, managers, tls_config).await {
+                        if let Err(e) =
+                            Self::handle_connection(conn, managers, tls_config, reject_plaintext_ws)
+                                .await
+                        {
                             log::error!("handle connection error: {:?}", e);
                         }
                         metrics.decrement_connections();
@@ -1493,6 +1541,7 @@ impl Server {
         mut conn: tokio::net::TcpStream,
         managers: ServerManagers,
         tls_config: Option<TlsConfig>,
+        reject_plaintext_ws: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ServerManagers {
             control_manager,
@@ -1529,6 +1578,22 @@ impl Server {
         // 明文 WebSocket 控制连接：先完成 Upgrade，再按控制连接处理
         if sniffed_len > 0 && is_websocket_prefix(&first[..sniffed_len]) {
             let peer = conn.peer_addr().ok();
+            // P1：强制 TLS / 强制客户端证书时拒绝明文 ws ——
+            // 这条路径不套 TLS，拿不到客户端证书，会让"双因素"降级成单因素 token。
+            if reject_plaintext_ws {
+                global_metrics().incr_tls_rejects();
+                log::warn!(
+                    "Rejected plaintext websocket control connection from {:?}: \
+                     tls_only / require_client_cert is enabled, and this path cannot present a \
+                     client certificate",
+                    peer
+                );
+                return Err(
+                    "plaintext websocket control connection rejected: TLS client certificate \
+                     (mTLS) is required"
+                        .into(),
+                );
+            }
             log::info!("websocket control connection detected from {:?}", peer);
             let ws_conn =
                 rust_frp_net::accept_websocket_stream(conn, peer.unwrap_or_else(placeholder_addr))
@@ -1552,6 +1617,8 @@ impl Server {
                 None,
                 // 明文 WebSocket：未走 TLS 握手 ⇒ 无客户端证书指纹
                 None,
+                // P1 可观测性：走这条路的控制连接登录成功后要打 WARN
+                true,
             );
             return Ok(());
         }
@@ -1647,6 +1714,7 @@ impl Server {
             work_conn_tls,
             None,
             peer_cert_fingerprint,
+            false,
         );
 
         Ok(())
@@ -1699,12 +1767,17 @@ impl Server {
     /// 启动控制连接处理任务（登录注册 + 控制循环 + 退出清理）
     ///
     /// 返回任务句柄：多路复用路径在控制流退出后据此关闭会话。
+    ///
+    /// `plaintext_ws`：该控制连接是否来自**明文 WebSocket** 分支（无 TLS）。
+    /// 仅用于登录成功后的 WARN 提示（P1 可观测性）—— 原先这条路径完全静默，
+    /// 无法区分"扫描器踩到"与"合法客户端真在用"。
     fn spawn_control(
         conn: ControlConn,
         managers: ServerManagers,
         work_conn_tls: bool,
         pre_read_login: Option<rust_frp_core::LoginMsg>,
         peer_cert_fingerprint: Option<String>,
+        plaintext_ws: bool,
     ) -> tokio::task::JoinHandle<()> {
         let ServerManagers {
             control_manager,
@@ -1761,6 +1834,14 @@ impl Server {
             // 等待登录成功，然后注册 msg_tx 到 ControlManager
             if let Some(run_id) = login_rx.recv().await {
                 log::info!("Control registered for run_id: {}", run_id);
+                if plaintext_ws {
+                    log::warn!(
+                        "Control connection for run_id {} authenticated over a PLAINTEXT \
+                         websocket (no TLS ⇒ no client certificate check). Close this path with \
+                         transport.tls.enable = true + require_client_cert = true (or tls_only = true).",
+                        run_id
+                    );
+                }
                 // 注册消息通道
                 if let Some(msg_tx) = msg_tx_clone {
                     cm.add(run_id.clone(), msg_tx).await.ok();
@@ -1852,6 +1933,7 @@ impl Server {
             work_conn_tls,
             None,
             peer_cert_fingerprint,
+            false,
         );
 
         // 后续流 = 工作连接，逐条分发
@@ -2012,7 +2094,7 @@ impl Server {
                 // 对端证书指纹，故传 None，该路径下会话接管仍按 client_id 判定。
                 // 线上 `transport.protocol = "tcp"`，未使用 QUIC；若将来启用 QUIC + mTLS，
                 // 需把 `quinn::Connection` 一并传进来补齐（见设计稿 §5 注）。
-                Self::spawn_control(conn, managers, false, Some(login), None);
+                Self::spawn_control(conn, managers, false, Some(login), None, false);
                 Ok(())
             }
             m @ Message::NewWorkConn(_) => {
@@ -2143,6 +2225,47 @@ impl Clone for Server {
             shutdown_notify: self.shutdown_notify.clone(),
             plugin_manager: self.plugin_manager.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod p1_plaintext_ws_tests {
+    use super::*;
+
+    fn tls(enable: bool, require_client_cert: bool) -> rust_frp_config::TlsConfig {
+        rust_frp_config::TlsConfig {
+            enable,
+            require_client_cert,
+            client_ca_file: Some("/etc/frp/ca.crt".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_reject_when_require_client_cert_enabled() {
+        // 线上配置：enable = true + require_client_cert = true ⇒ 必须拒绝明文 ws
+        assert!(plaintext_ws_must_be_rejected(false, Some(&tls(true, true))));
+    }
+
+    #[test]
+    fn test_reject_when_tls_only() {
+        // 强制 TLS（tls_only = true）：明文 ws 也是明文，必须拒绝
+        assert!(plaintext_ws_must_be_rejected(true, Some(&tls(true, false))));
+        assert!(plaintext_ws_must_be_rejected(true, None));
+    }
+
+    #[test]
+    fn test_allow_in_plaintext_deployment() {
+        // 未启用 TLS / 仅灰度（require_client_cert = false）时保持原行为，不误伤
+        assert!(!plaintext_ws_must_be_rejected(false, None));
+        assert!(!plaintext_ws_must_be_rejected(
+            false,
+            Some(&tls(false, true))
+        ));
+        assert!(!plaintext_ws_must_be_rejected(
+            false,
+            Some(&tls(true, false))
+        ));
     }
 }
 

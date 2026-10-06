@@ -175,7 +175,6 @@ pub struct MonitorMetrics {
     total_connections: AtomicUsize,
     current_connections: AtomicUsize,
     total_proxies: AtomicUsize,
-    current_proxies: AtomicUsize,
     bytes_sent: AtomicUsize,
     bytes_received: AtomicUsize,
     start_time: Instant,
@@ -208,7 +207,6 @@ impl MonitorMetrics {
             total_connections: AtomicUsize::new(0),
             current_connections: AtomicUsize::new(0),
             total_proxies: AtomicUsize::new(0),
-            current_proxies: AtomicUsize::new(0),
             bytes_sent: AtomicUsize::new(0),
             bytes_received: AtomicUsize::new(0),
             start_time: Instant::now(),
@@ -235,13 +233,17 @@ impl MonitorMetrics {
         self.current_connections.fetch_sub(1, Ordering::SeqCst);
     }
 
-    pub fn increment_proxies(&self) {
-        self.total_proxies.fetch_add(1, Ordering::SeqCst);
-        self.current_proxies.fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub fn decrement_proxies(&self) {
-        self.current_proxies.fetch_sub(1, Ordering::SeqCst);
+    /// 当前已注册（在线）代理数
+    ///
+    /// 直接取 per-proxy 统计表的条目数，天然与注册/注销保持一致。
+    ///
+    /// 修复前的形态是 `increment_proxies()/decrement_proxies()` 维护一个原子量，
+    /// 但这两个方法**全仓零调用点** ⇒ `proxies=0/0`、`frps_proxies_current` 恒为 0。
+    pub fn current_proxies(&self) -> usize {
+        self.proxy_stats
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     pub fn add_bytes_sent(&self, bytes: usize) {
@@ -276,7 +278,7 @@ impl MonitorMetrics {
                 "total_connections": self.total_connections.load(Ordering::SeqCst),
                 "current_connections": self.current_connections.load(Ordering::SeqCst),
                 "total_proxies": self.total_proxies.load(Ordering::SeqCst),
-                "current_proxies": self.current_proxies.load(Ordering::SeqCst),
+                "current_proxies": self.current_proxies(),
                 "bytes_sent": self.bytes_sent.load(Ordering::SeqCst),
                 "bytes_received": self.bytes_received.load(Ordering::SeqCst),
             }
@@ -307,6 +309,9 @@ impl MonitorMetrics {
         remote_port: Option<u16>,
     ) -> std::sync::Arc<ProxyStat> {
         let stat = std::sync::Arc::new(ProxyStat::new(name, proxy_type, remote_port));
+        // 累计注册数在此自增（修复前靠零调用点的 increment_proxies ⇒ 恒 0）。
+        // 语义 = "注册事件计数"：同名代理重连重注册会再计一次，与 login_successes 一致。
+        self.total_proxies.fetch_add(1, Ordering::SeqCst);
         self.proxy_stats
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -428,18 +433,18 @@ impl MonitorMetrics {
             &mut out,
             "frps_proxies_current",
             "Current registered proxies",
-            self.current_proxies.load(Ordering::SeqCst),
+            self.current_proxies(),
         );
         counter(
             &mut out,
             "frps_traffic_bytes_sent_total",
-            "Bytes sent (not wired in dataplane, always 0)",
+            "Bytes sent to visitors (accumulated when a bridge finishes)",
             self.bytes_sent.load(Ordering::SeqCst),
         );
         counter(
             &mut out,
             "frps_traffic_bytes_received_total",
-            "Bytes received (not wired in dataplane, always 0)",
+            "Bytes received from visitors (accumulated when a bridge finishes)",
             self.bytes_received.load(Ordering::SeqCst),
         );
         counter(
@@ -548,6 +553,42 @@ mod traffic_tests {
         m.record_traffic("未知代理", 7, 9);
         assert_eq!(m.bytes_received.load(Ordering::SeqCst), 7);
         assert_eq!(m.bytes_sent.load(Ordering::SeqCst), 9);
+    }
+
+    /// B1 回归：代理计数必须随注册/注销变化（修复前恒为 0/0）
+    #[test]
+    fn test_proxy_counters_track_registration_and_removal() {
+        let m = MonitorMetrics::new();
+        assert_eq!(m.current_proxies(), 0, "初始应为 0");
+
+        m.register_proxy_stat("a", "tcp", Some(1000));
+        m.register_proxy_stat("b", "tcp", Some(1001));
+        assert_eq!(m.current_proxies(), 2);
+        assert_eq!(
+            m.get_metrics()["current_proxies"],
+            2,
+            "Monitor 行读的就是这个"
+        );
+        assert_eq!(m.get_metrics()["total_proxies"], 2);
+
+        m.remove_proxy_stat("a");
+        assert_eq!(m.current_proxies(), 1, "注销后当前数必须下降");
+        assert_eq!(m.get_metrics()["current_proxies"], 1);
+        assert_eq!(m.get_metrics()["total_proxies"], 2, "累计数只增不减");
+
+        // 同名重注册：当前数不重复计，累计数继续增长
+        m.register_proxy_stat("b", "tcp", Some(1001));
+        assert_eq!(m.current_proxies(), 1);
+
+        let text = m.render_prometheus();
+        assert!(
+            text.contains("frps_proxies_current 1"),
+            "Prometheus 未反映当前代理数:\n{text}"
+        );
+        assert!(
+            text.contains("frps_proxies_total 3"),
+            "Prometheus 未反映累计代理数:\n{text}"
+        );
     }
 
     #[test]

@@ -189,25 +189,167 @@ where
     bridge_streams_counted(stream1, stream2).await.map(|_| ())
 }
 
+/// 桥接半关闭宽限期：一侧已读到 EOF 后，等待另一侧结束的最长时间。
+///
+/// # 为什么需要它（修 fd 泄漏）
+///
+/// `tokio::io::copy_bidirectional` 只在**两个方向都 EOF** 后才返回。对端若
+/// "半关闭后不再发 FIN"（扫描器/健康检查的典型行为：发完请求就挂着不关连接），
+/// 桥接任务会**永久挂起** —— visitor 侧 fd 不释放、socket 永久停在 `FIN-WAIT-2`
+/// （`ss -s` 的 `orphaned 0` 即证据），累积可打满 fd 上限、`accept()` 失败，
+/// 且 `Restart=always` 因进程未退出而不会自愈。
+///
+/// # 为什么不是"空闲超时 / 总时长超时"
+///
+/// 线上有 300s 长请求（procurement）与 50MB 上传（ARMS），SSH/WebSocket 会话也会
+/// 长时间无数据 —— 任何"按空闲计时"的超时都会误杀它们。本计时**只在某一方向
+/// 已经 EOF 之后才启动**，因此只要双向都还活着（含上述全部场景）就完全不受影响，
+/// 只回收"已经半死"的连接。
+///
+/// # 300s 的取舍
+///
+/// 正常 HTTP 半关闭（客户端 `shutdown(SHUT_WR)` → 服务端回响应）在秒级完成，
+/// 远小于该值；设得更长只是让"被钉住的 socket"多占一会儿 fd。要调整改这一个常量。
+pub const BRIDGE_HALF_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 读到 EOF（`Ok(0)`）时通知一次的透明包装。
+///
+/// 仅服务于 [`BRIDGE_HALF_CLOSE_GRACE`] 的计时：让外层能知道"某个方向已经结束"，
+/// 而不必自己实现双向拷贝（自己实现会引入 `split` 的锁竞争，影响大流量吞吐）。
+/// 读写语义原样转发。
+struct EofWatcher<S> {
+    inner: S,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+    seen_eof: bool,
+}
+
+impl<S> EofWatcher<S> {
+    fn new(inner: S, notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            inner,
+            notify,
+            seen_eof: false,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for EofWatcher<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &r {
+            // 本次没读到任何字节 = 对端已 EOF（或读端已关闭）
+            if buf.filled().len() == before && !this.seen_eof {
+                this.seen_eof = true;
+                // notify_one（而非 notify_waiters）：即使此刻还没有 waiter，
+                // 也会存下一个许可，后续 notified().await 立即返回，避免丢通知
+                this.notify.notify_one();
+            }
+        }
+        r
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for EofWatcher<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
 /// 桥接两个双向流，并返回双向传输的字节数。
 ///
 /// 返回 `(stream1 -> stream2, stream2 -> stream1)`，用于流量统计
 /// （调用方在桥接结束后把计数累加进指标）。
 ///
-/// 注意：字节数在桥接过程结束才返回——若桥接被取消（任务 abort），
-/// 调用方拿不到计数，这是有意的取舍（避免在热路径上共享原子计数开销）。
+/// 注意：字节数在桥接过程结束才返回——若桥接被取消（任务 abort）或触发
+/// [`BRIDGE_HALF_CLOSE_GRACE`] 强制结束，调用方拿不到计数，这是有意的取舍
+/// （避免在热路径上共享原子计数开销）。
 pub async fn bridge_streams_counted<S1, S2>(
-    mut stream1: S1,
-    mut stream2: S2,
+    stream1: S1,
+    stream2: S2,
 ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>>
 where
     S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let result = tokio::io::copy_bidirectional(&mut stream1, &mut stream2).await;
+    bridge_streams_counted_with_grace(stream1, stream2, BRIDGE_HALF_CLOSE_GRACE).await
+}
 
-    let _ = stream1.shutdown().await;
-    let _ = stream2.shutdown().await;
+/// [`bridge_streams_counted`] 的实现体；宽限期可注入（供回归测试用）。
+async fn bridge_streams_counted_with_grace<S1, S2>(
+    stream1: S1,
+    stream2: S2,
+    grace: std::time::Duration,
+) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>>
+where
+    S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut s1 = EofWatcher::new(stream1, notify.clone());
+    let mut s2 = EofWatcher::new(stream2, notify.clone());
+
+    // Box::pin：让 future 成为单个可 drop 的局部变量，select 之后能立即释放
+    // 对 s1/s2 的可变借用（tokio::pin! 的隐藏局部会持有借用到作用域结束）。
+    let mut copy_fut = Box::pin(tokio::io::copy_bidirectional(&mut s1, &mut s2));
+
+    let result = tokio::select! {
+        r = &mut copy_fut => r,
+        _ = async {
+            // 1) 等到"某一方向结束"
+            notify.notified().await;
+            // 2) 再给另一方向一个宽限期；仍不结束说明对端半死 → 强制释放
+            tokio::time::sleep(grace).await;
+        } => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "bridge half-close grace ({}s) exceeded: one direction finished but the peer \
+                 kept the other direction open without FIN; force-closing to release resources",
+                grace.as_secs()
+            ),
+        )),
+    };
+    drop(copy_fut);
+
+    // 收尾带超时：即使某个 shutdown 被对端拖住，也不能让任务再挂住（否则又变成 fd 泄漏）
+    let shutdown_cap = std::time::Duration::from_secs(5);
+    let _ = tokio::time::timeout(shutdown_cap, s1.shutdown()).await;
+    let _ = tokio::time::timeout(shutdown_cap, s2.shutdown()).await;
 
     match result {
         Ok((n1, n2)) => {
@@ -219,7 +361,12 @@ where
             log::info!("Bridge streams closed");
             Ok((n1, n2))
         }
-        Err(e) => Err(e.into()),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                log::warn!("{}", e);
+            }
+            Err(e.into())
+        }
     }
 }
 
@@ -292,6 +439,74 @@ mod bridge_stream_tests {
             .unwrap();
         assert_eq!(c1_to_c2, 5);
         assert_eq!(c2_to_c1, 7);
+    }
+
+    /// 复现线上 fd 泄漏形态：后端回完响应后**半关闭**（只关写端），
+    /// 而 visitor（扫描器）既不发数据也不关连接。
+    /// 期望：宽限期到点后桥接自行结束并释放两侧句柄，而不是永久挂起。
+    #[tokio::test]
+    async fn test_bridge_half_close_grace_releases_stuck_visitor_socket() {
+        let (s1, mut c1) = tcp_pair().await;
+        let (s2, mut c2) = tcp_pair().await;
+        let handle = tokio::spawn(async move {
+            bridge_streams_counted_with_grace(s1, s2, std::time::Duration::from_millis(200)).await
+        });
+
+        // 后端（.75）侧半关闭：只关写端 ⇒ 桥接的 stream2 方向读到 EOF；
+        // c2 仍可读（TCP 半关闭语义），因此"另一方向写不进去"不会发生，
+        // 桥接确实会停在"等 visitor FIN"上 —— 这正是线上卡死的那一步。
+        c2.shutdown().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("桥接未在半关闭宽限期内结束 ⇒ fd 会永久泄漏（B2 回归）")
+            .expect("桥接任务不应 panic");
+        assert!(res.is_err(), "半关闭宽限超时应返回错误，实际: {:?}", res);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(200),
+            "不应在宽限期之前就放弃该方向"
+        );
+
+        // 桥接结束后 visitor 侧句柄被释放：c1 读到 EOF（0 字节）而非报错挂住
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), c1.read(&mut buf))
+            .await
+            .expect("visitor 侧应在桥接结束后被关闭")
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// 宽限期不得误杀"双向都活着"的连接：本环境有 300s 长请求、50MB 上传、
+    /// 长时间无数据的 SSH/WebSocket 会话，它们都不该被回收。
+    #[tokio::test]
+    async fn test_bridge_grace_does_not_affect_live_connections() {
+        let (s1, mut c1) = tcp_pair().await;
+        let (s2, mut c2) = tcp_pair().await;
+        let handle = tokio::spawn(async move {
+            bridge_streams_counted_with_grace(s1, s2, std::time::Duration::from_millis(100)).await
+        });
+
+        // 空闲远超宽限期，但两个方向都没 EOF ⇒ 不计时、不许被回收
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        c1.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(2), c2.read_exact(&mut got))
+            .await
+            .expect("宽限期不应误杀仍然活着的连接（SSH/WebSocket/长请求场景）")
+            .unwrap();
+        assert_eq!(&got, b"ping");
+
+        c1.shutdown().await.unwrap();
+        c2.shutdown().await.unwrap();
+        let (n1, n2) = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(n1, 4);
+        assert_eq!(n2, 0);
     }
 
     #[tokio::test]
