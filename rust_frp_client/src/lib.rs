@@ -864,6 +864,55 @@ impl XtcpRegistry {
     }
 }
 
+/// STCP 访问端应答等待器：handle_stcp_visitor_conn 在发出 StcpVisitor 后
+/// 必须等服务端桥就绪确认（StcpVisitorResp）再拨工作连接。否则存在竞态：
+/// 工作连接可能先于控制消息被服务端处理，此时桥尚未建立，连接被当作
+/// 普通代理工作连接丢弃，visitor 永远等不到 StartWorkConn 而超时。
+struct StcpRespRegistry {
+    /// proxy_name -> 等待桥就绪确认的 oneshot 列表（并发访问同代理时全部唤醒）
+    pending: std::sync::Mutex<
+        std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<String, String>>>>,
+    >,
+}
+
+impl StcpRespRegistry {
+    fn global() -> &'static Self {
+        static REG: std::sync::OnceLock<StcpRespRegistry> = std::sync::OnceLock::new();
+        REG.get_or_init(|| StcpRespRegistry {
+            pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// 注册等待者，返回接收端
+    fn register(
+        &self,
+        proxy_name: &str,
+    ) -> tokio::sync::oneshot::Receiver<Result<String, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(proxy_name.to_string())
+            .or_default()
+            .push(tx);
+        rx
+    }
+
+    /// 服务端应答到达时唤醒该代理的全部等待者
+    fn resolve(&self, proxy_name: &str, result: Result<String, String>) {
+        if let Some(waiters) = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(proxy_name)
+        {
+            for tx in waiters {
+                let _ = tx.send(result.clone());
+            }
+        }
+    }
+}
+
 /// 客户端控制
 // 部分通道字段（udp_resp_rx 等）由消息循环按需消费，整结构保留以便协议扩展
 #[allow(dead_code)]
@@ -1053,6 +1102,20 @@ impl ClientControl {
                     self.plugin_rejected_heartbeat = true;
                 }
                 log::debug!("收到 Pong 消息: timestamp={}", pong_msg.timestamp);
+            }
+            Message::StcpVisitorResp(resp) => {
+                // STCP 访问端桥就绪确认：成功唤醒等待者，失败则让其报错返回
+                let result = if resp.error.is_empty() {
+                    Ok("bridge ready".to_string())
+                } else {
+                    Err(resp.error.clone())
+                };
+                log::info!(
+                    "Received StcpVisitorResp for proxy {}: {}",
+                    resp.proxy_name,
+                    if resp.error.is_empty() { "ok" } else { &resp.error }
+                );
+                StcpRespRegistry::global().resolve(&resp.proxy_name, result);
             }
             Message::ReqWorkConn(req_work_conn_msg) => {
                 // 服务器请求建立工作连接
@@ -1949,6 +2012,23 @@ async fn handle_stcp_visitor_conn(
 
     if let Err(e) = stcp_tx.send(Message::StcpVisitor(stcp_msg)).await {
         return Err(format!("Failed to send StcpVisitor: {}", e).into());
+    }
+
+    // 等待服务端桥就绪确认（StcpVisitorResp）再拨工作连接。
+    // 不等的话存在竞态：工作连接先于控制消息到达服务端时桥尚未建立，
+    // 该连接会被当作普通代理工作连接丢弃，visitor 永久等不到 StartWorkConn。
+    let resp_rx = StcpRespRegistry::global().register(&proxy_name);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx).await {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(e))) => return Err(format!("STCP visitor rejected by server: {}", e).into()),
+        Ok(Err(_)) => return Err("STCP visitor waiter dropped (reconnect?)".into()),
+        Err(_) => {
+            return Err(format!(
+                "timeout waiting for STCP visitor resp of {} (bridge not ready)",
+                proxy_name
+            )
+            .into())
+        }
     }
 
     // 工作连接：与 establish_work_connection 共用同一建立与包装逻辑
