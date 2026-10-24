@@ -919,8 +919,9 @@ impl Server {
                         dst_addr: String::new(),
                         dst_port: 0,
                     });
-                    write_message_with_timeout(&mut conn, &resp).await?;
-                    conn
+                    let mut c = conn;
+                    write_message_with_timeout(&mut c, &resp).await?;
+                    c
                 } else {
                     conn
                 };
