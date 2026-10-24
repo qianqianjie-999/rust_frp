@@ -1,5 +1,10 @@
 # Rust FRP
 
+[![CI](https://github.com/qianqianjie-999/rust_frp/actions/workflows/ci.yml/badge.svg)](https://github.com/qianqianjie-999/rust_frp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-language-informational?logo=rust)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-blue.svg)](README.md)
+
 Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/HTTP/HTTPS 代理转发功能。
 
 ## 功能特性
