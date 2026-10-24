@@ -65,14 +65,16 @@ async fn start_server(token: &str) -> u16 {
     bind_port
 }
 
-fn login_msg(token: &str, run_id: &str) -> LoginMsg {
+/// 带显式 client_id 的登录消息（跨客户端场景必须区分 client_id，
+/// 否则后登录者会按 kick_same_client 把前一条控制连接踢掉）
+fn login_msg_with_client_id(token: &str, run_id: &str, client_id: &str) -> LoginMsg {
     LoginMsg {
         arch: "x86_64".to_string(),
         os: "linux".to_string(),
         hostname: "dual-port-e2e".to_string(),
         pool_count: 1,
         user: String::new(),
-        client_id: "dual-port-client".to_string(),
+        client_id: client_id.to_string(),
         version: "0.1.0".to_string(),
         timestamp: rust_frp_util::get_timestamp(),
         run_id: run_id.to_string(),
@@ -87,10 +89,18 @@ async fn connect_and_login(
     port: u16,
     token: &str,
     run_id: &str,
-) -> (
-    tokio::net::TcpStream,
-    rust_frp_core::LoginRespMsg,
-) {
+) -> (tokio::net::TcpStream, rust_frp_core::LoginRespMsg) {
+    connect_and_login_as(port, token, run_id, "dual-port-client").await
+}
+
+/// 同 connect_and_login，但可指定 client_id（跨客户端场景必须区分，
+/// 否则后登录者按 kick_same_client 把前一条控制连接踢掉）
+async fn connect_and_login_as(
+    port: u16,
+    token: &str,
+    run_id: &str,
+    client_id: &str,
+) -> (tokio::net::TcpStream, rust_frp_core::LoginRespMsg) {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
     let mut conn = None;
     for _ in 0..20 {
@@ -102,13 +112,19 @@ async fn connect_and_login(
     }
     let mut conn = conn.expect("tcp connect");
 
-    rust_frp_core::write_message(&mut conn, &Message::Login(login_msg(token, run_id)))
-        .await
-        .expect("send login");
-    let resp = tokio::time::timeout(Duration::from_secs(5), rust_frp_core::read_message(&mut conn))
-        .await
-        .expect("login resp within timeout")
-        .expect("read login resp");
+    rust_frp_core::write_message(
+        &mut conn,
+        &Message::Login(login_msg_with_client_id(token, run_id, client_id)),
+    )
+    .await
+    .expect("send login");
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        rust_frp_core::read_message(&mut conn),
+    )
+    .await
+    .expect("login resp within timeout")
+    .expect("read login resp");
     match resp {
         Message::LoginResp(r) => (conn, r),
         other => panic!("expected LoginResp, got {other:?}"),
@@ -133,6 +149,254 @@ async fn start_echo_server() -> u16 {
         }
     });
     port
+}
+
+/// 启动一个 frps（纯 TCP，token 认证），返回（控制端口, 工作端口）
+async fn start_server_with_work_port(token: &str, work_port: u16) -> (u16, u16) {
+    let bind_port = free_tcp_port();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1".to_string(),
+        bind_port,
+        // 自定义工作端口：刻意不等于 bind_port + 1000，验证客户端不按默认值推算
+        work_conn_port: Some(work_port),
+        allow_ports: vec![rust_frp_config::PortRange {
+            single: None,
+            start: Some(10000),
+            end: Some(65535),
+        }],
+        auth: AuthConfig {
+            method: "token".to_string(),
+            token: Some(token.to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut server = rust_frp_server::Server::new(cfg, None)
+        .await
+        .expect("server construct");
+    tokio::spawn(async move {
+        if let Err(e) = server.start().await {
+            eprintln!("SERVER START ERROR: {e}");
+        }
+    });
+    (bind_port, work_port)
+}
+
+/// 直拨工作端口并完成 NewWorkConn/StartWorkConn 握手，返回就绪的工作连接
+async fn dial_and_handshake_work_conn(
+    work_port: u16,
+    run_id: &str,
+    proxy_name: &str,
+    token: &str,
+) -> tokio::net::TcpStream {
+    let mut work_conn = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(format!("127.0.0.1:{work_port}")),
+    )
+    .await
+    .expect("dial work port within timeout")
+    .expect("dial work port");
+    let auth_manager = AuthManager::new(&AuthConfig {
+        method: "token".to_string(),
+        token: Some(token.to_string()),
+        ..Default::default()
+    })
+    .expect("auth manager");
+    let sign_key = auth_manager
+        .generate_work_conn_sign_key(run_id)
+        .await
+        .expect("sign key");
+    rust_frp_core::write_message(
+        &mut work_conn,
+        &Message::NewWorkConn(rust_frp_core::NewWorkConnMsg {
+            run_id: run_id.to_string(),
+            proxy_name: proxy_name.to_string(),
+            timestamp: rust_frp_util::get_timestamp(),
+            sign_key,
+            use_encryption: false,
+            use_compression: false,
+        }),
+    )
+    .await
+    .expect("send NewWorkConn");
+    let start = tokio::time::timeout(
+        Duration::from_secs(5),
+        rust_frp_core::read_message(&mut work_conn),
+    )
+    .await
+    .expect("StartWorkConn within timeout")
+    .expect("read StartWorkConn");
+    match start {
+        Message::StartWorkConn(s) => {
+            assert!(s.error.is_empty(), "StartWorkConn error: {}", s.error);
+        }
+        other => panic!("expected StartWorkConn, got {other:?}"),
+    }
+    work_conn
+}
+
+/// STCP 桥接全链路：服务端**自定义工作端口**（≠ bind_port+1000）下，
+/// 代理侧与访问者侧各自拨该端口，桥接管理器配对后双向中继数据。
+///
+/// 覆盖：
+/// 1. LoginResp 下发自定义工作端口（客户端不得按 server_port+1000 推算）；
+/// 2. STCP 注册（secret_key 登记）→ 访问者签名 → 建桥；
+/// 3. 桥接路径回发 StartWorkConn（b22ef43 修复：两端不再永久挂起）；
+/// 4. 两条腿均拨自定义工作端口且 HMAC 签名照常校验；
+/// 5. 数据经桥双向中继。
+///
+/// 多线程 runtime：与生产环境一致；进程级看门狗防「停更即冻 runtime」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stcp_bridge_relays_over_custom_work_port() {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let proc_watchdog = std::thread::spawn(move || {
+        for i in 0..60u32 {
+            if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            eprintln!("[proc-watchdog] alive #{}", i);
+        }
+    });
+    let _guard = server_lock().await;
+    let token = "dual-port-secret";
+    let work_port = free_tcp_port(); // 自定义工作端口
+    let (bind_port, advertised) = start_server_with_work_port(token, work_port).await;
+
+    // 1. 代理侧控制连接：登录 + 注册 STCP 代理（登记 secret_key）
+    let (mut ctrl_proxy, resp) = connect_and_login(bind_port, token, "stcp-proxy-run").await;
+    assert!(resp.error.is_empty(), "login rejected: {}", resp.error);
+    assert_eq!(
+        resp.work_conn_port, advertised,
+        "LoginResp must advertise the custom work conn port"
+    );
+    assert_ne!(
+        advertised,
+        bind_port + 1000,
+        "custom work port must differ from the default for this test to be meaningful"
+    );
+    rust_frp_core::write_message(
+        &mut ctrl_proxy,
+        &Message::RegisterProxy(rust_frp_core::RegisterProxyMsg {
+            proxy: ProxyConfig {
+                name: "stcpbridge".to_string(),
+                r#type: "stcp".to_string(),
+                local_ip: "127.0.0.1".to_string(),
+                local_port: 1, // 桥接路径不连本地服务，占位即可
+                remote_port: None,
+                secret_key: Some("stcp-bridge-secret".to_string()),
+                ..Default::default()
+            },
+        }),
+    )
+    .await
+    .expect("send register proxy");
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        rust_frp_core::read_message(&mut ctrl_proxy),
+    )
+    .await
+    .expect("register resp within timeout")
+    .expect("read register resp")
+    {
+        Message::RegisterProxyResp(r) => {
+            assert!(r.error.is_empty(), "register rejected: {}", r.error)
+        }
+        other => panic!("expected RegisterProxyResp, got {other:?}"),
+    }
+
+    // 2. 访问者侧控制连接：签名后发送 StcpVisitor
+    // （独立 client_id：同 client_id 会触发 kick_same_client 踢掉代理侧连接）
+    let (mut ctrl_visitor, _) =
+        connect_and_login_as(bind_port, token, "stcp-visitor-run", "dual-port-visitor").await;
+    let ts = rust_frp_util::get_timestamp();
+    let sign_key = rust_frp_auth::generate_stcp_sign_key("stcp-bridge-secret", "stcpbridge", ts);
+    rust_frp_core::write_message(
+        &mut ctrl_visitor,
+        &Message::StcpVisitor(rust_frp_core::StcpVisitorMsg {
+            proxy_name: "stcpbridge".to_string(),
+            run_id: "stcp-visitor-run".to_string(),
+            timestamp: ts,
+            sign_key,
+        }),
+    )
+    .await
+    .expect("send StcpVisitor");
+
+    // 3. 代理侧收到 ReqWorkConn → 拨自定义工作端口（b22ef43：桥路径回发 StartWorkConn）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, rust_frp_core::read_message(&mut ctrl_proxy))
+            .await
+            .expect("ReqWorkConn within timeout")
+            .expect("read control message");
+        match msg {
+            Message::ReqWorkConn(r) => {
+                assert_eq!(r.proxy_name, "stcpbridge");
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let mut proxy_leg =
+        dial_and_handshake_work_conn(work_port, "stcp-proxy-run", "stcpbridge", token).await;
+    eprintln!(
+        "[ckpt] proxy leg established on custom work port {}",
+        work_port
+    );
+
+    // 4. 访问者侧收到桥就绪确认（StcpVisitorResp）→ 拨自定义工作端口
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, rust_frp_core::read_message(&mut ctrl_visitor))
+            .await
+            .expect("StcpVisitorResp within timeout")
+            .expect("read control message");
+        match msg {
+            Message::StcpVisitorResp(r) => {
+                assert!(r.error.is_empty(), "StcpVisitorResp error: {}", r.error);
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let mut visitor_leg =
+        dial_and_handshake_work_conn(work_port, "stcp-visitor-run", "stcpbridge", token).await;
+    eprintln!("[ckpt] visitor leg established, bridge pairing");
+
+    // 5. 桥双向中继：代理侧写 → 访问者侧读；访问者侧写 → 代理侧读
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    proc_watchdog.join().ok();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(5), async {
+        proxy_leg
+            .write_all(b"proxy-to-visitor")
+            .await
+            .expect("proxy leg write");
+        proxy_leg.flush().await.expect("proxy leg flush");
+        let mut buf = [0u8; 16];
+        visitor_leg
+            .read_exact(&mut buf)
+            .await
+            .expect("visitor leg read");
+        assert_eq!(&buf, b"proxy-to-visitor");
+
+        visitor_leg
+            .write_all(b"visitor-to-proxy")
+            .await
+            .expect("visitor leg write");
+        visitor_leg.flush().await.expect("visitor leg flush");
+        let mut buf2 = [0u8; 16];
+        proxy_leg
+            .read_exact(&mut buf2)
+            .await
+            .expect("proxy leg read");
+        assert_eq!(&buf2, b"visitor-to-proxy");
+    })
+    .await
+    .expect("bridge relay within timeout");
+    eprintln!("[ckpt] stcp bridge relay verified over custom work port");
 }
 
 #[tokio::test]
@@ -232,7 +496,10 @@ async fn tcp_proxy_data_flows_over_dedicated_work_port() {
     }
 
     // 4. 直拨专用工作端口，完成 NewWorkConn/StartWorkConn 握手
-    eprintln!("[ckpt] ReqWorkConn received, dialing work port {}", work_port);
+    eprintln!(
+        "[ckpt] ReqWorkConn received, dialing work port {}",
+        work_port
+    );
     // 心跳看门狗：每 2s 打一条，若停更说明 runtime 被同步代码阻塞
     let watchdog = tokio::spawn(async {
         for i in 0..30u32 {

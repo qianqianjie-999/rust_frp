@@ -440,7 +440,8 @@ impl Server {
             format!("{}:{}", self.config.bind_addr, work_conn_port).parse::<SocketAddr>()?;
         let std_listener = std::net::TcpListener::bind(work_conn_addr)?;
         std_listener.set_nonblocking(true)?;
-        let work_conn_listener = std::sync::Arc::new(tokio::net::TcpListener::from_std(std_listener)?);
+        let work_conn_listener =
+            std::sync::Arc::new(tokio::net::TcpListener::from_std(std_listener)?);
         log::info!("Work connection listener started on {}", work_conn_addr);
 
         // 启动工作连接处理任务
@@ -924,10 +925,7 @@ impl Server {
                 // 修复死锁：两端客户端在 open_work_conn 后都阻塞等待 StartWorkConn
                 // 才开始搬运数据，而桥接完成路径此前从不回发该消息 —— 服务端桥已
                 // 就绪但双方永远挂起。故在交给桥接管理器之前，先回发 StartWorkConn。
-                let mut conn = if stcp_bridge_manager
-                    .contains(&work_msg.proxy_name)
-                    .await
-                {
+                let conn = if stcp_bridge_manager.contains(&work_msg.proxy_name).await {
                     let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
                         error: String::new(),
                         src_addr: String::new(),

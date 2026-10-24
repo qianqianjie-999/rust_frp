@@ -195,8 +195,10 @@ impl Plugin for UnixDomainSocketPlugin {
         &mut self,
         _conn: Box<dyn AsyncStream>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Err("unix_domain_socket plugin is not supported on this platform (no Unix domain sockets)"
-            .into())
+        Err(
+            "unix_domain_socket plugin is not supported on this platform (no Unix domain sockets)"
+                .into(),
+        )
     }
 }
 

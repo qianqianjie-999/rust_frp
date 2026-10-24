@@ -723,7 +723,10 @@ fn work_conn_port_of(config: &rust_frp_config::ClientConfig) -> u16 {
 ///
 /// 服务器通过 `LoginRespMsg.work_conn_port` 下发真实端口（0 = 旧版服务端未下发），
 /// 避免"服务端自定义了 work_conn_port 而客户端按默认值推算"的错位。
-fn resolve_work_conn_port(config: &rust_frp_config::ClientConfig, server_work_conn_port: u16) -> u16 {
+fn resolve_work_conn_port(
+    config: &rust_frp_config::ClientConfig,
+    server_work_conn_port: u16,
+) -> u16 {
     if server_work_conn_port > 0 {
         server_work_conn_port
     } else {
@@ -910,15 +913,17 @@ impl XtcpRegistry {
     }
 }
 
+/// STCP 访问端应答等待表：proxy_name -> 等待桥就绪确认的 oneshot 列表
+type StcpPendingMap =
+    std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<String, String>>>>;
+
 /// STCP 访问端应答等待器：handle_stcp_visitor_conn 在发出 StcpVisitor 后
 /// 必须等服务端桥就绪确认（StcpVisitorResp）再拨工作连接。否则存在竞态：
 /// 工作连接可能先于控制消息被服务端处理，此时桥尚未建立，连接被当作
 /// 普通代理工作连接丢弃，visitor 永远等不到 StartWorkConn 而超时。
 struct StcpRespRegistry {
     /// proxy_name -> 等待桥就绪确认的 oneshot 列表（并发访问同代理时全部唤醒）
-    pending: std::sync::Mutex<
-        std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<String, String>>>>,
-    >,
+    pending: std::sync::Mutex<StcpPendingMap>,
 }
 
 impl StcpRespRegistry {
@@ -930,10 +935,7 @@ impl StcpRespRegistry {
     }
 
     /// 注册等待者，返回接收端
-    fn register(
-        &self,
-        proxy_name: &str,
-    ) -> tokio::sync::oneshot::Receiver<Result<String, String>> {
+    fn register(&self, proxy_name: &str) -> tokio::sync::oneshot::Receiver<Result<String, String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending
             .lock()
@@ -1058,6 +1060,11 @@ impl ClientControl {
         self.work_conn_tls
     }
 
+    /// 服务器下发的工作连接端口（0 = 旧版服务端未下发，按本地推算）
+    pub fn server_work_conn_port(&self) -> u16 {
+        self.server_work_conn_port
+    }
+
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut msg_count = 0u32;
         // 心跳 10 秒一次（配合 Nginx proxy_read_timeout 300s 绰绰有余；
@@ -1165,7 +1172,11 @@ impl ClientControl {
                 log::info!(
                     "Received StcpVisitorResp for proxy {}: {}",
                     resp.proxy_name,
-                    if resp.error.is_empty() { "ok" } else { &resp.error }
+                    if resp.error.is_empty() {
+                        "ok"
+                    } else {
+                        &resp.error
+                    }
                 );
                 StcpRespRegistry::global().resolve(&resp.proxy_name, result);
             }
@@ -1580,16 +1591,16 @@ async fn open_work_conn(
                         proxy_name,
                         dial_err
                     );
-                    let stream = session
-                        .open_stream()
-                        .await
-                        .map_err(|e| {
-                            format!(
-                                "both work port ({}) and mux session failed: {}",
-                                dial_err, e
-                            )
-                        })?;
-                    log::info!("Mux work stream established (fallback) for proxy: {}", proxy_name);
+                    let stream = session.open_stream().await.map_err(|e| {
+                        format!(
+                            "both work port ({}) and mux session failed: {}",
+                            dial_err, e
+                        )
+                    })?;
+                    log::info!(
+                        "Mux work stream established (fallback) for proxy: {}",
+                        proxy_name
+                    );
                     stream
                 }
                 None => return Err(dial_err),
@@ -2007,16 +2018,32 @@ async fn xtcp_try_p2p(
     None
 }
 
-/// 启动 STCP/XTCP 访问者：监听本地端口，当有连接时创建到服务器的工作连接并桥接
-async fn start_stcp_visitor(
+/// STCP/XTCP visitor 参数集（收敛 8 个独立参数，避免顺序误用——同 ClientControlDeps 惯例）
+#[derive(Clone)]
+struct StcpVisitorDeps {
     bind_addr: String,
     proxy_name: String,
-    stcp_tx: tokio::sync::mpsc::Sender<Message>,
+    stcp_tx: mpsc::Sender<Message>,
     run_id: String,
     config: Arc<ClientConfig>,
     work_conn_tls: bool,
+    /// 服务器下发的工作连接端口（0 = 旧版服务端未下发，按本地推算）
+    server_work_conn_port: u16,
     xtcp_registry: Arc<XtcpRegistry>,
-) {
+}
+
+/// 启动 STCP/XTCP 访问者：监听本地端口，当有连接时创建到服务器的工作连接并桥接
+async fn start_stcp_visitor(deps: StcpVisitorDeps) {
+    let StcpVisitorDeps {
+        bind_addr,
+        proxy_name,
+        stcp_tx,
+        run_id,
+        config,
+        work_conn_tls,
+        server_work_conn_port,
+        xtcp_registry,
+    } = deps;
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -2039,16 +2066,18 @@ async fn start_stcp_visitor(
                     addr,
                     proxy_name
                 );
-                let pn = proxy_name.clone();
-                let tx = stcp_tx.clone();
-                let rid = run_id.clone();
-                let cfg = Arc::clone(&config);
-                let wct = work_conn_tls;
-                let reg = xtcp_registry.clone();
+                let deps = StcpVisitorDeps {
+                    bind_addr: bind_addr.clone(),
+                    proxy_name: proxy_name.clone(),
+                    stcp_tx: stcp_tx.clone(),
+                    run_id: run_id.clone(),
+                    config: Arc::clone(&config),
+                    work_conn_tls,
+                    server_work_conn_port,
+                    xtcp_registry: xtcp_registry.clone(),
+                };
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_stcp_visitor_conn(local_conn, pn, tx, rid, cfg, wct, reg).await
-                    {
+                    if let Err(e) = handle_stcp_visitor_conn(local_conn, deps).await {
                         log::error!("STCP visitor connection error: {:?}", e);
                     }
                 });
@@ -2065,13 +2094,18 @@ async fn start_stcp_visitor(
 /// XTCP 先走 STUN + KCP UDP 打洞尝试 P2P；失败/超时后回退 STCP 服务端中继
 async fn handle_stcp_visitor_conn(
     local_conn: tokio::net::TcpStream,
-    proxy_name: String,
-    stcp_tx: tokio::sync::mpsc::Sender<Message>,
-    run_id: String,
-    config: Arc<ClientConfig>,
-    work_conn_tls: bool,
-    xtcp_registry: Arc<XtcpRegistry>,
+    deps: StcpVisitorDeps,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let StcpVisitorDeps {
+        proxy_name,
+        stcp_tx,
+        run_id,
+        config,
+        work_conn_tls,
+        server_work_conn_port,
+        xtcp_registry,
+        ..
+    } = deps;
     let is_xtcp = config
         .visitors
         .iter()
@@ -2165,6 +2199,8 @@ async fn handle_stcp_visitor_conn(
     }
 
     // 工作连接：与 establish_work_connection 共用同一建立与包装逻辑
+    // server_work_conn_port 经 LoginResp 下发链传入：服务端自定义了工作端口时，
+    // visitor 与普通代理拨同一个口，不会错回 server_port+1000
     let (work_conn, _, _) = open_work_conn(
         &config,
         WorkConnRequest {
@@ -2172,7 +2208,7 @@ async fn handle_stcp_visitor_conn(
             run_id: &run_id,
             work_conn_tls,
             session: None,
-            server_work_conn_port: 0,
+            server_work_conn_port,
             use_encryption,
             use_compression,
         },
@@ -2362,6 +2398,8 @@ struct SudpVisitorContext {
     run_id: String,
     config: Arc<ClientConfig>,
     work_conn_tls: bool,
+    /// 服务器下发的工作连接端口（0 = 旧版服务端未下发，按本地推算）
+    server_work_conn_port: u16,
     secret_key: String,
     use_encryption: bool,
     use_compression: bool,
@@ -2377,6 +2415,7 @@ async fn start_sudp_visitor(
     run_id: String,
     config: Arc<ClientConfig>,
     work_conn_tls: bool,
+    server_work_conn_port: u16,
 ) {
     let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
         Ok(socket) => Arc::new(socket),
@@ -2403,6 +2442,7 @@ async fn start_sudp_visitor(
         run_id,
         config,
         work_conn_tls,
+        server_work_conn_port,
         stcp_tx,
         socket: socket.clone(),
     };
@@ -2471,7 +2511,7 @@ async fn sudp_open_session(
             run_id: &ctx.run_id,
             work_conn_tls: ctx.work_conn_tls,
             session: None,
-            server_work_conn_port: 0,
+            server_work_conn_port: ctx.server_work_conn_port,
             use_encryption: ctx.use_encryption,
             use_compression: ctx.use_compression,
         },
@@ -3231,6 +3271,7 @@ impl Client {
                         let stcp_tx = control.stcp_visitor_sender();
                         let run_id = control.run_id.clone();
                         let work_conn_tls = control.work_conn_tls();
+                        let server_work_conn_port = control.server_work_conn_port();
                         let xtcp_registry = control.xtcp_registry();
                         drop(control);
                         for visitor in &self.config.visitors {
@@ -3244,7 +3285,17 @@ impl Client {
                                     let rid = run_id.clone();
                                     let reg = xtcp_registry.clone();
                                     tokio::spawn(async move {
-                                        start_stcp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg, work_conn_tls, reg).await;
+                                        start_stcp_visitor(StcpVisitorDeps {
+                                            bind_addr,
+                                            proxy_name,
+                                            stcp_tx,
+                                            run_id: rid,
+                                            config: cfg,
+                                            work_conn_tls,
+                                            server_work_conn_port,
+                                            xtcp_registry: reg,
+                                        })
+                                        .await;
                                     });
                                 }
                                 // sudp visitor：监听本地 UDP，按源地址建独立隧道会话
@@ -3255,8 +3306,9 @@ impl Client {
                                     let stcp_tx = stcp_tx.clone();
                                     let cfg = Arc::clone(&self.config);
                                     let rid = run_id.clone();
+                                    let swcp = server_work_conn_port;
                                     tokio::spawn(async move {
-                                        start_sudp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg, work_conn_tls).await;
+                                        start_sudp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg, work_conn_tls, swcp).await;
                                     });
                                 }
                                 _ => {}
@@ -3873,6 +3925,13 @@ mod client_manager_tests {
         assert_eq!(resolve_work_conn_port(&cfg, 0), 9500);
         // 新版服务端下发真实端口 → 最高优先级（覆盖客户端的错配）
         assert_eq!(resolve_work_conn_port(&cfg, 10300), 10300);
+        // visitor 场景：服务端下发自定义端口（如 12000）且客户端无配置 →
+        // 必须拨下发值，不能回落 server_port+1000。
+        // STCP/XTCP/SUDP visitor 与普通代理共用本解析（见 handle_stcp_visitor_conn）。
+        cfg.work_conn_port = None;
+        assert_eq!(resolve_work_conn_port(&cfg, 12000), 12000);
+        // 旧版服务端（0）+ 客户端无配置 → 仍按 server_port+1000 推算
+        assert_eq!(resolve_work_conn_port(&cfg, 0), 10300);
     }
 
     /// auto 模式降级缓存：直拨失败后 60s 内不再尝试，超时后恢复尝试
@@ -4623,5 +4682,293 @@ mod client_id_tests {
         let mut startup = cfg_without_client_id();
         ensure_client_id(&mut startup, None);
         assert!(startup.client_id.as_deref().is_some_and(|s| !s.is_empty()));
+    }
+}
+
+/// STCP visitor 工作端口下传的真实链路测试
+///
+/// 驱真实 `handle_stcp_visitor_conn` + 真实 `ClientControl` 消息循环 +
+/// 真实 frps：服务端配置**自定义工作端口**（≠ server_port+1000），
+/// 验证 visitor 腿与代理腿都拨 LoginResp 下发的端口，而不是按
+/// `server_port + 1000` 推算（推算值所在端口无监听 ⇒ 拨错即快速
+/// ECONNREFUSED，测试立即失败而非挂到超时）。
+#[cfg(test)]
+mod stcp_visitor_work_port_tests {
+    use super::*;
+    use rust_frp_config::{AuthConfig, ProxyConfig, ServerConfig, VisitorConfig};
+    use std::time::Duration;
+
+    fn free_tcp_port() -> u16 {
+        for _ in 0..50 {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp :0");
+            let port = l.local_addr().expect("local addr").port();
+            if port <= 60_000 {
+                return port;
+            }
+        }
+        panic!("no suitable free TCP port found");
+    }
+
+    async fn start_echo_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind echo");
+        let port = listener.local_addr().expect("echo addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = sock.split();
+                    let _ = tokio::io::copy(&mut rd, &mut wr).await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stcp_visitor_dials_server_advertised_work_port() {
+        let token = "stcp-thread-secret";
+        let bind_port = free_tcp_port();
+        let work_port = free_tcp_port();
+        assert_ne!(
+            work_port,
+            bind_port + 1000,
+            "custom work port must differ from the default for this test to be meaningful"
+        );
+
+        // 起 frps：自定义工作端口（登录时经 LoginResp 下发）
+        let server_cfg = ServerConfig {
+            bind_addr: "127.0.0.1".to_string(),
+            bind_port,
+            work_conn_port: Some(work_port),
+            allow_ports: vec![rust_frp_config::PortRange {
+                single: None,
+                start: Some(10000),
+                end: Some(65535),
+            }],
+            auth: AuthConfig {
+                method: "token".to_string(),
+                token: Some(token.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut server = rust_frp_server::Server::new(server_cfg, None)
+            .await
+            .expect("server construct");
+        tokio::spawn(async move {
+            let _ = server.start().await;
+        });
+
+        let echo_port = start_echo_server().await;
+
+        // 客户端配置：stcp 代理（本地服务指向 echo）+ stcp visitor，双方同 secret_key
+        let visitor_bind = free_tcp_port();
+        let cfg = Arc::new(ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: bind_port,
+            client_id: Some("stcp-thread-client".to_string()),
+            auth: AuthConfig {
+                method: "token".to_string(),
+                token: Some(token.to_string()),
+                ..Default::default()
+            },
+            proxies: vec![ProxyConfig {
+                name: "stcpx".to_string(),
+                r#type: "stcp".to_string(),
+                local_ip: "127.0.0.1".to_string(),
+                local_port: echo_port,
+                remote_port: None,
+                secret_key: Some("stcp-thread-sk".to_string()),
+                ..Default::default()
+            }],
+            visitors: vec![VisitorConfig {
+                name: "v-stcpx".to_string(),
+                r#type: "stcp".to_string(),
+                server_name: "stcpx".to_string(),
+                secret_key: Some("stcp-thread-sk".to_string()),
+                bind_addr: "127.0.0.1".to_string(),
+                bind_port: visitor_bind,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        // 控制连接：登录 + 注册代理（与 Client::login 同序，此处手驱）
+        let mut tcp = None;
+        for _ in 0..20 {
+            if let Ok(c) = tokio::net::TcpStream::connect(format!("127.0.0.1:{bind_port}")).await {
+                tcp = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut tcp = tcp.expect("tcp connect");
+        rust_frp_core::write_message(
+            &mut tcp,
+            &Message::Login(rust_frp_core::LoginMsg {
+                arch: std::env::consts::ARCH.to_string(),
+                os: std::env::consts::OS.to_string(),
+                hostname: "stcp-thread".to_string(),
+                pool_count: 1,
+                user: String::new(),
+                client_id: "stcp-thread-client".to_string(),
+                version: "0.1.0".to_string(),
+                timestamp: get_timestamp(),
+                run_id: "stcp-thread-run".to_string(),
+                token: token.to_string(),
+                metas: std::collections::HashMap::new(),
+                client_spec: None,
+            }),
+        )
+        .await
+        .expect("send login");
+        let login_resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            rust_frp_core::read_message(&mut tcp),
+        )
+        .await
+        .expect("login resp within timeout")
+        .expect("read login resp");
+        let login_resp = match login_resp {
+            Message::LoginResp(r) => r,
+            other => panic!("expected LoginResp, got {other:?}"),
+        };
+        assert!(
+            login_resp.error.is_empty(),
+            "login rejected: {}",
+            login_resp.error
+        );
+        assert_eq!(
+            login_resp.work_conn_port, work_port,
+            "LoginResp must advertise the custom work conn port"
+        );
+        let run_id = login_resp.run_id.clone();
+
+        rust_frp_core::write_message(
+            &mut tcp,
+            &Message::RegisterProxy(rust_frp_core::RegisterProxyMsg {
+                proxy: ProxyConfig {
+                    name: "stcpx".to_string(),
+                    r#type: "stcp".to_string(),
+                    local_ip: "127.0.0.1".to_string(),
+                    local_port: echo_port,
+                    remote_port: None,
+                    secret_key: Some("stcp-thread-sk".to_string()),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .expect("send register proxy");
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            rust_frp_core::read_message(&mut tcp),
+        )
+        .await
+        .expect("register resp within timeout")
+        .expect("read register resp")
+        {
+            Message::RegisterProxyResp(r) => {
+                assert!(r.error.is_empty(), "register rejected: {}", r.error)
+            }
+            other => panic!("expected RegisterProxyResp, got {other:?}"),
+        }
+
+        // 构造 ClientControl：server_work_conn_port 传登录下发的自定义端口，
+        // 消息循环驱动代理侧腿（ReqWorkConn → establish_work_connection → 拨号）
+        let auth_manager = Arc::new(AuthManager::new(&cfg.auth).expect("auth manager"));
+        let mut control = ClientControl::new(ClientControlDeps {
+            conn: ControlConn::new(Box::new(tcp)),
+            run_id: run_id.clone(),
+            proxy_manager: Arc::new(ClientProxyManager::default()),
+            visitor_manager: Arc::new(ClientVisitorManager::default()),
+            auth_manager,
+            work_conn_manager: Arc::new(WorkConnManager::new()),
+            config: Arc::clone(&cfg),
+            work_conn_tls: false,
+            server_work_conn_port: login_resp.work_conn_port,
+            session: None,
+        });
+        let stcp_tx = control.stcp_visitor_sender();
+        let control_run_id = control.run_id.clone();
+        let xtcp_registry = control.xtcp_registry();
+        let loop_handle = tokio::spawn(async move {
+            let _ = control.run().await;
+        });
+
+        // visitor 本地连接：自起 listener，accept 到的 sock 作为数据端点
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind endpoint listener");
+        let endpoint_port = listener.local_addr().expect("endpoint addr").port();
+        let accept_task = tokio::spawn(async move { listener.accept().await.map(|(s, _)| s) });
+        let local_conn = tokio::net::TcpStream::connect(format!("127.0.0.1:{endpoint_port}"))
+            .await
+            .expect("local connect");
+        let mut endpoint = accept_task.await.expect("accept join").expect("accept");
+
+        // 直驱 visitor 处理函数（spawn：桥接期间该函数不会返回）
+        let cfg_for_visitor = Arc::clone(&cfg);
+        let mut visitor_handle = tokio::spawn(async move {
+            handle_stcp_visitor_conn(
+                local_conn,
+                StcpVisitorDeps {
+                    bind_addr: format!("127.0.0.1:{visitor_bind}"),
+                    proxy_name: "stcpx".to_string(),
+                    stcp_tx,
+                    run_id: control_run_id,
+                    config: cfg_for_visitor,
+                    work_conn_tls: false,
+                    server_work_conn_port: login_resp.work_conn_port,
+                    xtcp_registry,
+                },
+            )
+            .await
+        });
+
+        // 数据回环：endpoint → visitor 工作连接 → 桥 → 代理工作连接 → echo → 回程
+        // 任一侧提前退出（如 visitor 拨错端口 ECONNREFUSED）立即失败
+        let payload: &[u8; 21] = b"visitor-port-threaded";
+        let roundtrip = async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            tokio::time::timeout(Duration::from_secs(5), async {
+                endpoint.write_all(payload).await.expect("endpoint write");
+                endpoint.flush().await.expect("endpoint flush");
+                let mut buf = [0u8; 21];
+                endpoint
+                    .read_exact(&mut buf)
+                    .await
+                    .expect("endpoint read echo");
+                assert_eq!(&buf, payload);
+            })
+            .await
+            .expect("roundtrip within timeout");
+        };
+        tokio::select! {
+            res = &mut visitor_handle => {
+                panic!(
+                    "stcp visitor exited before data flowed (dialed wrong port?): {:?}",
+                    res.expect("visitor join")
+                );
+            }
+            _ = roundtrip => {}
+        }
+
+        // 收尾：关端点 → 桥 EOF → visitor 函数应干净返回
+        drop(endpoint);
+        let visitor_result = tokio::time::timeout(Duration::from_secs(5), &mut visitor_handle)
+            .await
+            .expect("visitor exit within timeout")
+            .expect("visitor join");
+        assert!(
+            visitor_result.is_ok(),
+            "stcp visitor returned error: {:?}",
+            visitor_result.err()
+        );
+        loop_handle.abort();
     }
 }

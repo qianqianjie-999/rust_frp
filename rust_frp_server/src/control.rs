@@ -846,7 +846,6 @@ impl Control {
             .await;
 
         let msg_tx_proxy = self.control_manager.get_msg_tx(proxy_run_id).await;
-        let msg_tx_visitor = self.control_manager.get_msg_tx(&visitor_run_id).await;
 
         if let Some(tx) = &msg_tx_proxy {
             let req = ReqWorkConnMsg {

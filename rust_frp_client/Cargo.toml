@@ -30,3 +30,5 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+# 测试需真实 frps 验证 visitor 工作端口下传（仅 dev，不进发布产物）
+rust_frp_server = { path = "../rust_frp_server" }
