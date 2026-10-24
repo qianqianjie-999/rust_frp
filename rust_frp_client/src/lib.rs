@@ -2177,6 +2177,10 @@ async fn handle_stcp_visitor_conn(
         sign_key,
     };
 
+    // 先注册应答等待者再发送：控制循环可能在我们 await 之前就处理完
+    // StcpVisitor 并收到 StcpVisitorResp，后注册会错过已发出的应答
+    // （oneshot 值先于注册到达即永久丢失，只能等 10s 超时）。
+    let resp_rx = StcpRespRegistry::global().register(&proxy_name);
     if let Err(e) = stcp_tx.send(Message::StcpVisitor(stcp_msg)).await {
         return Err(format!("Failed to send StcpVisitor: {}", e).into());
     }
@@ -2184,7 +2188,6 @@ async fn handle_stcp_visitor_conn(
     // 等待服务端桥就绪确认（StcpVisitorResp）再拨工作连接。
     // 不等的话存在竞态：工作连接先于控制消息到达服务端时桥尚未建立，
     // 该连接会被当作普通代理工作连接丢弃，visitor 永久等不到 StartWorkConn。
-    let resp_rx = StcpRespRegistry::global().register(&proxy_name);
     match tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx).await {
         Ok(Ok(Ok(_))) => {}
         Ok(Ok(Err(e))) => return Err(format!("STCP visitor rejected by server: {}", e).into()),
@@ -2494,6 +2497,10 @@ async fn sudp_open_session(
     let timestamp = get_timestamp();
     let sign_key =
         rust_frp_auth::generate_stcp_sign_key(&ctx.secret_key, &ctx.proxy_name, timestamp);
+
+    // 先注册应答等待者再发送：服务端可能在控制消息写出前就处理完建桥，
+    // 后注册会永久错过 StcpVisitorResp（oneshot 值已缓冲则无此忧）。
+    let resp_rx = StcpRespRegistry::global().register(&ctx.proxy_name);
     ctx.stcp_tx
         .send(Message::StcpVisitor(rust_frp_core::StcpVisitorMsg {
             proxy_name: ctx.proxy_name.clone(),
@@ -2503,6 +2510,22 @@ async fn sudp_open_session(
         }))
         .await
         .map_err(|e| format!("Failed to send StcpVisitor for sudp: {}", e))?;
+
+    // 等待服务端桥就绪确认（StcpVisitorResp）再拨工作连接——与 STCP visitor
+    // 同一竞态防护：桥未建立时工作连接先到会被当作普通代理连接池化丢弃，
+    // 会话永远等不到数据（对齐 handle_stcp_visitor_conn / 上游 8146c08）。
+    match tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx).await {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(e))) => return Err(format!("SUDP visitor rejected by server: {}", e).into()),
+        Ok(Err(_)) => return Err("SUDP visitor waiter dropped (reconnect?)".into()),
+        Err(_) => {
+            return Err(format!(
+                "timeout waiting for SUDP visitor resp of {} (bridge not ready)",
+                ctx.proxy_name
+            )
+            .into())
+        }
+    }
 
     let (work_conn, _, _) = open_work_conn(
         &ctx.config,
@@ -4693,10 +4716,23 @@ mod client_id_tests {
 /// `server_port + 1000` 推算（推算值所在端口无监听 ⇒ 拨错即快速
 /// ECONNREFUSED，测试立即失败而非挂到超时）。
 #[cfg(test)]
-mod stcp_visitor_work_port_tests {
+mod visitor_work_port_tests {
     use super::*;
     use rust_frp_config::{AuthConfig, ProxyConfig, ServerConfig, VisitorConfig};
     use std::time::Duration;
+
+    /// 串行化本模块的起服测试：各自 spawn 完整 frps，并行会互相抢调度、
+    /// 把「等待监听就绪」的重试预算耗穿（Server::new 不 bind，绑定在
+    /// start() 里，存在启动窗口）——同 dual_port_e2e 的 SERVER_LOCK。
+    static VISITOR_SERVER_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    async fn visitor_server_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        VISITOR_SERVER_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
 
     fn free_tcp_port() -> u16 {
         for _ in 0..50 {
@@ -4730,6 +4766,7 @@ mod stcp_visitor_work_port_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stcp_visitor_dials_server_advertised_work_port() {
+        let _guard = visitor_server_lock().await;
         let token = "stcp-thread-secret";
         let bind_port = free_tcp_port();
         let work_port = free_tcp_port();
@@ -4799,7 +4836,7 @@ mod stcp_visitor_work_port_tests {
 
         // 控制连接：登录 + 注册代理（与 Client::login 同序，此处手驱）
         let mut tcp = None;
-        for _ in 0..20 {
+        for _ in 0..100 {
             if let Ok(c) = tokio::net::TcpStream::connect(format!("127.0.0.1:{bind_port}")).await {
                 tcp = Some(c);
                 break;
@@ -4969,6 +5006,239 @@ mod stcp_visitor_work_port_tests {
             "stcp visitor returned error: {:?}",
             visitor_result.err()
         );
+        loop_handle.abort();
+    }
+
+    async fn start_udp_echo_server() -> u16 {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind udp echo");
+        let port = sock.local_addr().expect("udp echo addr").port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 65535];
+            loop {
+                if let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                    let _ = sock.send_to(&buf[..n], peer).await;
+                }
+            }
+        });
+        port
+    }
+
+    /// SUDP visitor 会话全链路：自定义工作端口 + 真实 frps + 真实 ClientControl。
+    ///
+    /// 关键编排：先发 UDP 包让 visitor 会话发起（StcpVisitor 入队待写），
+    /// **延迟 300ms 再启动控制循环**——确定性复现「工作连接先于控制消息
+    /// 到达服务端」的竞态。修复后 visitor 等 StcpVisitorResp 再拨号，
+    /// 循环启动后全链路打通；修复前 visitor 已直拨，桥未建 ⇒ 工作连接被
+    /// 池化丢弃，StartWorkConn 永不来 ⇒ 会话超时失败。
+    ///
+    /// 同时锁死服务端 secret 登记：sudp 代理不登记 secret 时 visitor 会被
+    /// fail-closed 拒绝（StcpVisitorResp 带错），本测试同样失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sudp_visitor_session_flows_over_custom_work_port() {
+        let _guard = visitor_server_lock().await;
+        let token = "sudp-thread-secret";
+        let bind_port = free_tcp_port();
+        let work_port = free_tcp_port();
+        assert_ne!(
+            work_port,
+            bind_port + 1000,
+            "custom work port must differ from the default for this test to be meaningful"
+        );
+
+        let server_cfg = ServerConfig {
+            bind_addr: "127.0.0.1".to_string(),
+            bind_port,
+            work_conn_port: Some(work_port),
+            allow_ports: vec![rust_frp_config::PortRange {
+                single: None,
+                start: Some(10000),
+                end: Some(65535),
+            }],
+            auth: AuthConfig {
+                method: "token".to_string(),
+                token: Some(token.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut server = rust_frp_server::Server::new(server_cfg, None)
+            .await
+            .expect("server construct");
+        tokio::spawn(async move {
+            let _ = server.start().await;
+        });
+
+        let udp_echo_port = start_udp_echo_server().await;
+
+        let visitor_bind = free_tcp_port();
+        let cfg = Arc::new(ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: bind_port,
+            client_id: Some("sudp-thread-client".to_string()),
+            auth: AuthConfig {
+                method: "token".to_string(),
+                token: Some(token.to_string()),
+                ..Default::default()
+            },
+            proxies: vec![ProxyConfig {
+                name: "sudpx".to_string(),
+                r#type: "sudp".to_string(),
+                local_ip: "127.0.0.1".to_string(),
+                local_port: udp_echo_port,
+                remote_port: None,
+                secret_key: Some("sudp-thread-sk".to_string()),
+                ..Default::default()
+            }],
+            visitors: vec![VisitorConfig {
+                name: "v-sudpx".to_string(),
+                r#type: "sudp".to_string(),
+                server_name: "sudpx".to_string(),
+                secret_key: Some("sudp-thread-sk".to_string()),
+                bind_addr: "127.0.0.1".to_string(),
+                bind_port: visitor_bind,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        // 控制连接：登录 + 注册 sudp 代理
+        let mut tcp = None;
+        for _ in 0..100 {
+            if let Ok(c) = tokio::net::TcpStream::connect(format!("127.0.0.1:{bind_port}")).await {
+                tcp = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let mut tcp = tcp.expect("tcp connect");
+        rust_frp_core::write_message(
+            &mut tcp,
+            &Message::Login(rust_frp_core::LoginMsg {
+                arch: std::env::consts::ARCH.to_string(),
+                os: std::env::consts::OS.to_string(),
+                hostname: "sudp-thread".to_string(),
+                pool_count: 1,
+                user: String::new(),
+                client_id: "sudp-thread-client".to_string(),
+                version: "0.1.0".to_string(),
+                timestamp: get_timestamp(),
+                run_id: "sudp-thread-run".to_string(),
+                token: token.to_string(),
+                metas: std::collections::HashMap::new(),
+                client_spec: None,
+            }),
+        )
+        .await
+        .expect("send login");
+        let login_resp = match tokio::time::timeout(
+            Duration::from_secs(5),
+            rust_frp_core::read_message(&mut tcp),
+        )
+        .await
+        .expect("login resp within timeout")
+        .expect("read login resp")
+        {
+            Message::LoginResp(r) => r,
+            other => panic!("expected LoginResp, got {other:?}"),
+        };
+        assert!(
+            login_resp.error.is_empty(),
+            "login rejected: {}",
+            login_resp.error
+        );
+        assert_eq!(
+            login_resp.work_conn_port, work_port,
+            "LoginResp must advertise the custom work conn port"
+        );
+        let run_id = login_resp.run_id.clone();
+
+        rust_frp_core::write_message(
+            &mut tcp,
+            &Message::RegisterProxy(rust_frp_core::RegisterProxyMsg {
+                proxy: ProxyConfig {
+                    name: "sudpx".to_string(),
+                    r#type: "sudp".to_string(),
+                    local_ip: "127.0.0.1".to_string(),
+                    local_port: udp_echo_port,
+                    remote_port: None,
+                    secret_key: Some("sudp-thread-sk".to_string()),
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .expect("send register proxy");
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            rust_frp_core::read_message(&mut tcp),
+        )
+        .await
+        .expect("register resp within timeout")
+        .expect("read register resp")
+        {
+            Message::RegisterProxyResp(r) => {
+                assert!(r.error.is_empty(), "register rejected: {}", r.error)
+            }
+            other => panic!("expected RegisterProxyResp, got {other:?}"),
+        }
+
+        // ClientControl 构造但**先不启动循环**（延迟启动即竞态编排）
+        let auth_manager = Arc::new(AuthManager::new(&cfg.auth).expect("auth manager"));
+        let mut control = ClientControl::new(ClientControlDeps {
+            conn: ControlConn::new(Box::new(tcp)),
+            run_id: run_id.clone(),
+            proxy_manager: Arc::new(ClientProxyManager::default()),
+            visitor_manager: Arc::new(ClientVisitorManager::default()),
+            auth_manager,
+            work_conn_manager: Arc::new(WorkConnManager::new()),
+            config: Arc::clone(&cfg),
+            work_conn_tls: false,
+            server_work_conn_port: login_resp.work_conn_port,
+            session: None,
+        });
+        let stcp_tx = control.stcp_visitor_sender();
+
+        // 启动 sudp visitor（绑定 UDP 并等待首个包）
+        tokio::spawn(start_sudp_visitor(
+            format!("127.0.0.1:{visitor_bind}"),
+            "sudpx".to_string(),
+            stcp_tx,
+            run_id,
+            Arc::clone(&cfg),
+            false,
+            login_resp.work_conn_port,
+        ));
+
+        // 发包触发会话建立（此时 StcpVisitor 仅入队，控制循环未启动）
+        let my_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind my udp");
+        let payload: &[u8; 18] = b"sudp-port-threaded";
+        my_sock
+            .send_to(payload, format!("127.0.0.1:{visitor_bind}"))
+            .await
+            .expect("send udp");
+
+        // 竞态窗口：修复前 visitor 在此已直拨工作端口（桥未建 ⇒ 被丢弃）；
+        // 修复后 visitor 阻塞等待 StcpVisitorResp
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // 启动控制循环：StcpVisitor 写出 → 服务端建桥 + ReqWorkConn（代理腿）+
+        // StcpVisitorResp（唤醒 visitor 腿）
+        let loop_handle = tokio::spawn(async move {
+            let _ = control.run().await;
+        });
+
+        // 回环：my_sock → visitor 腿 → 桥 → 代理腿 → UDP echo → 原路返回
+        let mut buf = [0u8; 18];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), my_sock.recv_from(&mut buf))
+            .await
+            .expect("sudp echo within timeout (visitor leg dialed before bridge ready?)")
+            .expect("recv udp echo");
+        assert_eq!(&buf[..n], payload, "udp payload mismatch");
+
         loop_handle.abort();
     }
 }

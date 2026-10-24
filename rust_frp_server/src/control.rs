@@ -686,8 +686,10 @@ impl Control {
                     .write()
                     .await
                     .insert(proxy_name.clone(), self.run_id.clone());
-                // stcp/xtcp 代理登记共享密钥，供访问者签名校验（fail-closed）
-                if matches!(proxy_type.as_str(), "stcp" | "xtcp") {
+                // stcp/xtcp/sudp 代理登记共享密钥，供访问者签名校验（fail-closed）。
+                // sudp 与 stcp/xtcp 共用同一套桥接 + 签名机制（服务端不解析 UDP），
+                // 漏登记 sudp 会使其 visitor 被 "proxy secret_key not configured" 拒绝。
+                if matches!(proxy_type.as_str(), "stcp" | "xtcp" | "sudp") {
                     match proxy_secret_key.as_deref() {
                         Some(sk) if !sk.is_empty() => {
                             global_proxy_secrets().register(&proxy_name, sk);
