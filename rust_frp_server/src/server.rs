@@ -85,6 +85,9 @@ pub(crate) struct ServerManagers {
     pub stcp_bridge_manager: Arc<StcpBridgeManager>,
     pub work_conn_manager: Arc<ServerWorkConnManager>,
     pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
+    /// 服务器工作连接端口（数据/控制分离的专用数据端口），
+    /// 通过 LoginRespMsg 下发给客户端，免去客户端猜测 server_port+1000
+    pub work_conn_port: u16,
 }
 
 /// 优雅关闭排空轮询间隔
@@ -174,7 +177,7 @@ pub struct Server {
     vhost_http_listener: Option<HttpVhostListener>,
     vhost_https_listener: Option<HttpsVhostListener>,
     /// 工作连接监听器
-    work_conn_listener: Option<tokio::net::TcpListener>,
+    work_conn_listener: Option<std::sync::Arc<tokio::net::TcpListener>>,
     web_server: Option<WebServer>,
     pub(crate) metrics: Arc<MonitorMetrics>,
     /// 工作连接管理器
@@ -215,6 +218,10 @@ impl Server {
             stcp_bridge_manager: self.stcp_bridge_manager.clone(),
             work_conn_manager: self.work_conn_manager.clone(),
             plugin_manager: self.plugin_manager.clone(),
+            work_conn_port: self
+                .config
+                .work_conn_port
+                .unwrap_or(self.config.bind_port + 1000),
         }
     }
 
@@ -420,6 +427,11 @@ impl Server {
         }
 
         // 启动工作连接监听器（如果配置了 work_conn_port）
+        //
+        // ⚠️ 只能注册一次：此前先 from_std 原体再 from_std 克隆句柄，等于把同一个
+        // socket 在 IO 多路复用器上注册了两次（Windows IOCP / epoll 皆如此），
+        // 第一次连接进来就可能把 IO 驱动卡死（e2e 复现：runtime 整体冻结）。
+        // 修复：单次注册，Arc 共享给监听任务与字段保活。
         let work_conn_port = self
             .config
             .work_conn_port
@@ -428,9 +440,7 @@ impl Server {
             format!("{}:{}", self.config.bind_addr, work_conn_port).parse::<SocketAddr>()?;
         let std_listener = std::net::TcpListener::bind(work_conn_addr)?;
         std_listener.set_nonblocking(true)?;
-        let std_listener_clone = std_listener.try_clone()?;
-        let work_conn_listener = tokio::net::TcpListener::from_std(std_listener)?;
-        let work_conn_listener_clone = tokio::net::TcpListener::from_std(std_listener_clone)?;
+        let work_conn_listener = std::sync::Arc::new(tokio::net::TcpListener::from_std(std_listener)?);
         log::info!("Work connection listener started on {}", work_conn_addr);
 
         // 启动工作连接处理任务
@@ -439,9 +449,10 @@ impl Server {
         let work_conn_tls_config = self.conn_manager.get_tls_config().cloned();
         let work_conn_tls_only = self.config.transport.tls_only;
         let work_conn_managers = self.managers();
+        let work_conn_listener_for_task = work_conn_listener.clone();
         tokio::spawn(async move {
             Self::handle_work_connections(
-                work_conn_listener_clone,
+                work_conn_listener_for_task,
                 work_conn_managers,
                 work_conn_tls_config,
                 work_conn_tls_only,
@@ -450,7 +461,6 @@ impl Server {
         });
 
         self.work_conn_listener = Some(work_conn_listener);
-
         // 开始处理连接
         log::info!("Starting connection handlers...");
 
@@ -485,6 +495,11 @@ impl Server {
             )
             .await?;
 
+            let kcp_work_conn_port = self
+                .config
+                .work_conn_port
+                .unwrap_or(self.config.bind_port + 1000);
+
             tokio::spawn(async move {
                 loop {
                     match kcp_listener.accept().await {
@@ -501,6 +516,7 @@ impl Server {
                                 stcp_bridge_manager: stcp_bridge_manager.clone(),
                                 work_conn_manager: work_conn_manager.clone(),
                                 plugin_manager: plugin_manager.clone(),
+                                work_conn_port: kcp_work_conn_port,
                             };
                             let m = metrics.clone();
 
@@ -573,7 +589,7 @@ impl Server {
 
     /// 处理工作连接（支持 TLS/明文混跑 + tls_only 强制）
     async fn handle_work_connections(
-        listener: tokio::net::TcpListener,
+        listener: std::sync::Arc<tokio::net::TcpListener>,
         managers: ServerManagers,
         tls_config: Option<TlsConfig>,
         tls_only: bool,
@@ -1575,6 +1591,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             plugin_manager,
+            work_conn_port,
         } = managers;
         // 首字节嗅探：TCP_MUX_MAGIC = tcp_mux 客户端（多路复用路径）；
         // "GET " = WebSocket 升级控制连接（明文 websocket 传输）。
@@ -1634,6 +1651,7 @@ impl Server {
                     stcp_bridge_manager,
                     work_conn_manager,
                     plugin_manager,
+                    work_conn_port,
                 },
                 tls_config.is_some(),
                 None,
@@ -1661,6 +1679,7 @@ impl Server {
                     stcp_bridge_manager,
                     work_conn_manager,
                     plugin_manager,
+                    work_conn_port,
                 },
                 tls_config,
             )
@@ -1732,6 +1751,7 @@ impl Server {
                 stcp_bridge_manager,
                 work_conn_manager,
                 plugin_manager,
+                work_conn_port,
             },
             work_conn_tls,
             None,
@@ -1810,6 +1830,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             plugin_manager,
+            work_conn_port,
             ..
         } = managers;
         // 创建登录通知通道
@@ -1837,6 +1858,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
+            work_conn_port,
             pre_read_login,
             plugin_manager,
             peer_cert_fingerprint,
@@ -1902,6 +1924,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             plugin_manager,
+            work_conn_port,
         } = managers;
         // 工作连接 TLS 协商标志（mux 下工作连接为会话流，TLS 在会话层；
         // 保持与 LoginResp 协商一致性）
@@ -1951,6 +1974,7 @@ impl Server {
                 stcp_bridge_manager,
                 work_conn_manager,
                 plugin_manager,
+                work_conn_port,
             },
             work_conn_tls,
             None,
@@ -2003,6 +2027,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             plugin_manager,
+            work_conn_port,
             ..
         } = managers;
         let conn = Self::negotiate_control_conn(Box::new(kcp_conn), &auth_manager).await?;
@@ -2027,6 +2052,7 @@ impl Server {
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
+            work_conn_port,
             pre_read_login: None,
             plugin_manager,
             // KCP 是 UDP 明文传输，没有 TLS 握手 ⇒ 无客户端证书指纹。

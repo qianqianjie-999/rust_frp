@@ -81,6 +81,9 @@ use base64::Engine as _;
 use rust_frp_config::PluginConfig;
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+// Unix 域套接字仅 POSIX 平台可用；Windows 下保留类型与工厂（构造即报错），
+// 保证 crate 可跨平台编译（server 在 Windows 上构建/测试需要）
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 /// 服务端 HTTP 插件机制（frps 控制面回调），与本地插件（数据面）互补。
@@ -149,6 +152,8 @@ pub trait PluginFactory {
 
 /// Unix 域套接字插件
 pub struct UnixDomainSocketPlugin {
+    // Windows 下该字段不参与任何路径（handle 直接报错），仅 Unix 实现使用
+    #[allow(dead_code)]
     unix_path: String,
 }
 
@@ -167,6 +172,7 @@ impl UnixDomainSocketPlugin {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl Plugin for UnixDomainSocketPlugin {
     async fn handle(
@@ -179,6 +185,18 @@ impl Plugin for UnixDomainSocketPlugin {
         // 双向转发数据
         tokio::io::copy_bidirectional(&mut conn, &mut unix_conn).await?;
         Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+#[async_trait]
+impl Plugin for UnixDomainSocketPlugin {
+    async fn handle(
+        &mut self,
+        _conn: Box<dyn AsyncStream>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("unix_domain_socket plugin is not supported on this platform (no Unix domain sockets)"
+            .into())
     }
 }
 

@@ -160,6 +160,8 @@ mod fields {
         "use_compression",
         "useCompression",
         "quic",
+        "work_conn_via",
+        "workConnVia",
     ];
 
     pub const TLS: &[&str] = &[

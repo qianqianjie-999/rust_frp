@@ -331,14 +331,22 @@ fn test_login_resp_work_conn_tls_backward_compat() {
         run_id: "rid".to_string(),
         error: String::new(),
         work_conn_tls: true,
+        work_conn_port: 10300,
     };
     let json = serde_json::to_string(&resp).unwrap();
     assert!(json.contains("\"work_conn_tls\":true"));
+    assert!(json.contains("\"work_conn_port\":10300"));
 
-    // 旧版服务端 JSON 无 work_conn_tls 字段 → serde default = false（保持旧行为）
+    // 旧版服务端 JSON 无 work_conn_tls/work_conn_port 字段 → serde default 保持旧行为
     let legacy = r#"{"version":"0.1.0","run_id":"rid","error":""}"#;
     let parsed: rust_frp_core::LoginRespMsg = serde_json::from_str(legacy).unwrap();
     assert!(!parsed.work_conn_tls);
+    assert_eq!(parsed.work_conn_port, 0);
+
+    // 旧版客户端忽略未知字段：新版 JSON 里多出的 work_conn_port 不影响解析
+    let modern = r#"{"version":"0.1.0","run_id":"rid","error":"","work_conn_tls":false,"work_conn_port":10300}"#;
+    let parsed: rust_frp_core::LoginRespMsg = serde_json::from_str(modern).unwrap();
+    assert_eq!(parsed.work_conn_port, 10300);
 }
 
 #[tokio::test]

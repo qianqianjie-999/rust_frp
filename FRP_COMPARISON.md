@@ -115,6 +115,7 @@
 | **wss** | ✅ | ✅ | rust：TLS 之上叠加 WebSocket（路径 `/~!frp`），服务端在 TLS 握手后嗅探升级；fail-closed 要求信任来源 |
 | **wire protocol v2** | ✅（控制连接） | ✅ | rust `wire_v2.rs`：魔数 `FRP\x00\x02\r\n` + 帧化 ClientHello/ServerHello 能力协商 + HKDF 方向性 AEAD（aes-256-gcm）。**scope**：仅控制连接；`xchacha20-poly1305` 列为路线图 |
 | tcp_mux | ✅ | ✅ | rust `mux.rs`（魔数 `0x5A`）；原版 wire v1 内置 |
+| **数据/控制分离（双端口）** | ✅（默认 auto） | ❌（单端口 mux 混载） | **rust 特有**：`bind_port` 承载控制面，`work_conn_port`（默认 +1000）承载工作连接。大流量不挤占心跳/控制通道；服务端经 LoginResp 下发真实工作端口；客户端 `transport.work_conn_via = auto/mux/dedicated`——auto 直拨失败自动回退 mux（60s 降级记忆），受限环境可单端口运行 |
 | TLS 默认加密 | ✅（默认 on） | ✅（默认 on） | 双方无证书时均**运行时自签** |
 | TLS force / 仅 TLS | ✅ `tls_only` | ✅ `transport.tls.force` | 等价 |
 | TLS 客户端校验 | ✅ fail-closed（无 CA 且未显式 skip → 拒绝启动） | ⚠️ 有 TrustedCAFile 才 force | **rust 更严** |

@@ -43,6 +43,10 @@ pub struct Control {
     pool_count: u32,
     /// 工作连接是否启用 TLS（通过 LoginRespMsg 协商给客户端）
     work_conn_tls: bool,
+    /// 服务器实际监听的工作连接端口（通过 LoginRespMsg 下发给客户端，
+    /// 使客户端无需猜测 `server_port + 1000`；仅当服务器显式配置了
+    /// `work_conn_port` 时才非 0 下发，保持兼容语义）
+    work_conn_port: u16,
     /// 客户端在 LoginMsg 中声明的扩展元数据（供插件回调透传）
     metas: std::collections::HashMap<String, String>,
     /// 服务端 HTTP 插件管理器（登录 / 注册 / 心跳 / 关闭代理回调）
@@ -69,6 +73,8 @@ pub struct ControlDeps {
     pub stcp_bridge_manager: Arc<StcpBridgeManager>,
     pub work_conn_manager: Arc<ServerWorkConnManager>,
     pub work_conn_tls: bool,
+    /// 服务器工作连接端口（0 = 服务器未自定义，客户端按 server_port+1000 推算）
+    pub work_conn_port: u16,
     /// 上层已读取的登录消息（QUIC 流按首条消息分派时复用，避免重复读取）
     pub pre_read_login: Option<rust_frp_core::LoginMsg>,
     pub plugin_manager: Arc<rust_frp_plugin::server_plugin::Manager>,
@@ -96,6 +102,7 @@ impl Control {
             stcp_bridge_manager,
             work_conn_manager,
             work_conn_tls,
+            work_conn_port,
             plugin_manager,
             pre_read_login,
             peer_cert_fingerprint,
@@ -118,6 +125,7 @@ impl Control {
             work_conn_manager,
             pool_count: 0, // 将在收到 LoginMsg 后由 run() 设置
             work_conn_tls,
+            work_conn_port,
             metas: std::collections::HashMap::new(),
             plugin_manager,
             pre_read_login,
@@ -136,6 +144,7 @@ impl Control {
             run_id: String::new(),
             error: message.to_string(),
             work_conn_tls: self.work_conn_tls,
+            work_conn_port: self.work_conn_port,
         };
         if let Err(e) = self.write_msg(&Message::LoginResp(resp)).await {
             log::debug!("failed to send login error response: {:?}", e);
@@ -457,6 +466,7 @@ impl Control {
                             run_id: self.run_id.clone(),
                             error: "".to_string(),
                             work_conn_tls: self.work_conn_tls,
+                            work_conn_port: self.work_conn_port,
                         };
                         let write_result = self.write_msg(&Message::LoginResp(resp)).await;
                         if let Err(e) = write_result {

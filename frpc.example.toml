@@ -89,6 +89,19 @@ protocol = "tcp"
 # keepalive_period = 0         # 秒，0 = 不主动保活
 tcp_mux = true
 pool_count = 10
+# ── 可选：工作连接承载方式（数据/控制分离开关，本项目的双端口设计）──
+# rust_frp 默认双端口：bind_port（如 9300）承载控制面（登录/心跳/控制消息），
+# work_conn_port（默认 bind_port+1000，如 10300）承载工作连接（真正的业务数据）。
+# work_conn_via 决定工作连接走哪条路：
+#   "auto"       默认。优先直拨专用工作端口（数据面与控制面彻底分离，
+#                大流量传输不会挤占心跳/控制通道）；工作端口不可达时
+#                自动回退 tcp_mux 会话流并降级记忆 60 秒，连通性优先。
+#   "mux"        工作连接始终走 tcp_mux 会话流（防火墙/安全组只放行
+#                一个端口时选它）。
+#   "dedicated"  强制直拨工作端口，失败直接报错（严格分离，不回退）。
+# 服务端会在登录响应中下发真实 work_conn_port（旧版服务端无此字段时
+# 客户端按 work_conn_port 配置或 server_port+1000 推算）。
+# work_conn_via = "auto"
 # 全局带宽限制（代理级 bandwidth_limit 优先）
 # bandwidth_limit = "10MB"
 # ── 可选：线协议版本（对齐原版 transport.wireProtocol）──

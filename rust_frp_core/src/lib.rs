@@ -243,6 +243,15 @@ pub struct LoginRespMsg {
     /// 客户端按明文建立工作连接（保持旧行为）。
     #[serde(default)]
     pub work_conn_tls: bool,
+    /// 服务器实际监听的工作连接端口（数据/控制分离架构的专用数据端口）
+    ///
+    /// # 兼容性
+    ///
+    /// `#[serde(default)]`：旧版服务端不发送此字段时默认 0（= 未下发），
+    /// 客户端沿用本地推算（客户端 `work_conn_port` 配置，否则 `server_port + 1000`），
+    /// 与旧版服务端完全互通。
+    #[serde(default)]
+    pub work_conn_port: u16,
 }
 
 /// 代理注册消息 - 客户端请求注册一个代理
@@ -1131,6 +1140,7 @@ mod tests {
             run_id: "server-run-001".to_string(),
             error: "".to_string(),
             work_conn_tls: true,
+            work_conn_port: 10300,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: LoginRespMsg = serde_json::from_str(&json).unwrap();

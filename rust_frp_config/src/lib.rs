@@ -998,6 +998,21 @@ pub struct TransportConfig {
     /// （空串）覆盖容器级 `#[serde(default)]`，使缺省值为空串而非 `"v1"`。
     #[serde(alias = "wireProtocol")]
     pub wire_protocol: String,
+
+    /// 工作连接承载方式（**客户端生效**，数据/控制分离架构开关）
+    ///
+    /// - `"auto"`（默认）：优先直拨服务器专用工作端口（`work_conn_port`，
+    ///   默认 `server_port + 1000`），把数据面与控制面（心跳/控制消息）彻底分开；
+    ///   工作端口不可达时（防火墙只放行了一个端口等）自动回退 tcp_mux 会话流，
+    ///   保证连通性优先。
+    /// - `"mux"`：工作连接始终走 tcp_mux/QUIC 会话流（受限环境，只开一个端口）。
+    /// - `"dedicated"`：强制直拨工作端口，失败直接报错（严格分离，不回退）。
+    ///
+    /// 注意：与 `wire_protocol` 一致**不加**字段级 `#[serde(default)]`——
+    /// 容器级 `#[serde(default)]` 会让缺省值取 `Default::default()`（"auto"），
+    /// 字段级 default 反而会以空串覆盖它。
+    #[serde(alias = "workConnVia")]
+    pub work_conn_via: String,
 }
 
 impl Default for TransportConfig {
@@ -1013,6 +1028,7 @@ impl Default for TransportConfig {
             use_compression: false,
             quic: None,
             wire_protocol: "v1".to_string(),
+            work_conn_via: "auto".to_string(),
         }
     }
 }

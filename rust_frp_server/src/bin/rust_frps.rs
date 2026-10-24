@@ -69,7 +69,8 @@ async fn main() {
     // 将 reload_tx 存入 server，供 WebServer API 使用
     server.set_reload_tx(reload_tx.clone());
 
-    // 启动 SIGHUP 信号处理
+    // 启动 SIGHUP 信号处理（仅 Unix；Windows 的配置重载走文件监听 / Web API）
+    #[cfg(unix)]
     if let Ok(mut sighup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         let tx = reload_tx.clone();
         tokio::spawn(async move {
@@ -84,6 +85,8 @@ async fn main() {
     } else {
         warn!("SIGHUP signal handler not available on this platform");
     }
+    #[cfg(windows)]
+    let _ = reload_tx.clone(); // reload 通道已交由文件监听/Web API 使用
 
     // 启动配置文件监听
     let watch_path = config_path.clone();
@@ -130,7 +133,9 @@ async fn main() {
 
     // 优雅关闭：SIGINT/SIGTERM → 停止接收新连接（不再硬 exit(0)），
     // 随后由 main 等待存量连接排空（超时上限见 DRAIN_TIMEOUT）
+    // 平台分派：Unix 用 SIGINT/SIGTERM，Windows 用 Ctrl+C/Ctrl+Break（对齐客户端 d4352d3）
     let shutdown = server.shutdown_handle();
+    #[cfg(unix)]
     if let (Ok(mut sigint), Ok(mut sigterm)) = (
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
@@ -149,6 +154,26 @@ async fn main() {
         });
     } else {
         warn!("Signal handlers not available on this platform");
+    }
+    #[cfg(windows)]
+    match (
+        tokio::signal::windows::ctrl_c(),
+        tokio::signal::windows::ctrl_break(),
+    ) {
+        (Ok(mut sigint), Ok(mut sigbreak)) => {
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = sigint.recv() => info!("Received Ctrl+C"),
+                    _ = sigbreak.recv() => info!("Received Ctrl+Break"),
+                }
+                info!("Shutting down gracefully: no longer accepting new connections, draining...");
+                shutdown.notify_waiters();
+                shutdown.notify_one();
+            });
+        }
+        _ => {
+            warn!("Signal handlers not available on this platform");
+        }
     }
 
     // start() 在收到关闭信号、accept 循环退出后返回

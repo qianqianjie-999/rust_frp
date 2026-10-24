@@ -719,6 +719,52 @@ fn work_conn_port_of(config: &rust_frp_config::ClientConfig) -> u16 {
     config.work_conn_port.unwrap_or(config.server_port + 1000)
 }
 
+/// 解析工作连接端口：服务器 LoginResp 下发值 > 客户端配置 > server_port + 1000
+///
+/// 服务器通过 `LoginRespMsg.work_conn_port` 下发真实端口（0 = 旧版服务端未下发），
+/// 避免"服务端自定义了 work_conn_port 而客户端按默认值推算"的错位。
+fn resolve_work_conn_port(config: &rust_frp_config::ClientConfig, server_work_conn_port: u16) -> u16 {
+    if server_work_conn_port > 0 {
+        server_work_conn_port
+    } else {
+        work_conn_port_of(config)
+    }
+}
+
+/// 工作端口最近一次直拨失败的时间（Unix 秒；0 = 从未失败）
+///
+/// `transport.work_conn_via = "auto"` 时的降级记忆：直拨失败（典型为安全组/防火墙
+/// 未放行工作端口）后 60 秒内不再尝试直拨，避免每次建工作连接都白等超时；
+/// 60 秒后重试一次，网络恢复（如端口放行）后自动回到数据/控制分离路径。
+static WORK_PORT_LAST_FAIL_SECS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+const WORK_PORT_RETRY_INTERVAL_SECS: i64 = 60;
+
+fn work_port_currently_preferred() -> bool {
+    let last = WORK_PORT_LAST_FAIL_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return true;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    now - last >= WORK_PORT_RETRY_INTERVAL_SECS
+}
+
+fn mark_work_port_failed() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    WORK_PORT_LAST_FAIL_SECS.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn mark_work_port_ok() {
+    WORK_PORT_LAST_FAIL_SECS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 解析服务器地址为 `SocketAddr`（支持 IP 字面量与域名）
 async fn resolve_server_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     if let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() {
@@ -934,6 +980,8 @@ pub struct ClientControl {
     plugin_rejected_heartbeat: bool,
     /// 工作连接是否使用 TLS（来自服务器 LoginRespMsg.work_conn_tls 协商）
     work_conn_tls: bool,
+    /// 服务器下发的工作连接端口（0 = 旧版服务端未下发，按本地推算）
+    server_work_conn_port: u16,
     /// 多路复用会话：tcp_mux 的 yamux 会话，或 QUIC 连接
     ///
     /// 存在时工作连接不再新建底层连接，而是从会话打开新流；
@@ -953,6 +1001,8 @@ pub struct ClientControlDeps {
     pub work_conn_manager: Arc<WorkConnManager>,
     pub config: Arc<ClientConfig>,
     pub work_conn_tls: bool,
+    /// 服务器 LoginResp 下发的工作连接端口（0 = 未下发）
+    pub server_work_conn_port: u16,
     pub session: Option<Arc<dyn Session>>,
 }
 
@@ -967,6 +1017,7 @@ impl ClientControl {
             work_conn_manager,
             config,
             work_conn_tls,
+            server_work_conn_port,
             session,
         } = deps;
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(256);
@@ -987,6 +1038,7 @@ impl ClientControl {
             last_pong_time: std::time::Instant::now(),
             plugin_rejected_heartbeat: false,
             work_conn_tls,
+            server_work_conn_port,
             session,
             xtcp_registry: Arc::new(XtcpRegistry::default()),
         }
@@ -1131,6 +1183,7 @@ impl ClientControl {
                 let run_id = self.run_id.clone();
                 let config = Arc::clone(&self.config);
                 let work_conn_tls = self.work_conn_tls;
+                let server_work_conn_port = self.server_work_conn_port;
                 let session = self.session.clone();
 
                 tokio::spawn(async move {
@@ -1140,6 +1193,7 @@ impl ClientControl {
                         &run_id,
                         &config,
                         work_conn_tls,
+                        server_work_conn_port,
                         session.as_ref(),
                     )
                     .await
@@ -1413,8 +1467,10 @@ struct WorkConnRequest<'a> {
     proxy_name: &'a str,
     run_id: &'a str,
     work_conn_tls: bool,
-    /// `Some` 时经多路复用会话流建立（tcp_mux / QUIC，协议与直连工作端口一致）
+    /// `Some` 时可作为回退路径：经多路复用会话流建立（tcp_mux / QUIC，协议与直连工作端口一致）
     session: Option<&'a Arc<dyn Session>>,
+    /// 服务器 LoginResp 下发的工作连接端口（0 = 未下发，按客户端配置/默认推算）
+    server_work_conn_port: u16,
     use_encryption: bool,
     use_compression: bool,
 }
@@ -1425,11 +1481,64 @@ struct WorkConnRequest<'a> {
 /// PROXY protocol v1 头使用。
 type OpenedWorkConn = (Box<dyn rust_frp_net::FrpConn>, String, u16);
 
+/// 直拨服务器专用工作端口（数据/控制分离的数据面通道）
+///
+/// - 端口：`resolve_work_conn_port`（服务器下发 > 客户端配置 > server_port+1000）；
+/// - 超时：TCP 连接 5 秒（auto 模式下快速失败以触发 mux 回退，也防 DROP 型
+///   防火墙把工作连接建立挂死）；
+/// - TLS：服务器协商要求时复用控制连接的客户端 TLS 配置。
+async fn dial_work_port(
+    config: &ClientConfig,
+    server_work_conn_port: u16,
+    work_conn_tls: bool,
+    proxy_name: &str,
+) -> Result<Box<dyn rust_frp_net::FrpConn>, Box<dyn std::error::Error + Send + Sync>> {
+    let work_addr = format!(
+        "{}:{}",
+        config.server_addr,
+        resolve_work_conn_port(config, server_work_conn_port)
+    );
+    let tcp_conn = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&work_addr),
+    )
+    .await
+    .map_err(|_| format!("connect to work port {} timed out (5s)", work_addr))??;
+    log::info!(
+        "Connected to server work conn port: {} (proxy {})",
+        work_addr,
+        proxy_name
+    );
+
+    if work_conn_tls {
+        let tls_config = build_client_tls_config(config)
+            .map_err(|e| format!("failed to build client TLS config: {}", e))?
+            .ok_or("server requires TLS work conn but client tls is disabled")?;
+        let tls_stream = tls_config
+            .connect(&config.server_addr, tcp_conn)
+            .await
+            .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
+        log::info!("Work conn TLS established for proxy: {}", proxy_name);
+        Ok(Box::new(tls_stream))
+    } else {
+        Ok(Box::new(tcp_conn))
+    }
+}
+
 /// 打开一条到服务端的工作连接并完成 `NewWorkConn`/`StartWorkConn` 握手
 ///
 /// 返回的连接在需要时已按固定顺序包装：**先压缩（内层）、后加密（外层）**，
 /// 与服务器 [`rust_frp_server`] 及对端客户端保持一致。直连与 tcp_mux 两条
 /// 路径共用本函数（握手消息明文，包装在握手之后）。
+///
+/// # 路径选择（`transport.work_conn_via`）
+///
+/// - `auto`（默认）：**优先直拨专用工作端口**（数据/控制分离，高吞吐不挤占
+///   控制通道）；直拨失败且有 mux 会话时自动回退会话流，并记入 60 秒降级
+///   缓存（期间不再尝试直拨，超时后自动重试）。无会话可回退（STCP/XTCP
+///   visitor 等）则直拨失败即报错。
+/// - `mux`：始终走会话流；无会话时退回直拨。
+/// - `dedicated`：强制直拨，失败即报错，不回退。
 async fn open_work_conn(
     config: &ClientConfig,
     req: WorkConnRequest<'_>,
@@ -1439,11 +1548,54 @@ async fn open_work_conn(
         run_id,
         work_conn_tls,
         session,
+        server_work_conn_port,
         use_encryption,
         use_compression,
     } = req;
 
-    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if let Some(session) = session {
+    let via = config.transport.work_conn_via.to_ascii_lowercase();
+    let prefer_direct = match via.as_str() {
+        "mux" => false,
+        "dedicated" => true,
+        _ => {
+            // auto：仅 TCP 控制连接才有"另一个端口"可拨；
+            // QUIC/KCP 等传输工作连接天然与会话同通道，保持原行为
+            config.transport.protocol == "tcp" && work_port_currently_preferred()
+        }
+    };
+
+    let mut work_conn: Box<dyn rust_frp_net::FrpConn> = if prefer_direct {
+        match dial_work_port(config, server_work_conn_port, work_conn_tls, proxy_name).await {
+            Ok(conn) => {
+                mark_work_port_ok();
+                conn
+            }
+            Err(dial_err) if via == "dedicated" => return Err(dial_err),
+            Err(dial_err) => match session {
+                Some(session) => {
+                    // 数据/控制分离不可用 → 回退 mux 会话流（连通性优先）
+                    mark_work_port_failed();
+                    log::warn!(
+                        "Work port dial failed for proxy {} ({}), falling back to mux session",
+                        proxy_name,
+                        dial_err
+                    );
+                    let stream = session
+                        .open_stream()
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "both work port ({}) and mux session failed: {}",
+                                dial_err, e
+                            )
+                        })?;
+                    log::info!("Mux work stream established (fallback) for proxy: {}", proxy_name);
+                    stream
+                }
+                None => return Err(dial_err),
+            },
+        }
+    } else if let Some(session) = session {
         // 多路复用（tcp_mux / QUIC）：工作连接 = 会话流（服务端分发循环经
         // process_work_conn 处理，协议与直连工作端口完全一致）
         let stream = session
@@ -1453,29 +1605,8 @@ async fn open_work_conn(
         log::info!("Mux work stream established for proxy: {}", proxy_name);
         stream
     } else {
-        // 直连工作端口路径
-        let work_addr = format!("{}:{}", config.server_addr, work_conn_port_of(config));
-        let tcp_conn = tokio::net::TcpStream::connect(&work_addr).await?;
-        log::info!(
-            "Connected to server work conn port: {} (proxy {})",
-            work_addr,
-            proxy_name
-        );
-
-        // 服务器协商要求 TLS 时，工作连接套 TLS（复用控制连接的客户端 TLS 配置）
-        if work_conn_tls {
-            let tls_config = build_client_tls_config(config)
-                .map_err(|e| format!("failed to build client TLS config: {}", e))?
-                .ok_or("server requires TLS work conn but client tls is disabled")?;
-            let tls_stream = tls_config
-                .connect(&config.server_addr, tcp_conn)
-                .await
-                .map_err(|e| format!("work conn TLS handshake failed: {}", e))?;
-            log::info!("Work conn TLS established for proxy: {}", proxy_name);
-            Box::new(tls_stream)
-        } else {
-            Box::new(tcp_conn)
-        }
+        // 无会话可用（STCP/XTCP visitor 的 owner/访问者腿等）：直拨工作端口
+        dial_work_port(config, server_work_conn_port, work_conn_tls, proxy_name).await?
     };
 
     // 生成 sign_key
@@ -1546,6 +1677,7 @@ async fn establish_work_connection(
     run_id: &str,
     config: &ClientConfig,
     work_conn_tls: bool,
+    server_work_conn_port: u16,
     session: Option<&Arc<dyn Session>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 查找代理配置
@@ -1573,6 +1705,7 @@ async fn establish_work_connection(
             run_id,
             work_conn_tls,
             session,
+            server_work_conn_port,
             use_encryption,
             use_compression,
         },
@@ -2039,6 +2172,7 @@ async fn handle_stcp_visitor_conn(
             run_id: &run_id,
             work_conn_tls,
             session: None,
+            server_work_conn_port: 0,
             use_encryption,
             use_compression,
         },
@@ -2337,6 +2471,7 @@ async fn sudp_open_session(
             run_id: &ctx.run_id,
             work_conn_tls: ctx.work_conn_tls,
             session: None,
+            server_work_conn_port: 0,
             use_encryption: ctx.use_encryption,
             use_compression: ctx.use_compression,
         },
@@ -3469,6 +3604,14 @@ impl Client {
                 if work_conn_tls {
                     log::info!("Server negotiated TLS for work connections");
                 }
+                // 服务器下发的工作连接端口（0 = 旧版服务端未下发）
+                let server_work_conn_port = login_resp_msg.work_conn_port;
+                if server_work_conn_port > 0 {
+                    log::info!(
+                        "Server advertised work conn port: {}",
+                        server_work_conn_port
+                    );
+                }
                 let control = ClientControl::new(ClientControlDeps {
                     conn,
                     run_id: login_resp_msg.run_id,
@@ -3478,6 +3621,7 @@ impl Client {
                     work_conn_manager: Arc::clone(&self.work_conn_manager),
                     config: Arc::clone(&self.config),
                     work_conn_tls,
+                    server_work_conn_port,
                     session,
                 });
                 self.control = Some(Mutex::new(control));
@@ -3712,6 +3856,39 @@ mod client_manager_tests {
 
         cfg.work_conn_port = Some(7400);
         assert_eq!(work_conn_port_of(&cfg), 7400);
+    }
+
+    /// 工作端口解析优先级：服务器下发 > 客户端配置 > server_port+1000
+    #[test]
+    fn test_resolve_work_conn_port_precedence() {
+        let mut cfg = ClientConfig {
+            server_port: 9300,
+            work_conn_port: None,
+            ..ClientConfig::default()
+        };
+        // 旧版服务端未下发（0）→ 客户端无配置 → server_port+1000
+        assert_eq!(resolve_work_conn_port(&cfg, 0), 10300);
+        // 旧版服务端未下发 → 客户端显式配置生效
+        cfg.work_conn_port = Some(9500);
+        assert_eq!(resolve_work_conn_port(&cfg, 0), 9500);
+        // 新版服务端下发真实端口 → 最高优先级（覆盖客户端的错配）
+        assert_eq!(resolve_work_conn_port(&cfg, 10300), 10300);
+    }
+
+    /// auto 模式降级缓存：直拨失败后 60s 内不再尝试，超时后恢复尝试
+    #[test]
+    fn test_work_port_degraded_cache() {
+        // 确保从"无失败记录"状态开始（清掉其他测试可能留下的标记）
+        mark_work_port_ok();
+        assert!(work_port_currently_preferred());
+
+        // 标记失败 → 立即不再优先直拨
+        mark_work_port_failed();
+        assert!(!work_port_currently_preferred());
+
+        // 恢复成功标记 → 重新优先直拨
+        mark_work_port_ok();
+        assert!(work_port_currently_preferred());
     }
 
     #[tokio::test]
@@ -4334,10 +4511,20 @@ mod token_source_tests {
     #[test]
     fn applies_token_from_exec() {
         let mut cfg = base_config();
+        // 平台自适应：/bin/echo 仅 POSIX 存在，Windows 用 cmd echo
+        #[cfg(windows)]
+        let exec = Some(vec![
+            "cmd".to_string(),
+            "/C".to_string(),
+            "echo".to_string(),
+            "exec-token-9".to_string(),
+        ]);
+        #[cfg(not(windows))]
+        let exec = Some(vec!["/bin/echo".to_string(), "exec-token-9".to_string()]);
         cfg.auth.token_source = Some(TokenSource {
             r#type: "exec".to_string(),
             file_path: None,
-            exec: Some(vec!["/bin/echo".to_string(), "exec-token-9".to_string()]),
+            exec,
         });
         apply_token_source(&mut cfg).unwrap();
         assert_eq!(cfg.auth.token.as_deref(), Some("exec-token-9"));
