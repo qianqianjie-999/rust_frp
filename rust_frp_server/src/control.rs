@@ -1400,12 +1400,19 @@ impl StcpBridgeManager {
     ///
     /// 正常路径（cleanup_proxies / 桥接完成 remove）覆盖绝大多数场景；
     /// 此函数兜住"visitor 侧重连、owner 换会话"等导致条目无人回收的情况。
-    async fn reap_zombie_bridges(&self, bridges: &mut std::collections::HashMap<String, StcpBridgeState>) {
+    async fn reap_zombie_bridges(
+        &self,
+        bridges: &mut std::collections::HashMap<String, StcpBridgeState>,
+    ) {
         let now = std::time::Instant::now();
         bridges.retain(|id, state| {
             if now.duration_since(state.created_at) > BRIDGE_ZOMBIE_TTL {
-                log::warn!("Reaping zombie STCP bridge: {} (legs: {}/{})", id,
-                    state.conn1.is_some() as u8, state.conn2.is_some() as u8);
+                log::warn!(
+                    "Reaping zombie STCP bridge: {} (legs: {}/{})",
+                    id,
+                    state.conn1.is_some() as u8,
+                    state.conn2.is_some() as u8
+                );
                 false
             } else {
                 true
@@ -1703,10 +1710,12 @@ mod stcp_bridge_tests {
     #[tokio::test]
     async fn add_conn_without_bridge_returns_conn_back() {
         let m = StcpBridgeManager::new();
-        match m.add_conn_and_try_bridge("no-such", fake_leg()).await {
-            Ok(_) => panic!("桥不存在时应把连接交回调用方（Err）"),
-            Err(_) => {}
-        }
+        assert!(
+            m.add_conn_and_try_bridge("no-such", fake_leg())
+                .await
+                .is_err(),
+            "桥不存在时应把连接交回调用方（Err）"
+        );
     }
 
     #[tokio::test]
