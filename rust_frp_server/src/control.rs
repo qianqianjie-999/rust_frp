@@ -219,6 +219,10 @@ impl Control {
             self.proxy_owners.write().await.remove(proxy_name);
             // 清理 STCP/XTCP 共享密钥登记
             global_proxy_secrets().remove(proxy_name);
+            // 清理 STCP 桥条目：owner（如播报机 frpc）断线重连后，
+            // 残留的半连接桥（只有一条腿）会让后续 visitor 的请求
+            // 填入僵尸条目并永远等不到另一条腿，必须在此一并清除
+            self.stcp_bridge_manager.cleanup(proxy_name).await;
         }
     }
 
@@ -1349,10 +1353,16 @@ impl ControlManager {
     }
 }
 
+/// STCP 僵尸桥存活上限：一条腿到达后另一条腿的最长等待时间。
+/// 正常桥接在秒级完成；超过 2 分钟说明对端已不可能再来（会话已断）。
+const BRIDGE_ZOMBIE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// STCP 桥接状态，用于等待两个客户端的工连接并桥接
 pub(crate) struct StcpBridgeState {
     conn1: Option<AnyConn>,
     conn2: Option<AnyConn>,
+    /// 建桥时间（create_bridge 时刻）：用于清理等不齐两条腿的僵尸条目
+    created_at: std::time::Instant,
 }
 
 /// STCP 桥接管理器，用于协调两个客户端的工作连接
@@ -1380,8 +1390,26 @@ impl StcpBridgeManager {
             StcpBridgeState {
                 conn1: None,
                 conn2: None,
+                created_at: std::time::Instant::now(),
             },
         );
+    }
+
+    /// 僵尸桥兜底清理：任一条腿超过 BRIDGE_ZOMBIE_TTL 仍未凑齐即整条丢弃。
+    ///
+    /// 正常路径（cleanup_proxies / 桥接完成 remove）覆盖绝大多数场景；
+    /// 此函数兜住"visitor 侧重连、owner 换会话"等导致条目无人回收的情况。
+    async fn reap_zombie_bridges(&self, bridges: &mut std::collections::HashMap<String, StcpBridgeState>) {
+        let now = std::time::Instant::now();
+        bridges.retain(|id, state| {
+            if now.duration_since(state.created_at) > BRIDGE_ZOMBIE_TTL {
+                log::warn!("Reaping zombie STCP bridge: {} (legs: {}/{})", id,
+                    state.conn1.is_some() as u8, state.conn2.is_some() as u8);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// 添加连接并尝试桥接。
@@ -1394,6 +1422,8 @@ impl StcpBridgeManager {
         conn: AnyConn,
     ) -> Result<Option<(AnyConn, AnyConn)>, AnyConn> {
         let mut bridges = self.bridges.write().await;
+        // 每次接入先做僵尸回收，保证陈旧条目不会吞掉新连接
+        self.reap_zombie_bridges(&mut bridges).await;
         if let Some(state) = bridges.get_mut(bridge_id) {
             if state.conn1.is_none() {
                 state.conn1 = Some(conn);
@@ -1594,5 +1624,121 @@ mod security_hardening_tests {
         assert_eq!(cm.login_throttle().map(|t| t.max_failures()), Some(3));
         assert_eq!(cm.client_id_policy(), ClientIdPolicy::Reject);
         assert!(cm.kick_require_same_cert());
+    }
+}
+
+#[cfg(test)]
+mod stcp_bridge_tests {
+    //! STCP 桥生命周期回归：僵尸条目清理（owner/visitor 任一侧重连后，
+    //! 等不齐两条腿的桥必须被回收，否则新连接填入僵尸条目后永远挂起）。
+
+    use super::*;
+
+    /// 测试用假腿：DuplexStream 包一层实现 FrpConn（remote_addr 返 None）。
+    /// 注意 `Box<dyn FrpConn>` 未实现 Debug，断言一律走 match，不用 unwrap/expect。
+    struct TestLeg(tokio::io::DuplexStream);
+
+    impl tokio::io::AsyncRead for TestLeg {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for TestLeg {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    impl rust_frp_net::FrpConn for TestLeg {
+        fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+            None
+        }
+    }
+
+    fn fake_leg() -> AnyConn {
+        let (a, _b) = tokio::io::duplex(4096);
+        Box::new(TestLeg(a))
+    }
+
+    #[tokio::test]
+    async fn create_and_bridge_both_legs() {
+        let m = StcpBridgeManager::new();
+        m.create_bridge("p1".to_string()).await;
+        assert!(m.contains("p1").await);
+        // 第一条腿：存入，等待另一半
+        match m.add_conn_and_try_bridge("p1", fake_leg()).await {
+            Ok(v) => assert!(v.is_none(), "只到一条腿时应返回 None（已存入）"),
+            Err(_) => panic!("第一条腿应成功存入"),
+        }
+        // 第二条腿：凑齐，返回待桥接的一对，条目随之移除
+        match m.add_conn_and_try_bridge("p1", fake_leg()).await {
+            Ok(v) => assert!(v.is_some(), "两条腿凑齐应返回待桥接的一对"),
+            Err(_) => panic!("第二条腿应凑齐桥接"),
+        }
+        assert!(!m.contains("p1").await, "桥接完成后条目应移除");
+    }
+
+    #[tokio::test]
+    async fn add_conn_without_bridge_returns_conn_back() {
+        let m = StcpBridgeManager::new();
+        match m.add_conn_and_try_bridge("no-such", fake_leg()).await {
+            Ok(_) => panic!("桥不存在时应把连接交回调用方（Err）"),
+            Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_bridge_entry() {
+        // 模拟 owner 断线：cleanup_proxies 对每个代理调 cleanup
+        let m = StcpBridgeManager::new();
+        m.create_bridge("ann-ssh-stcp".to_string()).await;
+        let _ = m.add_conn_and_try_bridge("ann-ssh-stcp", fake_leg()).await;
+        assert!(m.contains("ann-ssh-stcp").await);
+        m.cleanup("ann-ssh-stcp").await;
+        assert!(
+            !m.contains("ann-ssh-stcp").await,
+            "cleanup 后桥条目必须消失（否则新 visitor 填入僵尸条目后永远挂起）"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bridge_overwrites_stale_entry() {
+        // owner 重连后重新注册 → create_bridge 覆盖残桥，语义必须是"全新空桥"：
+        // 旧腿被丢弃，两条新腿才能凑齐（一条腿时不得误报桥接就绪）
+        let m = StcpBridgeManager::new();
+        m.create_bridge("p2".to_string()).await;
+        let _ = m.add_conn_and_try_bridge("p2", fake_leg()).await;
+        m.create_bridge("p2".to_string()).await;
+        // 覆盖后第一条新腿：应存入并返回 None（旧腿已被丢弃，不能与新腿凑对）
+        match m.add_conn_and_try_bridge("p2", fake_leg()).await {
+            Ok(v) => assert!(v.is_none(), "覆盖后的新桥只到一条腿时应返回 None"),
+            Err(_) => panic!("覆盖后的新桥应接受第一条新腿"),
+        }
+        // 第二条新腿：凑齐
+        match m.add_conn_and_try_bridge("p2", fake_leg()).await {
+            Ok(v) => assert!(v.is_some(), "两条新腿凑齐应返回待桥接的一对"),
+            Err(_) => panic!("第二条新腿应凑齐桥接"),
+        }
     }
 }
