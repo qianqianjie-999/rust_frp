@@ -13,11 +13,17 @@ use rust_frp_core::{LoginMsg, Message};
 use std::time::Duration;
 
 /// 申请一个当前空闲的 TCP 端口（bind :0 后立即释放）
+///
+/// 上限取 64_535（= u16::MAX - 1000）：保证调用方 `port + 1000`
+/// （work_conn_port）不溢出。不要用 60_000 之类的"心理安全值"——
+/// Windows 动态端口范围是 49152-65535，顺序分配下游标长期停在
+/// 60000+ 段时 50 次采样会全部落空（Linux 32768-60999 永远满足，
+/// 所以这个坑只在 Windows 上暴露）。
 fn free_tcp_port() -> u16 {
     for _ in 0..50 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp :0");
         let port = l.local_addr().expect("local addr").port();
-        if port <= 60_000 {
+        if port <= 64_535 {
             return port;
         }
     }

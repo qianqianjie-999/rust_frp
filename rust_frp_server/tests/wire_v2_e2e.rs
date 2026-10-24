@@ -17,11 +17,13 @@ use std::time::Duration;
 /// 申请一个当前空闲的 TCP 端口（bind :0 后立即释放）
 ///
 /// 同时保证 `port + 1000` 不会溢出 u16（`work_conn_port` 需要）。
+/// 上限必须放到 64_535：Windows 动态端口范围 49152-65535，
+/// 顺序分配下 60_000 阈值会连续 50 次落空（Linux 无此问题）。
 fn free_tcp_port() -> u16 {
     for _ in 0..50 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp :0");
         let port = l.local_addr().expect("local addr").port();
-        if port <= 60_000 {
+        if port <= 64_535 {
             return port;
         }
     }

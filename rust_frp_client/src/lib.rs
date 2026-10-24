@@ -579,6 +579,15 @@ impl ProxyManager for ClientProxyManager {
 /// 客户端访问者管理器
 pub struct ClientVisitorManager {
     visitors: RwLock<std::collections::HashMap<String, rust_frp_config::VisitorConfig>>,
+    /// visitor 任务句柄（按 visitor.name 索引）。
+    ///
+    /// 为什么需要它：控制连接断开重连时主循环会走 `clear()` 再按新
+    /// `run_id` 重新 spawn `start_stcp_visitor`。若 clear 只清配置表而不
+    /// abort 旧任务，旧任务的 listener 仍占用本地端口（bind 报 AddrInUse，
+    /// 新监听永远起不来），且旧任务的 `stcp_tx` 已随旧控制连接关闭，
+    /// 之后 accept 到的连接全部 "channel closed"——隧道静默死亡且不会
+    /// 自愈，只能手动重启 frpc。
+    visitor_tasks: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for ClientVisitorManager {
@@ -591,6 +600,48 @@ impl ClientVisitorManager {
     pub fn new() -> Self {
         Self {
             visitors: RwLock::new(std::collections::HashMap::new()),
+            visitor_tasks: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 注册（或替换）一个 visitor 任务的句柄。
+    ///
+    /// 同名重复注册时先 abort 旧任务：热重载改了 visitor 配置、或异常
+    /// 路径重复 spawn，都不允许两个任务同时监听同一个本地端口。
+    pub async fn register_visitor_task(&self, name: String, handle: tokio::task::JoinHandle<()>) {
+        let mut tasks = self.visitor_tasks.write().await;
+        if let Some(old) = tasks.insert(name, handle) {
+            old.abort();
+        }
+    }
+
+    /// abort 并摘除单个 visitor 任务（管理端 API 用）
+    pub async fn abort_visitor_task(&self, name: &str) {
+        let handle = self.visitor_tasks.write().await.remove(name);
+        if let Some(h) = handle {
+            h.abort();
+        }
+    }
+
+    /// abort 全部 visitor 任务并等待它们真正退出。
+    ///
+    /// 只 abort 不 await 是不够的：abort 是异步生效的，任务要到下一个
+    /// await 点才被 drop，listener socket 也随之释放。若立刻重连并 spawn
+    /// 新任务 bind 同一端口，仍可能撞上 AddrInUse。这里 await 兜底
+    /// （带超时：极端情况下任务卡住也不阻塞重连主循环，bind 重试会兜住）。
+    pub async fn abort_all_visitor_tasks(&self) {
+        let handles = {
+            let mut tasks = self.visitor_tasks.write().await;
+            tasks
+                .drain()
+                .map(|(_, h)| h)
+                .collect::<Vec<tokio::task::JoinHandle<()>>>()
+        };
+        for h in &handles {
+            h.abort();
+        }
+        for h in handles {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
         }
     }
 }
@@ -616,6 +667,9 @@ impl VisitorManager for ClientVisitorManager {
     }
 
     async fn clear(&self) {
+        // 先 abort 并等待旧 visitor 任务退出（释放本地监听端口），
+        // 再清配置表——顺序反了会让重连后的新任务 bind 失败
+        self.abort_all_visitor_tasks().await;
         let mut visitors = self.visitors.write().await;
         visitors.clear();
         log::info!("Visitor manager cleared");
@@ -2032,6 +2086,56 @@ struct StcpVisitorDeps {
     xtcp_registry: Arc<XtcpRegistry>,
 }
 
+/// 单次尝试绑定 visitor 本地监听端口。
+///
+/// 显式设置 `SO_REUSEADDR`：重连时上一轮会话的 accepted 连接关闭后会进入
+/// `TIME_WAIT`（本地地址正是监听端口），未设置 REUSEADDR 的 bind 在 Linux
+/// 上最长要等约 60s 才能成功（Windows 上 std 默认已开，行为对齐 frp 原版
+/// ——Go 的 net.Listen 默认也开）。注意 REUSEADDR 只允许复用 TIME_WAIT，
+/// 仍活动的监听端口一样会 AddrInUse，由调用方的重试循环处理。
+async fn try_bind_visitor_listener(bind_addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in tokio::net::lookup_host(bind_addr).await? {
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true)?;
+        match socket.bind(addr).and_then(|()| socket.listen(1024)) {
+            Ok(l) => return Ok(l),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("no address resolved for {}", bind_addr),
+        )
+    }))
+}
+
+/// 绑定 visitor 本地监听端口，失败按 1s 间隔无限重试。
+///
+/// 直接 return 是血的教训：曾经 bind 失败一次（旧 listener 未释放）任务
+/// 就退出，隧道再也不监听，只能手动重启 frpc。abort+await 已保证旧
+/// listener 关闭，这里的重试兜住 TIME_WAIT 与瞬时 EMFILE 等残余竞态。
+async fn bind_visitor_listener(bind_addr: &str) -> tokio::net::TcpListener {
+    loop {
+        match try_bind_visitor_listener(bind_addr).await {
+            Ok(l) => return l,
+            Err(e) => {
+                log::warn!(
+                    "Failed to bind visitor listener on {}: {:?}, retrying in 1s",
+                    bind_addr,
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 /// 启动 STCP/XTCP 访问者：监听本地端口，当有连接时创建到服务器的工作连接并桥接
 async fn start_stcp_visitor(deps: StcpVisitorDeps) {
     let StcpVisitorDeps {
@@ -2044,18 +2148,7 @@ async fn start_stcp_visitor(deps: StcpVisitorDeps) {
         server_work_conn_port,
         xtcp_registry,
     } = deps;
-    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            log::error!(
-                "Failed to bind STCP visitor {} on {}: {:?}",
-                proxy_name,
-                bind_addr,
-                e
-            );
-            return;
-        }
-    };
+    let listener = bind_visitor_listener(&bind_addr).await;
     log::info!("STCP visitor for {} listening on {}", proxy_name, bind_addr);
 
     loop {
@@ -2420,16 +2513,20 @@ async fn start_sudp_visitor(
     work_conn_tls: bool,
     server_work_conn_port: u16,
 ) {
-    let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
-        Ok(socket) => Arc::new(socket),
-        Err(e) => {
-            log::error!(
-                "Failed to bind sudp visitor {} on {}: {:?}",
-                proxy_name,
-                bind_addr,
-                e
-            );
-            return;
+    // UDP 无 TIME_WAIT 问题，但仍需重试：旧任务 abort 释放端口与本次
+    // bind 之间存在竞态窗口，一次失败就 return 会让 sudp 隧道静默消失
+    let socket = loop {
+        match tokio::net::UdpSocket::bind(&bind_addr).await {
+            Ok(socket) => break Arc::new(socket),
+            Err(e) => {
+                log::warn!(
+                    "Failed to bind sudp visitor {} on {}: {:?}, retrying in 1s",
+                    proxy_name,
+                    bind_addr,
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         }
     };
     log::info!("sudp visitor for {} listening on {}", proxy_name, bind_addr);
@@ -3307,7 +3404,7 @@ impl Client {
                                     let cfg = Arc::clone(&self.config);
                                     let rid = run_id.clone();
                                     let reg = xtcp_registry.clone();
-                                    tokio::spawn(async move {
+                                    let handle = tokio::spawn(async move {
                                         start_stcp_visitor(StcpVisitorDeps {
                                             bind_addr,
                                             proxy_name,
@@ -3320,6 +3417,11 @@ impl Client {
                                         })
                                         .await;
                                     });
+                                    // 登记句柄：断线重连 clear() 时 abort 旧任务，
+                                    // 否则旧 listener 占着端口，新任务 bind 必失败
+                                    self.visitor_manager
+                                        .register_visitor_task(visitor.name.clone(), handle)
+                                        .await;
                                 }
                                 // sudp visitor：监听本地 UDP，按源地址建独立隧道会话
                                 "sudp" => {
@@ -3330,9 +3432,12 @@ impl Client {
                                     let cfg = Arc::clone(&self.config);
                                     let rid = run_id.clone();
                                     let swcp = server_work_conn_port;
-                                    tokio::spawn(async move {
+                                    let handle = tokio::spawn(async move {
                                         start_sudp_visitor(bind_addr, proxy_name, stcp_tx, rid, cfg, work_conn_tls, swcp).await;
                                     });
+                                    self.visitor_manager
+                                        .register_visitor_task(visitor.name.clone(), handle)
+                                        .await;
                                 }
                                 _ => {}
                             }
@@ -3869,6 +3974,30 @@ mod client_manager_tests {
         }
     }
 
+    /// visitor 任务 drop 标记：任务被 abort（future 被 drop）时置位，
+    /// 用于从外部断言"任务真的停了"
+    struct TaskDropped(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for TaskDropped {
+        fn drop(&mut self) {
+            self.0
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 起一个永不自行结束的 visitor 任务（模拟 accept 循环），
+    /// 返回句柄与 drop 标记
+    fn spawn_never_ending_visitor_task()
+    -> (tokio::task::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>) {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = flag.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = TaskDropped(f);
+            let (_tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+            let _ = rx.recv().await; // 永不完成，只能被 abort
+        });
+        (handle, flag)
+    }
+
     // 注册为不支持的代理类型：只写入注册表、不启动本地监听，避免端口占用
     #[tokio::test]
     async fn test_proxy_manager_add_status_remove_clear() {
@@ -3918,6 +4047,108 @@ mod client_manager_tests {
 
         mgr.clear().await;
         assert!(mgr.visitors.read().await.is_empty());
+    }
+
+    /// 回归（2026-10-24 生产故障）：重连 clear() 必须 abort 已注册的
+    /// visitor 任务。只清配置表不 abort → 旧 listener 占着本地端口，
+    /// 新任务 bind 报 AddrInUse 直接退出；且旧 stcp_tx 随旧控制连接关闭，
+    /// 旧任务之后 accept 到的连接全部 "channel closed"，隧道静默死亡。
+    #[tokio::test]
+    async fn test_visitor_manager_clear_aborts_running_tasks() {
+        let mgr = ClientVisitorManager::new();
+        let (h1, flag1) = spawn_never_ending_visitor_task();
+        let (h2, flag2) = spawn_never_ending_visitor_task();
+        mgr.register_visitor_task("v1".to_string(), h1).await;
+        mgr.register_visitor_task("v2".to_string(), h2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !flag1.load(std::sync::atomic::Ordering::SeqCst)
+                && !flag2.load(std::sync::atomic::Ordering::SeqCst),
+            "任务应在运行中"
+        );
+
+        mgr.clear().await;
+        assert!(
+            flag1.load(std::sync::atomic::Ordering::SeqCst),
+            "clear() 必须 abort v1 任务"
+        );
+        assert!(
+            flag2.load(std::sync::atomic::Ordering::SeqCst),
+            "clear() 必须 abort v2 任务"
+        );
+        assert!(mgr.visitor_tasks.read().await.is_empty(), "句柄表应清空");
+
+        // clear 之后管理器仍可复用（重连路径会再次注册新任务）
+        let (h3, flag3) = spawn_never_ending_visitor_task();
+        mgr.register_visitor_task("v3".to_string(), h3).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!flag3.load(std::sync::atomic::Ordering::SeqCst));
+        mgr.abort_visitor_task("v3").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(flag3.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// 同名重复注册（热重载/异常重入）必须 abort 旧任务，
+    /// 否则两个 accept 循环抢同一个本地端口
+    #[tokio::test]
+    async fn test_visitor_manager_register_replaces_old_task() {
+        let mgr = ClientVisitorManager::new();
+        let (old, old_flag) = spawn_never_ending_visitor_task();
+        mgr.register_visitor_task("v1".to_string(), old).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!old_flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (new, new_flag) = spawn_never_ending_visitor_task();
+        mgr.register_visitor_task("v1".to_string(), new).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            old_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "同名重新注册应 abort 旧任务"
+        );
+        assert!(
+            !new_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "新任务应继续运行"
+        );
+    }
+
+    /// bind 重试回归：端口被占用时不得放弃（一次失败就 return 会让
+    /// visitor 隧道静默消失，只能手动重启 frpc）；端口释放后必须绑定成功
+    #[tokio::test]
+    async fn test_bind_visitor_listener_retries_until_port_free() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let fut = bind_visitor_listener(&addr);
+        tokio::pin!(fut);
+        // 端口被占：首次尝试立即失败，随后进入 1s 重试等待
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut fut)
+                .await
+                .is_err(),
+            "端口占用期间 bind 不应成功"
+        );
+
+        drop(blocker);
+        let listener = tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .expect("端口释放后应在重试周期内绑定成功");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    /// 空闲端口应立即绑定（重试路径不引入人为延迟）
+    #[tokio::test]
+    async fn test_bind_visitor_listener_free_port() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listener = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            bind_visitor_listener(&format!("127.0.0.1:{}", port)),
+        )
+        .await
+        .expect("空闲端口应立即绑定");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
     }
 
     #[test]
