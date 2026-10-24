@@ -2899,11 +2899,20 @@ impl Client {
             self.web_server = Some(web_server);
         }
 
-        // 设置信号处理
+        // 设置信号处理（Unix: SIGINT/SIGTERM/SIGHUP；Windows: Ctrl+C/Break/Close 控制台事件）
+        #[cfg(unix)]
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        #[cfg(unix)]
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        #[cfg(unix)]
         let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        #[cfg(windows)]
+        let mut sigint = tokio::signal::windows::ctrl_c()?;
+        #[cfg(windows)]
+        let mut sigterm = tokio::signal::windows::ctrl_break()?;
+        #[cfg(windows)]
+        let mut sighup = tokio::signal::windows::ctrl_close()?;
 
         // 配置文件变更触发热重载（与管理端 /reload、SIGHUP 共用通知通道）
         if let Some(watch_path) = self.config_path.clone() {
