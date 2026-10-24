@@ -1,3 +1,200 @@
+# Rust FRP 代码质量评审报告（第七轮复审 · 2026-10-24）
+
+- 评审对象：`/home/qianqianjie/rust_frp`（Rust workspace，8 个 crate）
+- 评审时间：2026-10-24（本地 master @ `1cd381a`，与 `origin/master` **完全一致**，工作区干净）
+- 工具链：rustc/cargo 1.94.0，clippy 0.1.94
+- 评审方式：静态分析（clippy/fmt）+ 全量测试 + 指标统计（剔除 `#[cfg(test)]` 段，**与第六轮同脚本同口径**）+ 安全走读 + 临时探针动态复现
+- **本轮范围**：第六轮（2026-10-04，100/100）之后新增的**双端口数据/控制分离 + STCP 死锁修复链 + SUDP 修复**三批代码；历史模块沿用第六轮结论，未逐行重审
+
+---
+
+## 〇-B、第七轮结论（2026-10-24）：97 / 100 → **P1 修复后复评 98.4 / 100**
+
+> 评审轮给 97；P1-1、P1-2 修复并补回归测试后复评 **98.4**（加权算式见《修复记录》）。
+> 剩余扣分全部来自 P2 未做项。
+
+**综合评分：97 / 100**（第六轮 100 → 97，**−3**）。
+
+> 先说清楚这不是"整体倒退"：核心静态指标（生产 `.unwrap()` / `panic!` / `TODO` / `unsafe` / clippy / fmt）
+> **全部保持满分**，测试从 215 涨到 **542** 且全绿。扣分全部来自**新增代码路径上的两个长稳缺陷**
+> （其中一个是我本轮 SUDP 修复自己引入的等待路径），属于"跑久了才咬人"的类型，不是当下的功能故障。
+
+### 扣分明细（对照第六轮满分账本）
+
+| 扣分 | 分值 | 依据 |
+|---|---|---|
+| P1-1 客户端 `StcpRespRegistry` 等待方消失后不反注册（**探针实锤**） | −1.5 | `rust_frp_client/src/lib.rs:938-947` / 超时分支 `2191-2202`、`2517` |
+| P1-2 服务端 `StcpBridgeManager` 桥表无容量上限 + 回收只在接入时触发 | −1.0 | `rust_frp_server/src/control.rs:1387-1397`、`1403-1434` |
+| P2 长函数继续增长 + 超时硬编码 + 无定时 purge + CI 未严格 | −0.5 | 见 P2 表 |
+
+### 第七轮维度评分
+
+| 维度 | 权重 | 第六轮 | 第七轮 | 依据 |
+|---|---|---|---|---|
+| 安全实现 | 25% | 98 | **98** | TLS 跳过验证为显式配置门控（`client/lib.rs:689-711` 默认拒绝、与客户端证书组合直接拒绝启动）；`login_throttle` 有 `MAX_ENTRIES=4096` 上限；凭据不入库；新增桥接路径在签名校验后才建条目 |
+| 架构与模块划分 | 15% | 98 | **96** | 双端口/桥管理抽象清晰，但两处**无界全局状态**（客户端 registry、服务端 bridges）缺少容量与生命周期设计 |
+| 错误处理 | 15% | 100 | **100** | 生产 `.unwrap()` **0**、`panic!` **0**；13 处 `expect` 全为常量/不变量型且带说明（新增 3 处桥接不变量 `control.rs:1444/1448/1452`） |
+| 测试有效性 | 15% | 97 | **97** | **542 测试全绿**（第六轮 215 → +327），新增 e2e 带负验证；扣分：**泄漏路径无测试守护**（本轮正是靠临时探针才暴露） |
+| 可维护性 | 15% | 98 | **95** | 新增 `#[allow]` 带理由注释（+1 处，合格）；扣分：`start` 233→254 行、`server::start` 235→245、control `run` 354 行；visitor 超时 10s 硬编码两处 |
+| 可运维性 | 10% | 96 | **93** | 僵尸桥 TTL 双保险（好）；扣分：桥表/registry 无容量告警、web 会话仅在登录时 purge、CI 未上 `-D warnings` |
+| 静态质量 | 5% | 100 | **100** | `cargo fmt --all --check` 零 diff；`clippy --workspace --all-targets` **0 warning**；`TODO/FIXME` 0；`unsafe` 0 |
+
+**加权算式**：98×0.25 + 96×0.15 + 100×0.15 + 97×0.15 + 95×0.15 + 93×0.10 + 100×0.05
+= 24.5 + 14.4 + 15.0 + 14.55 + 14.25 + 9.3 + 5.0 = **97.0**
+
+### 客观指标（生产代码，剔除 `#[cfg(test)]`，与 10-04 基线 `04c6a3b` 同脚本对比）
+
+| 指标 | 第六轮基线 | 本轮（1cd381a） | 变化 |
+|---|---|---|---|
+| 源文件 / 总行数 | 41 / 35,962 | 41 / 37,524 | +1,562 |
+| 生产行数 | 27,088 | **27,806** | +718 |
+| 生产 `.unwrap()` | 0 | **0** | 持平 ✅ |
+| 生产 `panic!` | 0 | **0** | 持平 ✅ |
+| 生产 `.expect()` | 13 | **13**（新增 3 处桥接不变量，均带注释） | 持平 ✅ |
+| `TODO/FIXME` | 0 | **0** | 持平 ✅ |
+| `unsafe` | 0 | **0** | 持平 ✅ |
+| `#[allow(...)]` | 5 | **6**（+1，`lib.rs:966` 带理由注释） | +1 |
+| `tokio::spawn` | 54 | 55 | +1 |
+| clippy 告警 | 0 | **0** | 持平 ✅ |
+| fmt diff | 0 | **0** | 持平 ✅ |
+| 测试数 | 215 | **542 passed / 0 failed / 1 ignored**（27 套件） | **+327** |
+
+### 做得好的地方（不要动）
+
+1. **生产 panic 面归零**：`.unwrap()` 0、`panic!` 0；13 处 `expect` 逐处带不变量说明，新增的桥接 3 处也遵守了同一纪律（`control.rs:1441-1452`）。
+2. **TLS 降级是显式门控**：`new_client_insecure()`（`rust_frp_net/src/lib.rs:762-778`）不是默认路径——需 `transport.tls.skip_verify = true`，且**与客户端证书组合时直接拒绝启动**（`client/lib.rs:689-694`），带 `log::warn!`。QUIC 侧同构（`client/lib.rs:850-862`）。
+3. **无界容器防护有正面样板**：`login_throttle.rs:72` 的 `MAX_ENTRIES = 4096` + `retain` 回收——这正是 P1-2 该照抄的做法。
+4. **僵尸桥双保险**：`cleanup_proxies` 主动清（主路径）+ `created_at`/`BRIDGE_ZOMBIE_TTL=120s` 兜底（`control.rs:1399-1421`），方向与注释都写得清楚。
+5. **文档与代码同步**：README 有独立《数据/控制分离（双端口架构）》章节（`README.md:709-739`），`frps/frpc.example.toml` 同步给出 `work_conn_port` / `work_conn_via`。
+6. **凭据不入库**：`git ls-files` 无 `.key/.pem/.env`，仅 `*.example.toml` 与 `Cargo.toml`。
+7. **CI 已成型**：`.github/workflows/ci.yml` 含 fmt / clippy / test / release / musl 静态链接构建 / cargo-audit（审计 `continue-on-error` 合理）。
+
+### 问题清单
+
+#### P0（安全 / 崩溃）
+
+**无。** 本轮未发现可导致崩溃或未授权访问的问题。
+
+#### P1（长稳缺陷，跑久了才咬人）
+
+| # | 问题 | 证据 | 影响 | 建议修复 |
+|---|---|---|---|---|
+| P1-1 | **客户端 `StcpRespRegistry` 等待方消失后不反注册 ⇒ 全局表无界增长** | `register` 只做 `entry().or_default().push(tx)`（`rust_frp_client/src/lib.rs:938-947`）；`remove` 只发生在 `resolve`（`950-960`）。而 STCP 等待的**三个失败分支**（超时 `2195-2201`、被拒 `2193`、发送失败 `2184`）与 SUDP 同构分支（`2517` 起）都**直接 return，不做反注册** | 每次 visitor 超时/失败都在全局 `OnceLock` map 里留一个 dead sender；同一 `proxy_name` 重试时 `Vec` 线性增长，且 `resolve` 要给全部历史 dead tx 发消息。客户端长跑 ⇒ 内存与每次唤醒耗时单调增长 | `register` 返回带唯一 id 的 guard（Drop 时精确反注册），或超时/失败分支显式 `cancel(proxy_name, id)`；补一条「注册后放弃 → 表为空」的回归测试 |
+| P1-2 | **服务端桥表无容量上限，且回收只在"接入"时触发** | `create_bridge` 无条件 `insert`，无上限（`rust_frp_server/src/control.rs:1387-1397`）；`reap_zombie_bridges` **只在 `add_conn_and_try_bridge` 内被调用**（`1434`），`create_bridge` / `contains` 路径不回收 | 只 create 不 add 的场景（visitor 发起后工作连接始终没来）条目常驻；持密钥客户端可反复触发 ⇒ 桥表无界。触发门槛是"签名校验通过之后"（`846`），故非匿名放大，定 P1 而非 P0 | ① `create_bridge` 内也做一次 reap；② 加容量上限（照抄 `MAX_ENTRIES=4096` 先例），超限时拒绝建桥并告警 |
+
+#### P2（技术债）
+
+| # | 问题 | 位置 | 说明 |
+|---|---|---|---|
+| P2-1 | 僵尸回收是**全表扫描 O(n)**，每次工作连接接入都扫一遍 | `control.rs:1403-1434` | 与 P1-2 叠加后，条目越多每次桥接越慢；建议改为按 `created_at` 的最小堆/定期巡检 |
+| P2-2 | 长函数继续变长 | `client::start` 233→**254**、`server::start` 235→**245**、`control::run` 353→**354** | 尚未失控（TOP1 仍是 config 的 `default` 507 行，属数据型可接受），但趋势向上，建议单独立项拆分 |
+| P2-3 | visitor 等待超时**硬编码 10s**（两处） | `client/lib.rs:2191`、`2517` | 建议提为配置项 `visitor_resp_timeout_secs` |
+| P2-4 | web 会话**仅在登录/校验时 purge**，无定时清理 | `rust_frp_server/src/web.rs:123-135`、`171-173` | TTL 8h，长期无人登录则过期条目常驻；加个低频巡检即可 |
+| P2-5 | CI 的 clippy **未加 `-D warnings`** | `.github/workflows/ci.yml:31` | 当前告警恰为 0，正是上严格的窗口期；上后再新增告警会立即拦住 |
+| P2-6 | 全局状态零散（`OnceLock`/`static` 5 处） | `client/lib.rs:742`（AtomicI64，有界 ✅）、`931`（registry ⚠️ 见 P1-1）、`4727`（测试锁） | 除 P1-1 外均有界；建议集中登记到一处便于审计 |
+
+### 三阶段改进路线
+
+| 阶段 | 内容 |
+|---|---|
+| **天级止血** | P1-1（registry guard 化 + 回归测试）、P1-2（`create_bridge` 内 reap + 容量上限） |
+| **周级补齐** | P2-3 超时可配、P2-4 会话定时 purge、P2-5 CI 上 `-D warnings` |
+| **季度结构性** | P2-1 回收改最小堆、P2-2 三个长函数拆分、P2-6 全局状态集中登记 |
+
+### 附录：复现命令
+
+```bash
+export HOME=/home/qianqianjie; export RUSTUP_HOME=$HOME/.rustup; export CARGO_HOME=$HOME/.cargo
+cd /home/qianqianjie/rust_frp
+
+cargo fmt --all --check                 # 零 diff
+cargo clippy --workspace --all-targets  # 0 warning
+cargo test --workspace --no-fail-fast   # 542 passed / 0 failed / 1 ignored（27 套件）
+
+# P1-1 泄漏实锤（本轮临时探针，跑完已删除；恢复方式见下）
+#   在 rust_frp_client/src/lib.rs 末尾追加一个 #[cfg(test)] mod，register 5 次后 drop(rx)，
+#   读 pending[key].len() ⇒ 实测 5（应为 0）。仓库已复原，git status 干净。
+git ls-files | grep -iE '\.key$|\.pem$|\.env$'   # 应无输出
+```
+
+### 评审纪律声明
+
+- **本轮为评审轮，未修改任何业务源码**（`git status` 干净，HEAD = origin/master = `1cd381a`）。
+- P1-1 的证据来自**临时探针**（追加到 `rust_frp_client/src/lib.rs` 末尾的 `#[cfg(test)] mod`），
+  取得结果后已用精确替换删除，并复核 `git diff --stat` 为空。
+- **没验到的部分**：① 双端口在真实网络下的长跑（7×24h）未做，僵尸桥 TTL 的 120s 取值仅为代码推断；
+  ② 1 个 `ignored` 用例的来源未追查（非 `#[ignore]` 标注，疑似 doc-test）；
+  ③ 历史模块（除新增路径外）沿用第六轮结论，本轮未逐行重审。
+
+---
+
+## 修复记录（2026-10-24，P1 两项已落地）
+
+分支：`fix/p1-longrun-leaks`（基于 `1cd381a`）。**只做 P1-1、P1-2**，结构性重构（P2）按规范单独立项，不在同一轮做。
+
+### 改动清单
+
+| 编号 | 问题 | 修复方式 | 位置 |
+|---|---|---|---|
+| P1-1 | 客户端 `StcpRespRegistry` 等待方消失后不反注册，dead sender 无界累积 | 引入 `StcpWaiter` **等待句柄**：`register` 返回句柄，`Drop` 时按 `(proxy_name, id)` 精确 `cancel`；等待逻辑收进 `wait_timeout`（用 `let-else` 而非 `expect`，不新增 panic 点）。把"必须记得清理"从调用方自觉变成类型系统保证 | `rust_frp_client/src/lib.rs`：`StcpPendingMap` 改带 id、`cancel()`、`StcpWaiter`/`Drop`；STCP 调用点 2183+、SUDP 调用点 2503+ |
+| P1-2 | 服务端桥表无容量上限，且回收只在"接入"时触发 | ① `create_bridge` 内也做一次僵尸回收（兜住"只 create 不 add"）；② 新增 `MAX_PENDING_BRIDGES = 4096` 容量上限，超限拒绝建桥并 `log::warn!`；③ 调用点在拒绝时回 `StcpVisitorResp{error}` 给 visitor（fail-closed，不让它空等） | `rust_frp_server/src/control.rs`：`MAX_PENDING_BRIDGES`、`create_bridge` 返回 `bool`、调用点 846+ |
+
+### 新增回归测试（5 个，已全部固化"修复前会失败"的判据）
+
+| 测试 | 判据 |
+|---|---|
+| `stcp_waiter_registry_tests::waiter_dropped_after_abandon_leaves_no_sender` | 注册 5 次后放弃 ⇒ 残留 sender 必须为 0（评审轮探针实锤为 5） |
+| `stcp_waiter_registry_tests::waiter_clears_entry_after_timeout` | 超时路径必须自动反注册 |
+| `stcp_waiter_registry_tests::resolve_wakes_waiter_and_clears_entry` | 正常路径不被改坏（守护兜底） |
+| `stcp_bridge_tests::create_bridge_reaps_zombie_entries` | 建桥路径也要回收超 TTL 条目 |
+| `stcp_bridge_tests::create_bridge_is_rejected_at_capacity` | 达上限拒绝建桥；已存在 id 仍可覆盖（不误伤 owner 重连） |
+
+**负验证（三项，全部"回退即红"，非超时糊弄）**：
+
+| 回退动作 | 结果 |
+|---|---|
+| 去掉 `Drop` 里的 `cancel` | `1 passed; 2 failed` ✅ 红 |
+| 容量判断改 `if false` | `0 passed; 1 failed` ✅ 红 |
+| 去掉 `create_bridge` 里的 reap | `0 passed; 1 failed` ✅ 红 |
+
+### 复评：98.4 / 100（加权算式）
+
+| 维度 | 权重 | 修复前 | 修复后 | 依据 |
+|---|---|---|---|---|
+| 安全实现 | 25% | 98 | **98** | 本轮无安全面改动 |
+| 架构与模块划分 | 15% | 96 | **98** | 两处无界全局状态均已设界（句柄自动反注册 + 容量上限）；reap 全表扫描仍在（P2-1） |
+| 错误处理 | 15% | 100 | **100** | 生产 `.unwrap()` 0 / `panic!` 0 / `expect` 13（未新增） |
+| 测试有效性 | 15% | 97 | **100** | 542 → **547**；泄漏路径有回归测试守护且经负验证 |
+| 可维护性 | 15% | 95 | **97** | 清理责任类型化；长函数与硬编码 10s 仍在（P2-2/P2-3） |
+| 可运维性 | 10% | 93 | **96** | 桥表有上限与告警；web 会话 purge 与 CI 严格化未做（P2-4/P2-5） |
+| 静态质量 | 5% | 100 | **100** | fmt 零 diff；clippy **0 warning** |
+
+98×0.25 + 98×0.15 + 100×0.15 + 100×0.15 + 97×0.15 + 96×0.10 + 100×0.05
+= 24.5 + 14.7 + 15.0 + 15.0 + 14.55 + 9.6 + 5.0 = **98.35 ≈ 98.4**
+
+> 口径说明：以**加权算式**为准（可复核）。剩余 1.6 分全部对应 P2 未做项。
+
+### 本轮未做 + 原因
+
+| 项 | 未做原因 |
+|---|---|
+| P2-1 reap 改最小堆 | 改动面较大（数据结构替换），按规范不与安全/长稳修复同轮做 |
+| P2-2 长函数拆分 | 结构性重构，需单独立项与单独评审 |
+| P2-3 超时可配 | 需新增配置字段 + example 同步 + 解析回归测试，属配置面改动 |
+| P2-4 web 会话定时 purge | 需引入周期任务，影响面待评估 |
+| P2-5 CI 上 `-D warnings` | 一行改动，但会改变 CI 判据，留作独立 chore |
+
+### 评审纪律（修复轮）
+
+- 改了 **2 个源码文件**（`rust_frp_client/src/lib.rs`、`rust_frp_server/src/control.rs`），新增 **5 个用例**（542 → 547）。
+- 评审轮的临时探针已在评审结束时删除（当时 `git status` 干净），本轮改动不含探针残留。
+- 收尾三连：`cargo fmt --all` 零 diff / `clippy --workspace --all-targets` **0 warning** / `cargo test --workspace --no-fail-fast` **547 passed, 0 failed**。
+- 生产段复检：`.unwrap()` **0**、`panic!` **0**、`expect` **13**（未新增 panic 点）。
+
+---
+
+# 历史存档（第六轮及以前）
+
 # Rust FRP 代码质量评审报告（第六轮复审 · 最终）
 
 - 评审对象：`/home/qianqianjie/rust_frp`（Rust workspace，8 个 crate）
