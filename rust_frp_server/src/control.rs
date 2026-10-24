@@ -843,9 +843,25 @@ impl Control {
             );
             return Ok(());
         };
-        self.stcp_bridge_manager
+        if !self
+            .stcp_bridge_manager
             .create_bridge(proxy_name.clone())
-            .await;
+            .await
+        {
+            log::error!(
+                "STCP bridge table is full; rejecting visitor request for proxy {}",
+                proxy_name
+            );
+            let resp = StcpVisitorRespMsg {
+                proxy_name: proxy_name.clone(),
+                error: "server has too many pending STCP bridges".to_string(),
+                visitor_run_id,
+            };
+            if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                log::error!("Failed to send StcpVisitorResp: {:?}", e);
+            }
+            return Ok(());
+        }
 
         let msg_tx_proxy = self.control_manager.get_msg_tx(proxy_run_id).await;
 
@@ -1358,6 +1374,10 @@ impl ControlManager {
 /// 正常桥接在秒级完成；超过 2 分钟说明对端已不可能再来（会话已断）。
 const BRIDGE_ZOMBIE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// 待桥接条目的容量上限：与 `login_throttle` 的 `MAX_ENTRIES` 同一思路——
+/// 内存必须有上界。达到上限即拒绝新建并告警，而不是让表无限增长。
+const MAX_PENDING_BRIDGES: usize = 4096;
+
 /// STCP 桥接状态，用于等待两个客户端的工连接并桥接
 pub(crate) struct StcpBridgeState {
     conn1: Option<AnyConn>,
@@ -1384,8 +1404,22 @@ impl StcpBridgeManager {
         }
     }
 
-    pub async fn create_bridge(&self, bridge_id: String) {
+    /// 建桥；返回 false 表示已达容量上限（调用方应回错误给 visitor，不要继续等）。
+    ///
+    /// 建桥前先做一次僵尸回收：只 create 不 add 的场景（visitor 发起后工作连接
+    /// 始终没来）没人触发 `add_conn_and_try_bridge`，条目会一直常驻。
+    pub async fn create_bridge(&self, bridge_id: String) -> bool {
         let mut bridges = self.bridges.write().await;
+        self.reap_zombie_bridges(&mut bridges).await;
+        // 已存在的 id 走覆盖语义（owner 重连重建），不受容量上限误伤
+        if !bridges.contains_key(&bridge_id) && bridges.len() >= MAX_PENDING_BRIDGES {
+            log::warn!(
+                "STCP pending bridges reached the {} entry cap; rejecting bridge for {}",
+                MAX_PENDING_BRIDGES,
+                bridge_id
+            );
+            return false;
+        }
         bridges.insert(
             bridge_id,
             StcpBridgeState {
@@ -1394,6 +1428,7 @@ impl StcpBridgeManager {
                 created_at: std::time::Instant::now(),
             },
         );
+        true
     }
 
     /// 僵尸桥兜底清理：任一条腿超过 BRIDGE_ZOMBIE_TTL 仍未凑齐即整条丢弃。
@@ -1750,5 +1785,48 @@ mod stcp_bridge_tests {
             Ok(v) => assert!(v.is_some(), "两条新腿凑齐应返回待桥接的一对"),
             Err(_) => panic!("第二条新腿应凑齐桥接"),
         }
+    }
+
+    #[tokio::test]
+    async fn create_bridge_reaps_zombie_entries() {
+        // 只 create 不 add 的场景（visitor 发起后工作连接始终没来）此前无人回收：
+        // reap 只在 add_conn_and_try_bridge 内触发 ⇒ 条目常驻。建桥路径必须也能回收。
+        let m = StcpBridgeManager::new();
+        m.create_bridge("zombie".to_string()).await;
+        {
+            let mut bridges = m.bridges.write().await;
+            if let Some(s) = bridges.get_mut("zombie") {
+                s.created_at = std::time::Instant::now()
+                    - BRIDGE_ZOMBIE_TTL
+                    - std::time::Duration::from_secs(1);
+            }
+        }
+        assert!(m.contains("zombie").await);
+        m.create_bridge("fresh".to_string()).await;
+        assert!(
+            !m.contains("zombie").await,
+            "create_bridge 也应回收超过 TTL 的僵尸条目"
+        );
+        assert!(m.contains("fresh").await, "新建的桥不应被误删");
+    }
+
+    #[tokio::test]
+    async fn create_bridge_is_rejected_at_capacity() {
+        // 内存必须有上界：达到 MAX_PENDING_BRIDGES 后拒绝建桥，而不是无限增长
+        let m = StcpBridgeManager::new();
+        for i in 0..MAX_PENDING_BRIDGES {
+            assert!(
+                m.create_bridge(format!("cap-{i}")).await,
+                "容量之内应全部建桥成功（第 {i} 条失败）"
+            );
+        }
+        assert!(
+            !m.create_bridge("one-too-many".to_string()).await,
+            "达到容量上限后必须拒绝建桥"
+        );
+        assert!(
+            m.create_bridge("cap-0".to_string()).await,
+            "已存在的桥 id 应允许覆盖重建，不受容量上限误伤"
+        );
     }
 }
