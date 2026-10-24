@@ -843,14 +843,9 @@ impl Control {
             }
         }
 
-        if let Some(tx) = &msg_tx_visitor {
-            let req = ReqWorkConnMsg {
-                proxy_name: proxy_name.clone(),
-            };
-            if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
-                log::error!("Failed to send ReqWorkConn to visitor: {:?}", e);
-            }
-        }
+        // 访问者侧不发送 ReqWorkConn：visitor 客户端在 handle_stcp_visitor_conn
+        // 中自行打开工作连接（官方 frp 同语义），向其请求工作连接只会导致
+        // 客户端按代理名查找本地代理配置而报错，属于无意义请求。
 
         let resp = StcpVisitorRespMsg {
             proxy_name: proxy_name.clone(),
@@ -1414,6 +1409,11 @@ impl StcpBridgeManager {
         } else {
             Err(conn)
         }
+    }
+
+    /// 判断该 proxy_name 是否存在待桥接（STCP）条目
+    pub async fn contains(&self, bridge_id: &str) -> bool {
+        self.bridges.read().await.contains_key(bridge_id)
     }
 
     pub async fn cleanup(&self, bridge_id: &str) {

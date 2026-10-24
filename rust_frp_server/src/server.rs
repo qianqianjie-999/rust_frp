@@ -904,6 +904,27 @@ impl Server {
                     conn
                 };
 
+                // STCP 桥接路径判定：桥存在即说明该工作连接属于 STCP 桥的一条腿。
+                // 修复死锁：两端客户端在 open_work_conn 后都阻塞等待 StartWorkConn
+                // 才开始搬运数据，而桥接完成路径此前从不回发该消息 —— 服务端桥已
+                // 就绪但双方永远挂起。故在交给桥接管理器之前，先回发 StartWorkConn。
+                let mut conn = if stcp_bridge_manager
+                    .contains(&work_msg.proxy_name)
+                    .await
+                {
+                    let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
+                        error: String::new(),
+                        src_addr: String::new(),
+                        src_port: 0,
+                        dst_addr: String::new(),
+                        dst_port: 0,
+                    });
+                    write_message_with_timeout(&mut conn, &resp).await?;
+                    conn
+                } else {
+                    conn
+                };
+
                 // 不再立即发送 StartWorkConn，连接放入池中等待访客取用
                 // 检查是否是 STCP 桥接工作连接（用 proxy_name 作为 bridge_id）
                 match stcp_bridge_manager
