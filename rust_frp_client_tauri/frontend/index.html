@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<title>rust_frp 客户端</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --border: #e3e6ea; --text: #1f2933;
+    --muted: #6b7280; --accent: #2563eb; --green: #22c55e; --amber: #f59e0b;
+    --gray: #9ca3af; --red: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 13px;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 16px 18px 28px; }
+  header {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+  }
+  header h1 { font-size: 17px; margin: 0; flex: 1; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--gray); box-shadow: 0 0 0 3px rgba(0,0,0,.04); }
+  .state-text { color: var(--muted); }
+  .btns button {
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; margin-left: 6px; font-size: 13px;
+  }
+  .btns button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btns button:disabled { opacity: .45; cursor: default; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+  section h2 { font-size: 14px; margin: 0 0 10px; }
+  .grid { display: grid; grid-template-columns: 140px 1fr; gap: 8px 12px; align-items: center; }
+  label { color: var(--muted); }
+  input[type=text], input[type=password], select {
+    width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: #fff; color: var(--text); font-size: 13px;
+  }
+  input[type=checkbox] { width: 16px; height: 16px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+  .row input { flex: 1; min-width: 80px; }
+  .vrow { border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px; background: #fafbfc; }
+  .vrow .row { margin-bottom: 4px; }
+  .add { border: 1px dashed var(--accent); color: var(--accent); background: #fff; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  .del { border: none; background: transparent; color: var(--red); cursor: pointer; font-size: 13px; }
+  .status-line { color: var(--muted); margin-top: 6px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .msg { margin-top: 8px; font-size: 12px; min-height: 16px; }
+  .msg.ok { color: var(--green); }
+  .msg.err { color: var(--red); }
+  details summary { cursor: pointer; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="dot" id="dot"></span>
+    <h1>rust_frp 客户端</h1>
+    <span class="state-text" id="stateText">就绪</span>
+    <span class="btns">
+      <button id="btnStop">停止</button>
+      <button id="btnStart" class="primary">启动</button>
+      <button id="btnSave">保存配置</button>
+    </span>
+  </header>
+
+  <section>
+    <h2>连接参数</h2>
+    <div class="grid">
+      <label>服务器地址</label><input type="text" id="server_addr" placeholder="123.57.86.80" />
+      <label>控制端口</label><input type="text" id="server_port" placeholder="9300" />
+      <label>工作端口(可空)</label><input type="text" id="work_conn_port" placeholder="留空=自动" />
+      <label>客户端 ID(可空)</label><input type="text" id="client_id" placeholder="win-visitor-01" />
+      <label>用户名(可空)</label><input type="text" id="user" />
+      <label>Token</label><input type="password" id="token" />
+      <label>启用 TLS(mTLS)</label><input type="checkbox" id="tls_enable" />
+      <label>CA 证书</label><input type="text" id="ca_file" placeholder="ca.crt" />
+      <label>客户端证书</label><input type="text" id="cert_file" placeholder="client.crt" />
+      <label>客户端私钥</label><input type="text" id="key_file" placeholder="client.key" />
+    </div>
+  </section>
+
+  <section>
+    <h2>访问者 (<span id="vCount">0</span>)</h2>
+    <div id="visitors"></div>
+    <button class="add" id="btnAdd">＋ 添加访问者</button>
+  </section>
+
+  <section>
+    <details>
+      <summary>高级选项</summary>
+      <div class="grid" style="margin-top:10px">
+        <label>管理端口</label><input type="text" id="web_port" placeholder="9310" />
+        <label>日志级别</label>
+        <select id="log_level">
+          <option>debug</option><option>info</option><option>warn</option><option>error</option>
+        </select>
+        <label>开机自启</label><input type="checkbox" id="autostart" />
+      </div>
+      <div class="hint">管理端口仅供本机状态轮询（固定监听 127.0.0.1）。</div>
+    </details>
+  </section>
+
+  <section>
+    <h2>状态</h2>
+    <div class="status-line" id="visitorsLine">已注册访问者：无</div>
+    <div class="status-line" id="msgLine"></div>
+  </section>
+
+  <div class="msg" id="msg"></div>
+</div>
+
+<script>
+  // 兼容 Tauri v2 全局注入（withGlobalTauri: true）
+  const invoke = window.__TAURI__ ? window.__TAURI__.invoke : null;
+
+  function showMsg(text, kind) {
+    const el = document.getElementById('msg');
+    el.textContent = text || '';
+    el.className = 'msg' + (kind ? ' ' + kind : '');
+  }
+
+  function setStatus(resp) {
+    const dot = document.getElementById('dot');
+    const t = document.getElementById('stateText');
+    t.textContent = resp.text;
+    let color = 'var(--gray)';
+    if (resp.state === 'Connected') color = 'var(--green)';
+    else if (resp.state === 'Starting' || resp.state === 'Reconnecting') color = 'var(--amber)';
+    else if (resp.state.startsWith('Error')) color = 'var(--red)';
+    dot.style.background = color;
+    const connected = resp.state === 'Connected' || resp.state === 'Starting' || resp.state === 'Reconnecting';
+    document.getElementById('btnStart').disabled = connected;
+    document.getElementById('btnStop').disabled = !connected;
+    const vs = resp.visitors || [];
+    document.getElementById('visitorsLine').textContent =
+      '已注册访问者：' + (vs.length ? vs.join(', ') : '无');
+    if (resp.message) document.getElementById('msgLine').textContent = resp.message;
+  }
+
+  async function pollStatus() {
+    if (!invoke) return;
+    try {
+      const r = await invoke('get_status');
+      setStatus(r);
+    } catch (e) { /* 忽略瞬时错误 */ }
+  }
+
+  async function loadAll() {
+    if (!invoke) { showMsg('未检测到 Tauri 运行环境', 'err'); return; }
+    try {
+      const cfg = await invoke('load_config');
+      document.getElementById('server_addr').value = cfg.server_addr || '';
+      document.getElementById('server_port').value = cfg.server_port || '';
+      document.getElementById('work_conn_port').value = cfg.work_conn_port || '';
+      document.getElementById('client_id').value = cfg.client_id || '';
+      document.getElementById('user').value = cfg.user || '';
+      document.getElementById('token').value = cfg.token || '';
+      document.getElementById('tls_enable').checked = !!cfg.tls_enable;
+      document.getElementById('ca_file').value = cfg.ca_file || '';
+      document.getElementById('cert_file').value = cfg.cert_file || '';
+      document.getElementById('key_file').value = cfg.key_file || '';
+      document.getElementById('web_port').value = cfg.web_port || '9310';
+      document.getElementById('log_level').value = cfg.log_level || 'info';
+      renderVisitors(cfg.visitors || []);
+      const aut = await invoke('get_autostart');
+      document.getElementById('autostart').checked = !!aut;
+    } catch (e) {
+      showMsg('加载配置失败：' + e, 'err');
+    }
+  }
+
+  function renderVisitors(list) {
+    const box = document.getElementById('visitors');
+    box.innerHTML = '';
+    document.getElementById('vCount').textContent = list.length;
+    list.forEach((v, i) => box.appendChild(vrow(v, i)));
+  }
+
+  function vrow(v, idx) {
+    const d = document.createElement('div');
+    d.className = 'vrow';
+    d.innerHTML =
+      '<div class="row">' +
+        '<input type="text" placeholder="名称" data-f="name" value="' + esc(v.name||'') + '">' +
+        '<select data-f="type">' +
+          ['stcp','sudp','xtcp'].map(t => '<option' + (t===v.type?' selected':'') + '>' + t + '</option>').join('') +
+        '</select>' +
+        '<input type="text" placeholder="代理名" data-f="server_name" value="' + esc(v.server_name||'') + '">' +
+        '<button class="del" data-del="1">✕</button>' +
+      '</div>' +
+      '<div class="row">' +
+        '<input type="text" placeholder="密钥" data-f="secret_key" value="' + esc(v.secret_key||'') + '">' +
+        '<input type="text" placeholder="127.0.0.1" data-f="bind_addr" value="' + esc(v.bind_addr||'') + '">' +
+        '<input type="text" placeholder="端口" data-f="bind_port" value="' + esc(v.bind_port||'') + '">' +
+        '<label><input type="checkbox" data-f="use_encryption"' + (v.use_encryption?' checked':'') + '>加密</label>' +
+        '<label><input type="checkbox" data-f="use_compression"' + (v.use_compression?' checked':'') + '>压缩</label>' +
+      '</div>';
+    d.querySelector('[data-del]').onclick = () => {
+      d.remove();
+      reindex();
+    };
+    return d;
+  }
+
+  function reindex() {
+    const rows = document.querySelectorAll('#visitors .vrow');
+    document.getElementById('vCount').textContent = rows.length;
+  }
+
+  function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+
+  function collectConfig() {
+    const g = id => document.getElementById(id).value;
+    const c = id => document.getElementById(id).checked;
+    const visitors = [];
+    document.querySelectorAll('#visitors .vrow').forEach(d => {
+      const f = n => d.querySelector('[data-f="' + n + '"]');
+      visitors.push({
+        name: f('name').value,
+        type: f('type').value,
+        server_name: f('server_name').value,
+        secret_key: f('secret_key').value,
+        bind_addr: f('bind_addr').value,
+        bind_port: f('bind_port').value,
+        use_encryption: f('use_encryption').checked,
+        use_compression: f('use_compression').checked,
+      });
+    });
+    return {
+      server_addr: g('server_addr'),
+      server_port: g('server_port'),
+      work_conn_port: g('work_conn_port'),
+      client_id: g('client_id'),
+      user: g('user'),
+      token: g('token'),
+      tls_enable: c('tls_enable'),
+      ca_file: g('ca_file'),
+      cert_file: g('cert_file'),
+      key_file: g('key_file'),
+      log_level: g('log_level'),
+      web_port: g('web_port'),
+      visitors: visitors,
+    };
+  }
+
+  document.getElementById('btnAdd').onclick = () => {
+    const box = document.getElementById('visitors');
+    box.appendChild(vrow({ name:'', type:'stcp', server_name:'', secret_key:'', bind_addr:'127.0.0.1', bind_port:'', use_encryption:false, use_compression:false }, 0));
+    reindex();
+  };
+  document.getElementById('btnStart').onclick = () => invoke('start').catch(e=>showMsg('启动失败：'+e,'err'));
+  document.getElementById('btnStop').onclick = () => invoke('stop').catch(e=>showMsg('停止失败：'+e,'err'));
+  document.getElementById('btnSave').onclick = async () => {
+    try {
+      await invoke('save_config', collectConfig());
+      showMsg('配置已保存', 'ok');
+    } catch (e) { showMsg('保存失败：' + e, 'err'); }
+  };
+  document.getElementById('autostart').onchange = (e) => {
+    invoke('set_autostart', { enable: e.target.checked })
+      .catch(err => showMsg('开机自启设置失败：' + err, 'err'));
+  };
+
+  loadAll();
+  pollStatus();
+  setInterval(pollStatus, 2000);
+</script>
+</body>
+</html>
