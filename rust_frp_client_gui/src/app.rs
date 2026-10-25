@@ -332,7 +332,10 @@ impl GuiApp {
     }
 
     fn show_window(&self, ctx: &egui::Context) {
+        // 顺序很重要：先取消隐藏，再把可能被最小化的窗口拉回（SW_RESTORE），
+        // 最后抢焦点。仅 Visible(true) 对「最小化」态是 no-op（iconic 窗口 visible 仍为 true）。
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
