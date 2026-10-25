@@ -109,7 +109,11 @@ async fn runtime_loop(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeCmd>,
     status_tx: Sender<StatusUpdate>,
 ) {
-    let mut client_task: Option<tokio::task::JoinHandle<()>> = None;
+    // 每个客户端会话跑在独立 tokio runtime 上：停止时整体 shutdown_timeout，
+    // 连内部 tokio::spawn 起的 axum 管理端口 / 文件监听 / 访问者监听一并取消，
+    // 端口与资源被释放，下次启动才能重新绑定（避免「停止后再启动」因 9310 被占而失败）。
+    let mut client_rt: Option<tokio::runtime::Runtime> = None;
+    let mut client_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // 状态轮询线程：常驻，按 CLIENT_RUNNING 解释「管理端口连不上」的含义。
     //
@@ -151,9 +155,14 @@ async fn runtime_loop(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             RuntimeCmd::Start => {
-                if client_task.is_some() {
-                    continue;
+                // 上一次运行若仍在跑则跳过；若已结束则清理后再启动
+                if let Some(h) = &client_handle {
+                    if !h.is_finished() {
+                        continue;
+                    }
                 }
+                client_handle = None;
+                client_rt = None;
                 CLIENT_RUNNING.store(true, Ordering::SeqCst);
                 let _ = status_tx.send(StatusUpdate {
                     state: ConnState::Starting,
@@ -163,7 +172,23 @@ async fn runtime_loop(
 
                 let path = config_path.clone();
                 let tx = status_tx.clone();
-                client_task = Some(tokio::spawn(async move {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        CLIENT_RUNNING.store(false, Ordering::SeqCst);
+                        let _ = tx.send(StatusUpdate {
+                            state: ConnState::Error(format!("客户端运行时创建失败: {e}")),
+                            visitors: Vec::new(),
+                            message: format!("客户端运行时创建失败: {e}"),
+                        });
+                        continue;
+                    }
+                };
+                client_handle = Some(rt.spawn(async move {
                     let path_str = path.to_string_lossy().to_string();
                     // 同步读小配置文件，可接受（异步块内的短阻塞）
                     let config = match ConfigLoader::load_client_config_strict(&path_str, true) {
@@ -215,11 +240,21 @@ async fn runtime_loop(
                         }
                     }
                 }));
+                client_rt = Some(rt);
             }
             RuntimeCmd::Stop => {
                 CLIENT_RUNNING.store(false, Ordering::SeqCst);
-                if let Some(handle) = client_task.take() {
-                    stop_client(web_port, handle).await;
+                // 整体拆除客户端运行时：取消所有子任务（axum 管理端口 / 文件监听 /
+                // 访问者监听），确保端口与资源被释放，下次启动才能重新绑定
+                if let Some(rt) = client_rt.take() {
+                    let _ = client_handle.take();
+                    // 先尝试优雅断开（让客户端向服务端发 Disconnect）
+                    let p = web_port;
+                    let _ = tokio::task::spawn_blocking(move || http_post(p, "/stop")).await;
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(500));
+                        rt.shutdown_timeout(Duration::from_secs(3));
+                    });
                 }
                 let _ = status_tx.send(StatusUpdate {
                     state: ConnState::Stopped,
@@ -229,8 +264,13 @@ async fn runtime_loop(
             }
             RuntimeCmd::Shutdown => {
                 CLIENT_RUNNING.store(false, Ordering::SeqCst);
-                if let Some(handle) = client_task.take() {
-                    stop_client(web_port, handle).await;
+                if let Some(rt) = client_rt.take() {
+                    let _ = client_handle.take();
+                    let _ = tokio::task::spawn_blocking(move || http_post(web_port, "/stop")).await;
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(500));
+                        rt.shutdown_timeout(Duration::from_secs(3));
+                    });
                 }
                 // 轮询是独立 OS 线程，无法 abort：置停止标志，由其自行退出
                 POLL_STOP.store(true, Ordering::SeqCst);
@@ -238,24 +278,6 @@ async fn runtime_loop(
             }
         }
     }
-}
-
-/// 停止客户端：先走管理端口优雅退出（排空存量连接），超时未退则强杀任务
-async fn stop_client(web_port: u16, handle: tokio::task::JoinHandle<()>) {
-    if web_port > 0 {
-        // 阻塞 HTTP 放 blocking 池执行，避免占住 async worker（同轮询器饿死原理）
-        let port = web_port;
-        let _ = tokio::task::spawn_blocking(move || http_post(port, "/stop")).await;
-    }
-    // 给优雅退出留时间（向服务端发 Disconnect + 排空连接）
-    for _ in 0..10 {
-        if handle.is_finished() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    handle.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
 }
 
 /// 轮询管理端口 `/status`，推断连接状态

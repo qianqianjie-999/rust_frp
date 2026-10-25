@@ -14,7 +14,7 @@ egui = "0.31"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 tray-icon = "0.19"
 # 注册表 API 直读写（开机自启），复用 winit 依赖树里的 windows-sys 0.52
-windows-sys = { version = "0.52", features = ["Win32_System_Registry"] }
+windows-sys = { version = "0.52", features = ["Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

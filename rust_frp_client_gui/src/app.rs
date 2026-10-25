@@ -6,18 +6,20 @@
 //! 配置保存采用「TOML 手术」：读入现有文档只改写 GUI 管理的键，
 //! **保留 proxies / healthChecks 等手工段**，不做结构体整体序列化
 //! （toml crate 无法序列化 None，且会丢未知字段）。
+//!
+//! 托盘（图标 / 菜单 / 显示窗口 / 退出）由独立线程 [`crate::tray`] 负责，
+//! 不受本 eframe 循环冻结影响——本文件只把连接状态转发过去更新图标。
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use eframe::egui;
-use tray_icon::menu::MenuEvent;
-use tray_icon::TrayIconEvent;
+use rust_frp_config::{ConfigLoader, VisitorConfig};
 
 use crate::autostart;
 use crate::client_runtime::{http_post, ConnState, RuntimeCmd, RuntimeHandle};
-use crate::icon;
-use rust_frp_config::{ConfigLoader, VisitorConfig};
+use crate::tray::GuiToTray;
 
 /// 默认管理端口（仅监听 127.0.0.1，供 GUI 状态轮询）
 const DEFAULT_WEB_PORT: u16 = 8610;
@@ -229,16 +231,6 @@ impl FormState {
     }
 }
 
-/// 托盘句柄（图标 + 菜单项 id）。托盘创建失败时 `tray` 为 None，其余功能降级可用。
-pub struct TrayHandles {
-    pub tray: Option<tray_icon::TrayIcon>,
-    pub show_id: tray_icon::menu::MenuId,
-    pub reload_id: tray_icon::menu::MenuId,
-    pub autostart_id: tray_icon::menu::MenuId,
-    pub autostart_item: tray_icon::menu::MenuItem,
-    pub quit_id: tray_icon::menu::MenuId,
-}
-
 /// GUI 应用状态
 pub struct GuiApp {
     form: FormState,
@@ -248,17 +240,18 @@ pub struct GuiApp {
     live_visitors: Vec<String>,
     /// 用户意图（点了启动即为 true，直到停止/退出/出错）
     running: bool,
-    tray: TrayHandles,
+    /// 向托盘线程转发状态（更新图标）
+    tray_tx: Sender<GuiToTray>,
     autostart_on: bool,
-    last_icon_state: Option<ConnState>,
-    allow_close: bool,
+    /// 已转发给托盘的上一状态（避免每帧重复发送）
+    last_tray_state: Option<ConnState>,
 }
 
 impl GuiApp {
     pub fn new(
         form: FormState,
         runtime: RuntimeHandle,
-        tray: TrayHandles,
+        tray_tx: Sender<GuiToTray>,
         autostart_on: bool,
     ) -> Self {
         Self {
@@ -268,10 +261,9 @@ impl GuiApp {
             message: "就绪".to_string(),
             live_visitors: Vec::new(),
             running: false,
-            tray,
+            tray_tx,
             autostart_on,
-            last_icon_state: None,
-            allow_close: false,
+            last_tray_state: None,
         }
     }
 
@@ -318,9 +310,7 @@ impl GuiApp {
         match autostart::set_enabled(on) {
             Ok(()) => {
                 self.autostart_on = on;
-                self.tray
-                    .autostart_item
-                    .set_text(if on { "✓ 开机自启" } else { "开机自启" });
+                let _ = self.tray_tx.send(GuiToTray::Autostart(on));
                 self.message = if on {
                     "开机自启已开启".to_string()
                 } else {
@@ -329,52 +319,6 @@ impl GuiApp {
             }
             Err(e) => self.message = format!("开机自启设置失败: {e}"),
         }
-    }
-
-    fn show_window(&self, ctx: &egui::Context) {
-        // 顺序很重要：先取消隐藏，再把可能被最小化的窗口拉回（SW_RESTORE），
-        // 最后抢焦点。仅 Visible(true) 对「最小化」态是 no-op（iconic 窗口 visible 仍为 true）。
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-    }
-
-    fn handle_tray_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
-            match event {
-                TrayIconEvent::Click { button, .. }
-                | TrayIconEvent::DoubleClick { button, .. } => {
-                    if matches!(button, tray_icon::MouseButton::Left) {
-                        self.show_window(ctx);
-                    }
-                }
-                _ => {}
-            }
-        }
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.tray.show_id {
-                self.show_window(ctx);
-            } else if event.id == self.tray.reload_id {
-                self.save();
-                self.message = "已发送重载信号".to_string();
-            } else if event.id == self.tray.autostart_id {
-                self.toggle_autostart(!self.autostart_on);
-            } else if event.id == self.tray.quit_id {
-                self.allow_close = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-    }
-
-    fn sync_tray(&mut self) {
-        if self.last_icon_state.as_ref() == Some(&self.state) {
-            return;
-        }
-        if let Some(tray) = self.tray.tray.as_ref() {
-            let _ = tray.set_icon(Some(icon::status_icon(&self.state)));
-            let _ = tray.set_tooltip(Some(format!("rust_frp - {}", self.state.text())));
-        }
-        self.last_icon_state = Some(self.state.clone());
     }
 
     fn ui_top(&mut self, ui: &mut egui::Ui) {
@@ -526,22 +470,26 @@ impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 1. 后台状态推送
         while let Ok(u) = self.runtime.status_rx.try_recv() {
-            log::info!("GUI 收到状态: {:?} - {}", u.state, u.message);
-            self.state = u.state;
+            self.state = u.state.clone();
             self.message = u.message;
             self.live_visitors = u.visitors;
-            if matches!(self.state, ConnState::Stopped | ConnState::Error(_)) {
-                self.running = false;
+            // 按真实连接状态同步「运行」标志（不论是谁发起的 启动/停止）
+            match &self.state {
+                ConnState::Stopped | ConnState::Error(_) => self.running = false,
+                _ => self.running = true,
+            }
+            // 仅状态变化时转发给托盘线程更新图标
+            if self.last_tray_state.as_ref() != Some(&self.state) {
+                self.last_tray_state = Some(self.state.clone());
+                let _ = self.tray_tx.send(GuiToTray::Status(self.state.clone()));
             }
         }
-        // 2. 托盘事件
-        self.handle_tray_events(ctx);
-        // 3. 关闭窗口 = 收起到托盘（托盘菜单里才真退出）
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+        // 2. 关闭窗口 = 收起到托盘（托盘菜单「退出」才真正结束进程）
+        if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
-        // 4. 三区布局
+        // 3. 三区布局
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.ui_top(ui));
         egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -551,9 +499,7 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.ui_form(ui));
         });
-        // 5. 托盘图标随状态更新
-        self.sync_tray();
-        // 6. 保活轮询（托盘事件/状态推送的节拍）
+        // 4. 保活轮询（状态推送的节拍）
         ctx.request_repaint_after(Duration::from_millis(500));
     }
 }

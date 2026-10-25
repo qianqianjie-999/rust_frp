@@ -19,15 +19,16 @@ mod autostart;
 mod client_runtime;
 mod font;
 mod icon;
+mod tray;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui;
-use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 
-use crate::app::{FormState, GuiApp, TrayHandles};
-use crate::client_runtime::{ConnState, RuntimeCmd};
+use crate::app::{FormState, GuiApp};
+use crate::client_runtime::RuntimeCmd;
+use crate::tray::spawn_tray;
 
 fn main() -> eframe::Result<()> {
     // 维护用 CLI 开关（部署脚本/排障用，正常双击启动不带参数）：
@@ -89,55 +90,13 @@ fn main() -> eframe::Result<()> {
     // 留一份发送端：run_native 返回（窗口关闭）后通知 runtime 收摊
     let shutdown_tx = runtime.cmd_tx.clone();
 
-    // ---- 托盘 ----
-    let menu = Menu::new();
-    let show_item = MenuItem::new("显示主窗口", true, None);
-    let reload_item = MenuItem::new("重载配置", true, None);
+    // ---- 托盘（独立 OS 线程，见 tray.rs）----
     let autostart_on = autostart::is_enabled();
     log::info!(
         "开机自启状态: {}",
         if autostart_on { "已启用" } else { "未启用" }
     );
-    let autostart_item = MenuItem::new(
-        if autostart_on {
-            "✓ 开机自启"
-        } else {
-            "开机自启"
-        },
-        true,
-        None,
-    );
-    let quit_item = MenuItem::new("退出", true, None);
-    let _ = menu.append(&show_item);
-    let _ = menu.append(&reload_item);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&autostart_item);
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&quit_item);
-
-    let attrs = tray_icon::TrayIconAttributes {
-        tooltip: Some("rust_frp 客户端".to_string()),
-        icon: Some(icon::status_icon(&ConnState::Starting)),
-        menu: Some(Box::new(menu)),
-        ..Default::default()
-    };
-    let tray = match tray_icon::TrayIcon::new(attrs) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            // 托盘失败不阻断主窗口（个别环境/远程桌面可能创建失败）
-            log::error!("托盘图标创建失败: {e}");
-            None
-        }
-    };
-
-    let tray_handles = TrayHandles {
-        tray,
-        show_id: show_item.id().clone(),
-        reload_id: reload_item.id().clone(),
-        autostart_id: autostart_item.id().clone(),
-        autostart_item,
-        quit_id: quit_item.id().clone(),
-    };
+    let tray = spawn_tray(runtime.cmd_tx.clone(), web_port, autostart_on);
 
     // ---- 主窗口 ----
     let options = eframe::NativeOptions {
@@ -148,7 +107,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    let mut gui_app = GuiApp::new(form, runtime, tray_handles, autostart_on);
+    let mut gui_app = GuiApp::new(form, runtime, tray.tx, autostart_on);
     // 已有配置则 GUI 启动即连接（托盘服务语义）；无配置时等用户填完手动启动
     if config_exists {
         gui_app.auto_start();
