@@ -10,7 +10,12 @@ name = "rust_frpc-gui"
 path = "src/main.rs"
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# custom-protocol 必须启用：tauri::is_dev() = !cfg!(feature = "custom-protocol")。
+# 没有它，即便 cargo build --release 编出的 exe 也会认为自己是 dev 模式，
+# 去连 build.devUrl（http://localhost:1420）而不是内嵌的 frontend 资源，
+# 窗口显示「localhost 拒绝连接」。官方 tauri build 会自动带这个 feature，
+# 我们用裸 cargo 编译，必须显式开。
+tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

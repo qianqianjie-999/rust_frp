@@ -11,44 +11,48 @@
     --gray: #9ca3af; --red: #ef4444;
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0; font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
-    background: var(--bg); color: var(--text); font-size: 13px;
+    background: var(--bg); color: var(--text); font-size: 12.5px;
+    overflow-y: auto;
   }
-  .wrap { max-width: 720px; margin: 0 auto; padding: 16px 18px 28px; }
-  header {
-    display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
-  }
-  header h1 { font-size: 17px; margin: 0; flex: 1; }
-  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--gray); box-shadow: 0 0 0 3px rgba(0,0,0,.04); }
-  .state-text { color: var(--muted); }
+  .wrap { max-width: 700px; margin: 0 auto; padding: 10px 14px 14px; }
+  header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  header h1 { font-size: 15px; margin: 0; flex: 1; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--gray); box-shadow: 0 0 0 3px rgba(0,0,0,.04); flex: none; }
+  .state-text { color: var(--muted); font-size: 12px; }
   .btns button {
     border: 1px solid var(--border); background: var(--panel); color: var(--text);
-    padding: 6px 12px; border-radius: 6px; cursor: pointer; margin-left: 6px; font-size: 13px;
+    padding: 4px 11px; border-radius: 6px; cursor: pointer; margin-left: 5px; font-size: 12.5px;
   }
   .btns button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .btns button:disabled { opacity: .45; cursor: default; }
-  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
-  section h2 { font-size: 14px; margin: 0 0 10px; }
-  .grid { display: grid; grid-template-columns: 140px 1fr; gap: 8px 12px; align-items: center; }
-  label { color: var(--muted); }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 11px; margin-bottom: 8px; }
+  section h2 { font-size: 13px; margin: 0 0 7px; }
+  .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 14px; }
+  .f { display: flex; flex-direction: column; gap: 2px; }
+  .f.wide { grid-column: 1 / -1; }
+  .f.inline { flex-direction: row; align-items: center; gap: 6px; }
+  .f label { color: var(--muted); font-size: 11.5px; }
   input[type=text], input[type=password], select {
-    width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
-    background: #fff; color: var(--text); font-size: 13px;
+    width: 100%; padding: 4px 7px; border: 1px solid var(--border); border-radius: 6px;
+    background: #fff; color: var(--text); font-size: 12.5px;
   }
-  input[type=checkbox] { width: 16px; height: 16px; }
-  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
-  .row input { flex: 1; min-width: 80px; }
-  .vrow { border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px; background: #fafbfc; }
-  .vrow .row { margin-bottom: 4px; }
-  .add { border: 1px dashed var(--accent); color: var(--accent); background: #fff; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  input[type=checkbox] { width: 15px; height: 15px; }
+  .row { display: flex; gap: 7px; align-items: center; margin-bottom: 4px; flex-wrap: wrap; }
+  .row input { flex: 1; min-width: 70px; }
+  .vrow { border: 1px solid var(--border); border-radius: 6px; padding: 6px; margin-bottom: 6px; background: #fafbfc; }
+  .vrow .row { margin-bottom: 3px; }
+  .add { border: 1px dashed var(--accent); color: var(--accent); background: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
   .del { border: none; background: transparent; color: var(--red); cursor: pointer; font-size: 13px; }
-  .status-line { color: var(--muted); margin-top: 6px; }
-  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
-  .msg { margin-top: 8px; font-size: 12px; min-height: 16px; }
+  .status-line { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .hint { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+  .msg { margin-top: 6px; font-size: 12px; min-height: 15px; }
   .msg.ok { color: var(--green); }
   .msg.err { color: var(--red); }
-  details summary { cursor: pointer; color: var(--muted); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  details[open] { margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -65,18 +69,25 @@
   </header>
 
   <section>
+    <h2>状态</h2>
+    <div class="status-line" id="visitorsLine">已注册访问者：无</div>
+    <div class="msg" id="msg"></div>
+    <div class="status-line" id="msgLine"></div>
+  </section>
+
+  <section>
     <h2>连接参数</h2>
-    <div class="grid">
-      <label>服务器地址</label><input type="text" id="server_addr" placeholder="123.57.86.80" />
-      <label>控制端口</label><input type="text" id="server_port" placeholder="9300" />
-      <label>工作端口(可空)</label><input type="text" id="work_conn_port" placeholder="留空=自动" />
-      <label>客户端 ID(可空)</label><input type="text" id="client_id" placeholder="win-visitor-01" />
-      <label>用户名(可空)</label><input type="text" id="user" />
-      <label>Token</label><input type="password" id="token" />
-      <label>启用 TLS(mTLS)</label><input type="checkbox" id="tls_enable" />
-      <label>CA 证书</label><input type="text" id="ca_file" placeholder="ca.crt" />
-      <label>客户端证书</label><input type="text" id="cert_file" placeholder="client.crt" />
-      <label>客户端私钥</label><input type="text" id="key_file" placeholder="client.key" />
+    <div class="fields">
+      <div class="f"><label>服务器地址</label><input type="text" id="server_addr" placeholder="123.57.86.80" /></div>
+      <div class="f"><label>控制端口</label><input type="text" id="server_port" placeholder="9300" /></div>
+      <div class="f"><label>工作端口(可空)</label><input type="text" id="work_conn_port" placeholder="留空=自动" /></div>
+      <div class="f"><label>客户端 ID(可空)</label><input type="text" id="client_id" placeholder="win-visitor-01" /></div>
+      <div class="f"><label>用户名(可空)</label><input type="text" id="user" /></div>
+      <div class="f"><label>Token</label><input type="password" id="token" /></div>
+      <div class="f wide inline"><label>启用 TLS(mTLS)</label><input type="checkbox" id="tls_enable" /></div>
+      <div class="f wide"><label>CA 证书</label><input type="text" id="ca_file" placeholder="ca.crt" /></div>
+      <div class="f wide"><label>客户端证书</label><input type="text" id="cert_file" placeholder="client.crt" /></div>
+      <div class="f wide"><label>客户端私钥</label><input type="text" id="key_file" placeholder="client.key" /></div>
     </div>
   </section>
 
@@ -89,30 +100,46 @@
   <section>
     <details>
       <summary>高级选项</summary>
-      <div class="grid" style="margin-top:10px">
-        <label>管理端口</label><input type="text" id="web_port" placeholder="9310" />
-        <label>日志级别</label>
-        <select id="log_level">
-          <option>debug</option><option>info</option><option>warn</option><option>error</option>
-        </select>
-        <label>开机自启</label><input type="checkbox" id="autostart" />
+      <div class="fields" style="margin-top:8px">
+        <div class="f"><label>管理端口</label><input type="text" id="web_port" placeholder="9310" /></div>
+        <div class="f"><label>日志级别</label>
+          <select id="log_level">
+            <option>debug</option><option>info</option><option>warn</option><option>error</option>
+          </select>
+        </div>
+        <div class="f inline"><label>开机自启</label><input type="checkbox" id="autostart" /></div>
       </div>
       <div class="hint">管理端口仅供本机状态轮询（固定监听 127.0.0.1）。</div>
     </details>
   </section>
-
-  <section>
-    <h2>状态</h2>
-    <div class="status-line" id="visitorsLine">已注册访问者：无</div>
-    <div class="status-line" id="msgLine"></div>
-  </section>
-
-  <div class="msg" id="msg"></div>
 </div>
 
 <script>
-  // 兼容 Tauri v2 全局注入（withGlobalTauri: true）
-  const invoke = window.__TAURI__ ? window.__TAURI__.invoke : null;
+  // 解析 Tauri 的 IPC 入口。
+  // v2 里 invoke 不在顶层：底层始终注入 window.__TAURI_INTERNALS__.invoke，
+  // 而 window.__TAURI__（withGlobalTauri 注入的友好 API）把 invoke 放在 core 下。
+  // 顶层 window.__TAURI__.invoke 是 v1 老写法，v2 取到的是 undefined。
+  function resolveInvoke() {
+    const w = window;
+    const internals = w.__TAURI_INTERNALS__;
+    if (internals && typeof internals.invoke === 'function') {
+      return (cmd, args, opts) => internals.invoke(cmd, args, opts);
+    }
+    const t = w.__TAURI__;
+    if (t) {
+      if (t.core && typeof t.core.invoke === 'function') {
+        return (cmd, args, opts) => t.core.invoke(cmd, args, opts);
+      }
+      if (typeof t.invoke === 'function') {
+        return (cmd, args, opts) => t.invoke(cmd, args, opts);
+      }
+    }
+    return null;
+  }
+  const invoke = resolveInvoke();
+  const ipcDiag =
+    'internals=' + typeof window.__TAURI_INTERNALS__ +
+    ', __TAURI__=' + typeof window.__TAURI__;
 
   function showMsg(text, kind) {
     const el = document.getElementById('msg');
@@ -147,7 +174,7 @@
   }
 
   async function loadAll() {
-    if (!invoke) { showMsg('未检测到 Tauri 运行环境', 'err'); return; }
+    if (!invoke) { showMsg('未检测到 Tauri 运行环境（' + ipcDiag + '）', 'err'); return; }
     try {
       const cfg = await invoke('load_config');
       document.getElementById('server_addr').value = cfg.server_addr || '';
@@ -249,16 +276,29 @@
     box.appendChild(vrow({ name:'', type:'stcp', server_name:'', secret_key:'', bind_addr:'127.0.0.1', bind_port:'', use_encryption:false, use_compression:false }, 0));
     reindex();
   };
-  document.getElementById('btnStart').onclick = () => invoke('start').catch(e=>showMsg('启动失败：'+e,'err'));
-  document.getElementById('btnStop').onclick = () => invoke('stop').catch(e=>showMsg('停止失败：'+e,'err'));
+  function needIpc() {
+    if (!invoke) { showMsg('未检测到 Tauri 运行环境（' + ipcDiag + '）', 'err'); return false; }
+    return true;
+  }
+  document.getElementById('btnStart').onclick = () => {
+    if (!needIpc()) return;
+    invoke('start').catch(e=>showMsg('启动失败：'+e,'err'));
+  };
+  document.getElementById('btnStop').onclick = () => {
+    if (!needIpc()) return;
+    invoke('stop').catch(e=>showMsg('停止失败：'+e,'err'));
+  };
   document.getElementById('btnSave').onclick = async () => {
+    if (!needIpc()) return;
     try {
-      await invoke('save_config', collectConfig());
+      // Rust 侧签名是 save_config(cfg: ClientConfigUi)，参数必须包在 cfg 键下
+      await invoke('save_config', { cfg: collectConfig() });
       showMsg('配置已保存', 'ok');
     } catch (e) { showMsg('保存失败：' + e, 'err'); }
   };
   document.getElementById('autostart').onchange = (e) => {
-    invoke('set_autostart', { enable: e.target.checked })
+    // Rust 侧签名是 set_autostart(payload: SetAutostartPayload)
+    invoke('set_autostart', { payload: { enable: e.target.checked } })
       .catch(err => showMsg('开机自启设置失败：' + err, 'err'));
   };
 

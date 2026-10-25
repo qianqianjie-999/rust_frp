@@ -13,10 +13,10 @@
       {
         "label": "main",
         "title": "rust_frp 客户端",
-        "width": 760,
-        "height": 680,
+        "width": 700,
+        "height": 600,
         "minWidth": 640,
-        "minHeight": 520,
+        "minHeight": 540,
         "resizable": true,
         "fullscreen": false
       }

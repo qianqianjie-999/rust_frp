@@ -10,6 +10,10 @@
 //! - 前端（网页控制台）通过 Tauri 命令读写配置、启停、拉状态。
 //! - 窗口关闭 → 取消关闭并隐藏到托盘；托盘「显示主窗口」/左键单击 → 显示并聚焦。
 
+// 本二进制是 GUI 程序：设为 Windows 子系统，避免启动时报一个黑控制台窗口。
+// 仅影响本 crate 的编译产物，不影响其它 CLI 工具（rust_frpc 等）。
+#![windows_subsystem = "windows"]
+
 mod autostart;
 mod client_runtime;
 mod config_ui;
