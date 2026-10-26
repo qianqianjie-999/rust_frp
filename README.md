@@ -901,13 +901,20 @@ remote_port = 9304
 
 > **访问鉴权说明**
 >
-> - 访问者请求时用本地 `secret_key` 对 `proxy_name + timestamp` 计算
+> - 每次访问生成唯一 `bridge_id`；访问者用本地 `secret_key` 对
+>   `proxy_name + bridge_id + run_id + timestamp` 计算
 >   HMAC-SHA256 签名，服务端用代理注册的 `secret_key` 重算并**常量时间比较**；
+> - owner/visitor 工作连接还需分别携带由 `secret_key + bridge_id + role + run_id`
+>   派生的角色签名，普通 frps token 不能替代 STCP `secret_key`；
 > - 时间戳偏差超过 **120 秒**的请求视为重放直接拒绝；
+> - 同一 proxy 可并发建立多座独立桥；`bridge_id` 在签名时间窗内不可复用；
 > - stcp/xtcp 代理未配置 `secret_key` 时，所有访问请求都会被拒绝（fail-closed）；
 > - 支持**跨客户端**访问：访客与代理可以分属不同的 frpc 实例。
 > - 若代理启用了 `use_encryption`，访问者配置也必须启用（两端密钥同源派生自各自 token，
 >   且要求两侧 token 一致）。
+>
+> **升级提示**：STCP/SUDP 及 XTCP 中继回退要求 frps/frpc 使用带 `bridge_id`
+> 与角色签名的新协议；旧客户端会被 fail-closed 拒绝，避免退回不安全的按名称配对。
 
 **代理端配置（持有内网服务的一方）**：
 
@@ -1315,6 +1322,12 @@ POST /reload ────┘
 ```
 
 **关键实现**：
+
+> **token 热重载语义**：frps reload 后，新登录会话立即使用新 token；已在线会话
+> 保留登录时的 `AuthManager` 快照。后续工作连接按 `run_id` 取该会话快照完成
+> HMAC 校验和 `use_encryption` 密钥派生，因此不会出现控制连接用旧 token、
+> 工作连接却误用新 token 的半更新状态。TCP、TLS、KCP、QUIC、tcp_mux 和
+> STCP/SUDP/XTCP 中继路径共用这一规则。
 
 ```rust
 // 服务端：在 TCP 连接循环中使用 tokio::select! 同时监听新连接和重载信号

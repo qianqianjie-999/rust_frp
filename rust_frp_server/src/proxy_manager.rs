@@ -242,8 +242,8 @@ pub struct ServerProxyManager {
     control_manager: Arc<ControlManager>,
     /// 工作连接管理器
     work_conn_manager: Arc<ServerWorkConnManager>,
-    /// 允许的端口列表（空列表 = 默认拒绝所有）
-    allow_ports: Vec<rust_frp_config::PortRange>,
+    /// 允许的端口列表（空列表 = 默认拒绝所有；RwLock 支持热重载更新）
+    allow_ports: RwLock<Vec<rust_frp_config::PortRange>>,
     /// 单用户最大端口配额（None = 不限制，对应 max_ports_per_user 配置）
     max_ports_per_user: Option<usize>,
     /// 自定义域名白名单（空 = 不限制归属，仅做语法校验）
@@ -254,6 +254,8 @@ pub struct ServerProxyManager {
     proxy_user_ports: RwLock<std::collections::HashMap<String, (String, usize)>>,
     /// accept 任务的 JoinHandle，用于 stop_proxy 时立即中止
     accept_handles: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// UDP accept/recv 任务，shutdown 时立即中止
+    udp_accept_handles: RwLock<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     /// TCP 负载均衡分组注册表（group 代理共享监听端口，round-robin 分发）
     group_registry: Arc<GroupRegistry>,
     /// tcpmux 路由表（域名 + 可选 HTTP 用户 → tcpmux 代理）
@@ -402,17 +404,24 @@ impl ServerProxyManager {
             proxy_owners,
             control_manager,
             work_conn_manager,
-            allow_ports,
+            allow_ports: RwLock::new(allow_ports),
             max_ports_per_user,
             custom_domains_allowlist,
             user_port_counts: RwLock::new(std::collections::HashMap::new()),
             proxy_user_ports: RwLock::new(std::collections::HashMap::new()),
             accept_handles: RwLock::new(std::collections::HashMap::new()),
+            udp_accept_handles: RwLock::new(std::collections::HashMap::new()),
             group_registry: Arc::new(GroupRegistry::new()),
             tcpmux_router: Arc::new(TcpMuxRouter::new()),
             tcpmux_port,
             plugin_manager,
         }
+    }
+
+    /// 热重载时更新端口白名单（配置重载不重建 ProxyManager，
+    /// 必须显式同步，否则新 `allow_ports` 永远不生效）
+    pub async fn set_allow_ports(&self, allow_ports: Vec<rust_frp_config::PortRange>) {
+        *self.allow_ports.write().await = allow_ports;
     }
 
     /// 服务端 HTTP 插件管理器（供 vhost / tcpmux 等用户连接入口回调）
@@ -504,7 +513,7 @@ impl ServerProxyManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(remote_port) = config.remote_port {
             // 检查端口是否在允许列表中（空列表 = 默认拒绝所有）
-            if !port_allowed(remote_port, &self.allow_ports) {
+            if !port_allowed(remote_port, &self.allow_ports.read().await) {
                 return Err(
                     format!("Port {} is not in the allowed ports list", remote_port).into(),
                 );
@@ -639,7 +648,7 @@ impl ServerProxyManager {
         config: &rust_frp_config::ProxyConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(remote_port) = config.remote_port {
-            if !port_allowed(remote_port, &self.allow_ports) {
+            if !port_allowed(remote_port, &self.allow_ports.read().await) {
                 return Err(
                     format!("Port {} is not in the allowed ports list", remote_port).into(),
                 );
@@ -662,7 +671,7 @@ impl ServerProxyManager {
                 },
             );
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
                 while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     match tokio::time::timeout(
@@ -699,6 +708,10 @@ impl ServerProxyManager {
                 }
                 log::info!("UDP proxy {} stopped", proxy_name);
             });
+            self.udp_accept_handles
+                .write()
+                .await
+                .insert(config.name.clone(), handle);
 
             log::info!("UDP proxy {} listening on {}", config.name, addr);
         } else {
@@ -713,7 +726,7 @@ impl ServerProxyManager {
         config: &rust_frp_config::ProxyConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(remote_port) = config.remote_port {
-            if !port_allowed(remote_port, &self.allow_ports) {
+            if !port_allowed(remote_port, &self.allow_ports.read().await) {
                 return Err(
                     format!("Port {} is not in the allowed ports list", remote_port).into(),
                 );
@@ -790,6 +803,10 @@ impl ServerProxyManager {
             plugin_manager,
         } = deps;
         log::debug!("开始处理外部连接: proxy={}", proxy_name_clone);
+
+        // 优雅关闭排空：访客会话存活期间保持全局连接计数
+        //（proxy 监听器 accept 循环不做全局计数，由本守卫覆盖桥接全周期）
+        let _drain_guard = global_metrics().connection_guard();
 
         // 负载均衡分组：round-robin 选取实际处理连接的成员
         let target_name = if let Some(port) = group_port {
@@ -939,6 +956,8 @@ impl ServerProxyManager {
         let _conn_guard = global_metrics()
             .get_proxy_stat(&proxy_name_clone)
             .map(ProxyConnGuard::acquire);
+        // 优雅关闭排空：访客会话存活期间保持全局连接计数
+        let _drain_guard = global_metrics().connection_guard();
 
         // 服务端插件回调：NewUserConn（可拒绝本次外部接入）
         if let Err(reason) = notify_new_user_conn(
@@ -1094,15 +1113,48 @@ impl ServerProxyManager {
         }
 
         // 停止 UDP 会话
-        let mut udp_sessions = self.udp_sessions.write().await;
-        if let Some(session) = udp_sessions.remove(name) {
+        if let Some(session) = self.udp_sessions.write().await.remove(name) {
             session
                 .running
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             log::info!("stopped UDP proxy: {}", name);
         }
+        if let Some(handle) = self.udp_accept_handles.write().await.remove(name) {
+            handle.abort();
+            let _ = handle.await;
+        }
         Ok(())
+    }
+
+    /// shutdown 入口阶段：中止所有代理监听任务，但保留已接受连接的任务继续排空。
+    pub async fn stop_all_ingress(&self) {
+        let accept_handles: Vec<_> = self.accept_handles.write().await.drain().collect();
+        for (name, handle) in accept_handles {
+            handle.abort();
+            let _ = handle.await;
+            log::info!("Stopped proxy ingress listener: {}", name);
+        }
+
+        {
+            let mut listeners = self.listeners.write().await;
+            for (_, running) in listeners.values() {
+                running.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            listeners.clear();
+        }
+
+        let udp_handles: Vec<_> = self.udp_accept_handles.write().await.drain().collect();
+        for (name, handle) in udp_handles {
+            handle.abort();
+            let _ = handle.await;
+            log::info!("Stopped UDP proxy ingress listener: {}", name);
+        }
+
+        for (_, session) in self.udp_sessions.write().await.drain() {
+            session
+                .running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// 释放代理占用的用户端口配额（幂等，未记录时为空操作）

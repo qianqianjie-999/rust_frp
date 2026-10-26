@@ -71,10 +71,21 @@ pub struct ServerWorkConnManager {
     pool_size: usize,
 }
 
+/// 池中的工作连接条目：明文连接 + 取出发完 StartWorkConn 后需应用的包装标志。
+/// 压缩/加密包装必须在 StartWorkConn（明文 JSON）**之后**进行——客户端在读完
+/// StartWorkConn 前不做任何包装，提前包装会让客户端把密文当 JSON 解析。
+pub(crate) struct PooledWorkConn {
+    pub(crate) conn: AnyConn,
+    pub(crate) use_compression: bool,
+    pub(crate) use_encryption: bool,
+    /// 建立该工作连接时会话对应的 token 派生密钥。
+    pub(crate) encryption_key: Option<Vec<u8>>,
+}
+
 /// 单个代理的工作连接池
 pub(crate) struct WorkConnPool {
-    tx: mpsc::Sender<AnyConn>,
-    rx: tokio::sync::Mutex<mpsc::Receiver<AnyConn>>,
+    tx: mpsc::Sender<PooledWorkConn>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<PooledWorkConn>>,
 }
 
 impl Default for ServerWorkConnManager {
@@ -93,7 +104,7 @@ impl ServerWorkConnManager {
 
     /// 为代理初始化工作连接池
     pub async fn init_pool(&self, proxy_name: &str) {
-        let (tx, rx) = mpsc::channel::<AnyConn>(self.pool_size);
+        let (tx, rx) = mpsc::channel::<PooledWorkConn>(self.pool_size);
         let pool = Arc::new(WorkConnPool {
             tx,
             rx: tokio::sync::Mutex::new(rx),
@@ -109,25 +120,38 @@ impl ServerWorkConnManager {
 
     /// 注册工作连接到池中（由 process_work_conn 调用）
     /// 如果池已满，连接将被丢弃并关闭（背压保护）
-    pub async fn register_work_conn(&self, proxy_name: &str, mut conn: AnyConn) {
+    pub async fn register_work_conn(
+        &self,
+        proxy_name: &str,
+        conn: AnyConn,
+        use_compression: bool,
+        use_encryption: bool,
+        encryption_key: Option<Vec<u8>>,
+    ) {
         global_metrics().incr_work_conn_total();
+        let mut entry = PooledWorkConn {
+            conn,
+            use_compression,
+            use_encryption,
+            encryption_key,
+        };
         let pools = self.pools.read().await;
         if let Some(pool) = pools.get(proxy_name) {
-            match pool.tx.try_send(conn) {
+            match pool.tx.try_send(entry) {
                 Ok(_) => log::debug!("Work conn registered in pool for {}", proxy_name),
-                Err(mpsc::error::TrySendError::Full(mut conn)) => {
+                Err(mpsc::error::TrySendError::Full(mut entry)) => {
                     log::warn!(
                         "Work conn pool full for {}, discarding and closing",
                         proxy_name
                     );
-                    let _ = conn.shutdown().await;
+                    let _ = entry.conn.shutdown().await;
                 }
-                Err(mpsc::error::TrySendError::Closed(mut conn)) => {
+                Err(mpsc::error::TrySendError::Closed(mut entry)) => {
                     log::debug!(
                         "Work conn pool closed for {}, closing connection",
                         proxy_name
                     );
-                    let _ = conn.shutdown().await;
+                    let _ = entry.conn.shutdown().await;
                 }
             }
         } else {
@@ -135,7 +159,7 @@ impl ServerWorkConnManager {
                 "No pool initialized for proxy: {}, discarding and closing work conn",
                 proxy_name
             );
-            let _ = conn.shutdown().await;
+            let _ = entry.conn.shutdown().await;
         }
     }
 
@@ -163,7 +187,7 @@ impl ServerWorkConnManager {
 
         for retry in 0..max_retries {
             // 1. 从池中获取连接（池空则请求+等待）
-            let mut conn = {
+            let mut entry = {
                 let mut rx = pool.rx.lock().await;
                 match rx.try_recv() {
                     Ok(c) => c,
@@ -177,6 +201,7 @@ impl ServerWorkConnManager {
                         );
                         let req = Message::ReqWorkConn(rust_frp_core::ReqWorkConnMsg {
                             proxy_name: proxy_name.to_string(),
+                            ..Default::default()
                         });
                         msg_tx
                             .send(req)
@@ -201,7 +226,8 @@ impl ServerWorkConnManager {
                 }
             };
 
-            // 2. 发送 StartWorkConn 唤醒客户端（携带访问者地址，用于 PROXY protocol）
+            // 2. 明文发送 StartWorkConn 唤醒客户端（携带访问者地址，用于 PROXY protocol）
+            //    客户端读完该消息后才开始包装压缩/加密，服务端也必须在此之后才包装
             let resp = Message::StartWorkConn(rust_frp_core::StartWorkConnMsg {
                 error: "".to_string(),
                 src_addr: visitor_addr.ip().to_string(),
@@ -209,11 +235,39 @@ impl ServerWorkConnManager {
                 dst_addr: "127.0.0.1".to_string(),
                 dst_port: 0,
             });
-            match rust_frp_core::write_message(&mut conn, &resp).await {
+            match rust_frp_core::write_message(&mut entry.conn, &resp).await {
                 Ok(_) => {
+                    // 3. 握手完成，按固定顺序包装 —— 先压缩（内层）、后加密（外层）
+                    let mut conn = entry.conn;
+                    if entry.use_compression {
+                        log::debug!(
+                            "Work conn compression (snappy) enabled for proxy: {}",
+                            proxy_name
+                        );
+                        conn = Box::new(rust_frp_net::compress::CompressedStream::new(conn));
+                    }
+                    if entry.use_encryption {
+                        match entry.encryption_key {
+                            Some(key) => {
+                                conn = Box::new(
+                                    rust_frp_net::crypto::EncryptedStream::new(conn, &key)
+                                        .map_err(|e| format!("wrap encryption: {}", e))?,
+                                );
+                            }
+                            None => {
+                                // fail-closed：客户端请求加密但服务端未配 token
+                                let _ = conn.shutdown().await;
+                                return Err(format!(
+                                    "proxy {} requests use_encryption but server has no token",
+                                    proxy_name
+                                ));
+                            }
+                        }
+                    }
                     // 成功后立即补充，保持池始终有可用连接（与 frp 原版一致）
                     let req = Message::ReqWorkConn(rust_frp_core::ReqWorkConnMsg {
                         proxy_name: proxy_name.to_string(),
+                        ..Default::default()
                     });
                     let _ = msg_tx.try_send(req);
                     return Ok(conn);
@@ -228,7 +282,7 @@ impl ServerWorkConnManager {
                         max_retries
                     );
                     // 连接已损坏，丢弃，继续重试
-                    drop(conn);
+                    drop(entry);
                 }
             }
         }

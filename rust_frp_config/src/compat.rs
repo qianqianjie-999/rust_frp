@@ -160,6 +160,8 @@ mod fields {
         "use_compression",
         "useCompression",
         "quic",
+        "wire_protocol",
+        "wireProtocol",
         "work_conn_via",
         "workConnVia",
     ];

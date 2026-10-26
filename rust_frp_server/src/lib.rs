@@ -241,6 +241,31 @@ mod web_auth_tests {
     }
 
     #[test]
+    fn test_verify_stcp_bridge_sign_binds_bridge_id() {
+        let secret = "shared_secret";
+        let ts = get_timestamp();
+        let sign =
+            rust_frp_auth::generate_stcp_visitor_sign_key(secret, "ssh", "bridge-a", "run", ts);
+        assert!(verify_stcp_visitor_sign_with_bridge(
+            secret, "ssh", "bridge-a", "run", ts, &sign
+        ));
+        assert!(!verify_stcp_visitor_sign_with_bridge(
+            secret, "ssh", "bridge-b", "run", ts, &sign
+        ));
+        assert!(!verify_stcp_visitor_sign_with_bridge(
+            secret, "ssh", "", "run", ts, &sign
+        ));
+        assert!(!verify_stcp_visitor_sign_with_bridge(
+            secret,
+            "ssh",
+            "bridge-a",
+            "other-run",
+            ts,
+            &sign
+        ));
+    }
+
+    #[test]
     fn test_verify_credentials() {
         let auth = auth(Some("boss"), Some("s3cret"));
         assert!(auth.verify_credentials("boss", "s3cret"));

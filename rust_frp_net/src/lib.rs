@@ -1088,6 +1088,61 @@ impl std::io::Write for KcpChannelOutput {
 /// KCP 连接，实现了 AsyncRead + AsyncWrite + FrpConn
 ///
 /// 内部通过后台任务维护 KCP 会话，将 UDP 数据包与 KCP 协议进行转换。
+/// KCP 连接的数据报来源：客户端独占 socket 直接收；服务端由监听器按源地址分流
+enum KcpRecv {
+    Socket(std::sync::Arc<tokio::net::UdpSocket>),
+    Chan(tokio::sync::mpsc::Receiver<Vec<u8>>),
+}
+
+impl KcpRecv {
+    /// 读取下一个属于本连接的数据报；`Some(0)` 表示收到但来源不符（忽略），
+    /// `None` 表示来源已关闭（连接任务应退出）
+    async fn next_datagram(&mut self, buf: &mut [u8], remote_addr: &SocketAddr) -> Option<usize> {
+        match self {
+            KcpRecv::Socket(s) => match s.recv_from(buf).await {
+                Ok((n, src)) if &src == remote_addr => Some(n),
+                Ok(_) => Some(0),
+                Err(_) => None,
+            },
+            KcpRecv::Chan(rx) => rx.recv().await.map(|d| {
+                let n = d.len().min(buf.len());
+                buf[..n].copy_from_slice(&d[..n]);
+                n
+            }),
+        }
+    }
+}
+
+type KcpRoutes = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, KcpRoute>>>;
+
+struct KcpRoute {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    id: u64,
+}
+
+struct KcpRouteGuard {
+    routes: KcpRoutes,
+    remote_addr: SocketAddr,
+    id: u64,
+}
+
+impl Drop for KcpRouteGuard {
+    fn drop(&mut self) {
+        let mut routes = self
+            .routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if routes
+            .get(&self.remote_addr)
+            .is_some_and(|route| route.id == self.id)
+        {
+            routes.remove(&self.remote_addr);
+        }
+    }
+}
+
+static NEXT_KCP_ROUTE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct KcpConn {
     rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -1101,7 +1156,7 @@ impl KcpConn {
     ///
     /// # 参数
     ///
-    /// * `socket` - UDP socket
+    /// * `socket` - UDP socket（客户端独占，直接 recv_from）
     /// * `remote_addr` - 远程地址
     /// * `conv` - KCP 会话 ID（可选，默认为随机值）
     pub async fn new(
@@ -1110,20 +1165,32 @@ impl KcpConn {
         conv: Option<u32>,
     ) -> Result<Self, NetError> {
         let conv = conv.unwrap_or_else(rand::random::<u32>);
-        Self::create_impl(socket, remote_addr, conv, None).await
+        Self::create_impl(
+            socket.clone(),
+            KcpRecv::Socket(socket),
+            remote_addr,
+            conv,
+            None,
+            None,
+        )
+        .await
     }
 
-    /// 接受 KCP 连接（服务端）
+    /// 接受 KCP 连接（服务端，经 KcpListener 分流）
     ///
     /// # 参数
     ///
-    /// * `socket` - UDP socket
+    /// * `socket` - 共享 UDP socket（仅用于发送）
+    /// * `sock_rx` - 由监听器按源地址分流过来的数据报通道
     /// * `first_packet` - 收到的第一个数据包（用于提取 conv）
     /// * `remote_addr` - 远程地址
-    pub async fn accept(
+    /// * `routes` - 监听器路由表（连接关闭时自清）
+    pub(crate) async fn accept(
         socket: std::sync::Arc<tokio::net::UdpSocket>,
+        sock_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         first_packet: &[u8],
         remote_addr: SocketAddr,
+        route_guard: KcpRouteGuard,
     ) -> Result<Self, NetError> {
         let conv = if first_packet.len() >= 4 {
             u32::from_le_bytes([
@@ -1135,14 +1202,24 @@ impl KcpConn {
         } else {
             rand::random::<u32>()
         };
-        Self::create_impl(socket, remote_addr, conv, Some(first_packet.to_vec())).await
+        Self::create_impl(
+            socket,
+            KcpRecv::Chan(sock_rx),
+            remote_addr,
+            conv,
+            Some(first_packet.to_vec()),
+            Some(route_guard),
+        )
+        .await
     }
 
     async fn create_impl(
         socket: std::sync::Arc<tokio::net::UdpSocket>,
+        mut recv_src: KcpRecv,
         remote_addr: SocketAddr,
         conv: u32,
         initial_input: Option<Vec<u8>>,
+        route_guard: Option<KcpRouteGuard>,
     ) -> Result<Self, NetError> {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
         let (user_tx, mut user_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
@@ -1151,6 +1228,7 @@ impl KcpConn {
         let socket_clone = socket.clone();
 
         let handle = tokio::spawn(async move {
+            let _route_guard = route_guard;
             let kcp_output = KcpChannelOutput { tx: out_tx };
             let mut kcp = kcp::Kcp::new(conv, kcp_output);
 
@@ -1158,13 +1236,22 @@ impl KcpConn {
             kcp.set_wndsize(128, 128);
             let _ = kcp.set_mtu(1400);
 
-            if let Some(data) = initial_input {
-                let _ = kcp.input(&data);
-            }
-
             let mut buf = vec![0u8; 65535];
             let mut recv_buf = vec![0u8; 65535];
             let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(10));
+
+            // 首包（accept 路径）携带的载荷必须立即交付：KCP 无握手，
+            // 客户端首个数据报就是应用数据（如 Login），不入队交付将死锁——
+            // 服务端等更多数据报，客户端等响应。
+            if let Some(data) = initial_input {
+                let _ = kcp.input(&data);
+                while let Ok(n) = kcp.recv(&mut recv_buf) {
+                    if user_rx_tx.send(recv_buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = kcp.flush();
+            }
 
             loop {
                 tokio::select! {
@@ -1179,9 +1266,10 @@ impl KcpConn {
                         let _ = kcp.flush();
                     }
 
-                    recv_result = socket_clone.recv_from(&mut buf) => {
+                    recv_result = recv_src.next_datagram(&mut buf, &remote_addr) => {
                         match recv_result {
-                            Ok((n, src)) if src == remote_addr => {
+                            Some(0) => {} // 非本连接来源的数据报，忽略
+                            Some(n) => {
                                 let _ = kcp.input(&buf[..n]);
                                 while let Ok(n) = kcp.recv(&mut recv_buf) {
                                     if user_rx_tx.send(recv_buf[..n].to_vec()).await.is_err() {
@@ -1189,10 +1277,7 @@ impl KcpConn {
                                     }
                                 }
                             }
-                            Ok((_n, _src)) => {}
-                            Err(_e) => {
-                                break;
-                            }
+                            None => break, // socket 错误或分流通道关闭
                         }
                     }
 
@@ -1220,6 +1305,14 @@ impl KcpConn {
             read_buf: Vec::new(),
             _handle: handle,
         })
+    }
+}
+
+impl Drop for KcpConn {
+    fn drop(&mut self) {
+        // JoinHandle drop 只会分离任务；显式 abort 才能释放驱动循环、socket
+        // 与 route guard。
+        self._handle.abort();
     }
 }
 
@@ -1295,31 +1388,101 @@ impl FrpConn for KcpConn {
     }
 }
 
-/// KCP 监听器，用于服务端接受 KCP 连接
+/// KCP 监听器（服务端）
+///
+/// 单一读取任务独占共享 UDP socket，按源地址分流到各连接通道；
+/// 未知来源的数据报视为新连接首包，送入 `incoming` 队列等待 accept。
+/// 这样避免「监听器与各连接驱动在同一 socket 上竞态 recv_from」：
+/// 重传的首包会被正确路由到已建连接，而不会产生幻影连接。
 pub struct KcpListener {
     socket: std::sync::Arc<tokio::net::UdpSocket>,
+    routes: KcpRoutes,
+    incoming_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+    _reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl KcpListener {
     pub async fn bind(addr: SocketAddr) -> Result<Self, std::io::Error> {
-        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        let socket = std::sync::Arc::new(tokio::net::UdpSocket::bind(addr).await?);
+        let routes: KcpRoutes =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(256);
+
+        let socket_reader = socket.clone();
+        let routes_reader = routes.clone();
+        let reader_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, src)) = socket_reader.recv_from(&mut buf).await {
+                let data = buf[..n].to_vec();
+                let tx = {
+                    let map = routes_reader
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    map.get(&src).map(|route| route.tx.clone())
+                };
+                match tx {
+                    Some(tx) => {
+                        // 已建连接：分流失败（连接任务已退出）则忽略，路由自清
+                        let _ = tx.try_send(data);
+                    }
+                    None => {
+                        // 未知来源：新连接首包；队列满时丢弃（客户端会重传）
+                        let _ = incoming_tx.try_send((data, src));
+                    }
+                }
+            }
+        });
+
         Ok(Self {
-            socket: std::sync::Arc::new(socket),
+            socket,
+            routes,
+            incoming_rx: tokio::sync::Mutex::new(incoming_rx),
+            _reader_handle: reader_handle,
         })
     }
 
     pub async fn accept(&self) -> Result<(KcpConn, SocketAddr), NetError> {
-        let mut buf = vec![0u8; 65535];
-        let (n, src_addr) = self
-            .socket
-            .recv_from(&mut buf)
-            .await
-            .map_err(NetError::Io)?;
+        let (first_packet, src_addr) = {
+            let mut rx = self.incoming_rx.lock().await;
+            rx.recv()
+                .await
+                .ok_or_else(|| NetError::Other("KCP listener closed".into()))?
+        };
 
-        let first_packet = buf[..n].to_vec();
-        let conn = KcpConn::accept(self.socket.clone(), &first_packet, src_addr).await?;
+        let (sock_tx, sock_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let route_id = NEXT_KCP_ROUTE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                src_addr,
+                KcpRoute {
+                    tx: sock_tx,
+                    id: route_id,
+                },
+            );
+        let route_guard = KcpRouteGuard {
+            routes: self.routes.clone(),
+            remote_addr: src_addr,
+            id: route_id,
+        };
+
+        let conn = KcpConn::accept(
+            self.socket.clone(),
+            sock_rx,
+            &first_packet,
+            src_addr,
+            route_guard,
+        )
+        .await?;
 
         Ok((conn, src_addr))
+    }
+}
+
+impl Drop for KcpListener {
+    fn drop(&mut self) {
+        self._reader_handle.abort();
     }
 }
 pub use pool::{ConnPool, PoolConfig, PoolManager, PoolStats, PooledConn};
@@ -1328,6 +1491,144 @@ pub use pool::{ConnPool, PoolConfig, PoolManager, PoolStats, PooledConn};
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn kcp_conn_drop_removes_listener_route() {
+        let listener = KcpListener::bind("127.0.0.1:0".parse().expect("listen addr"))
+            .await
+            .expect("bind listener");
+        let server_addr = listener.socket.local_addr().expect("listener addr");
+        let client_socket = std::sync::Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind client socket"),
+        );
+        let mut client = KcpConn::new(client_socket, server_addr, None)
+            .await
+            .expect("create client KCP");
+        client
+            .write_all(b"first packet")
+            .await
+            .expect("send first KCP packet");
+
+        let (server_conn, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .expect("KCP accept timeout")
+                .expect("accept KCP");
+        assert_eq!(
+            listener
+                .routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "accepted connection should register a source route"
+        );
+
+        drop(server_conn);
+        drop(client);
+
+        for _ in 0..50 {
+            if listener
+                .routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("dropped KcpConn left its listener route and driver task alive");
+    }
+
+    #[test]
+    fn stale_kcp_route_guard_keeps_replacement_route() {
+        let remote: SocketAddr = "127.0.0.1:43210".parse().expect("remote addr");
+        let routes: KcpRoutes =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        routes
+            .lock()
+            .expect("route map")
+            .insert(remote, KcpRoute { tx: new_tx, id: 2 });
+
+        drop(KcpRouteGuard {
+            routes: routes.clone(),
+            remote_addr: remote,
+            id: 1,
+        });
+
+        let map = routes.lock().expect("route map");
+        assert_eq!(
+            map.get(&remote).map(|route| route.id),
+            Some(2),
+            "stale cleanup must not remove a newer same-source route"
+        );
+        drop(old_tx);
+    }
+
+    #[tokio::test]
+    async fn kcp_same_source_can_reconnect_after_old_conn_drops() {
+        let listener = KcpListener::bind("127.0.0.1:0".parse().expect("listen addr"))
+            .await
+            .expect("bind listener");
+        let server_addr = listener.socket.local_addr().expect("listener addr");
+
+        let first_socket = std::sync::Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind first client"),
+        );
+        let first_addr = first_socket.local_addr().expect("first client addr");
+        let mut first_client = KcpConn::new(first_socket, server_addr, None)
+            .await
+            .expect("create first client");
+        first_client
+            .write_all(b"first")
+            .await
+            .expect("send first packet");
+        let (first_server, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .expect("first accept timeout")
+                .expect("accept first connection");
+
+        drop(first_server);
+        drop(first_client);
+        for _ in 0..50 {
+            if listener
+                .routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let second_socket = std::sync::Arc::new(
+            tokio::net::UdpSocket::bind(first_addr)
+                .await
+                .expect("rebind same client source"),
+        );
+        let mut second_client = KcpConn::new(second_socket, server_addr, None)
+            .await
+            .expect("create second client");
+        second_client
+            .write_all(b"second")
+            .await
+            .expect("send second packet");
+        let (_second_server, second_remote) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .expect("second accept timeout")
+                .expect("accept reconnect");
+        assert_eq!(second_remote, first_addr);
+    }
 
     /// 前缀回放：先吐前缀字节，再委托底层流
     #[tokio::test]

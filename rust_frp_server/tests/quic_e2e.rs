@@ -151,6 +151,7 @@ async fn quic_new_work_conn_is_dispatched_to_work_conn_path() {
         sign_key: String::new(),
         use_encryption: false,
         use_compression: false,
+        ..Default::default()
     });
     rust_frp_core::write_message(&mut conn, &msg)
         .await

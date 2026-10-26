@@ -344,8 +344,9 @@ impl StaticFilePlugin {
             request_path = &path[..idx];
         }
 
-        // 去除 strip_prefix
+        // 去除 strip_prefix（容忍带不带前导斜杠两种写法）
         if let Some(prefix) = &self.strip_prefix {
+            let prefix = prefix.trim_start_matches('/');
             if request_path.starts_with(&format!("/{}", prefix)) {
                 request_path = &request_path[prefix.len() + 1..];
             }
