@@ -3333,7 +3333,7 @@ impl Client {
 
         // 重连配置：首次断线立即重连（0ms），失败后 1s 起步指数退避，封顶 30s
         let mut reconnect_delay_ms: u64 = 0;
-        let max_reconnect_delay_ms: u64 = 30_000;
+        let max_reconnect_delay_ms: u64 = 15_000;
 
         // 热重载通知：管理端 POST /reload、SIGHUP、配置文件变更共用同一通道
         let reload_notify = Arc::clone(&self.reload_notify);
@@ -3510,7 +3510,8 @@ impl Client {
                 );
                 tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
 
-                // 下次延迟：首次(0)后从 1s 起步翻倍，封顶 30s
+                // 下次延迟：首次(0)后从 1s 起步翻倍，封顶 15s
+                // （上限下调自 30s：开机/断网恢复后更快自愈，缩短 STCP 不可用窗口）
                 // （修复原实现 0*2=0 导致退避永不生效的问题）
                 reconnect_delay_ms = if reconnect_delay_ms == 0 {
                     1_000

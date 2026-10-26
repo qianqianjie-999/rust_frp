@@ -127,7 +127,96 @@ fn set_autostart(payload: SetAutostartPayload) -> Result<(), String> {
     autostart::set_enabled(payload.enable)
 }
 
+/// 单实例保护：用本地固定端口做互斥锁，保证全系统只有一个 GUI 实例在跑。
+///
+/// 为什么需要：开机时「Run 键自启」+「桌面环境就绪」可能双拉两个
+/// `rust_frpc-gui.exe`，两个实例抢 9310（管理端口）与 9311（STCP visitor），
+/// 一个 bind 失败就静默死掉，表现正是「STCP 联不上、点启动没反应」。
+/// 第二个实例 bind 同一端口会得到 EADDRINUSE，直接退出，由先启动的那个继续服务。
+///
+/// 返回 Some(监听器) = 本实例可继续（调用方须持有它以保持端口占用）；
+/// 返回 None = 已有实例在运行，调用方应退出。
+fn ensure_single_instance() -> Option<std::net::TcpListener> {
+    match std::net::TcpListener::bind("127.0.0.1:49171") {
+        Ok(l) => Some(l),
+        Err(e) => {
+            log::info!(
+                "检测到已有 rust_frpc-gui 实例在运行（49171 被占: {e}），本实例退出"
+            );
+            None
+        }
+    }
+}
+
+/// TCP 连通性探测（用于开机等待网络就绪）
+fn tcp_reachable(addr: &str, port: u16) -> bool {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = (addr, port)
+        .to_socket_addrs()
+        .map(|i| i.collect())
+        .unwrap_or_default();
+    for sa in addrs {
+        if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// 启动即连接，但开机时网络（WiFi/DNS）可能尚未就绪：先轮询服务端可达，
+/// 成功或超时（30s）后再发 Start，避免首轮 login 在链路未起时失败而卡死。
+/// 配置缺失则退化为固定延迟 3s。
+fn spawn_auto_connect(
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<RuntimeCmd>,
+    cfg_path: PathBuf,
+) {
+    std::thread::spawn(move || {
+        let mut server: Option<(String, u16)> = None;
+        if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+            if let Ok(tbl) = text.parse::<toml::Table>() {
+                let addr = tbl.get("server_addr").and_then(|v| v.as_str());
+                let port = tbl
+                    .get("server_port")
+                    .and_then(|v| v.as_integer())
+                    .map(|p| p as u16);
+                if let (Some(a), Some(p)) = (addr, port) {
+                    server = Some((a.to_string(), p));
+                }
+            }
+        }
+        match server {
+            Some((addr, port)) => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut ready = false;
+                while std::time::Instant::now() < deadline {
+                    if tcp_reachable(&addr, port) {
+                        ready = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                if !ready {
+                    log::warn!("等待服务端 {addr}:{port} 可达超时(30s)，仍尝试启动客户端");
+                }
+            }
+            None => {
+                log::warn!("未读到 server_addr/port，退化延迟 3s 后启动");
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        }
+        log::info!("网络就绪（或已超时），发送 Start 命令");
+        let _ = cmd_tx.send(RuntimeCmd::Start);
+    });
+}
+
 fn main() {
+    // 单实例：第二个实例直接退出，避免双实例抢端口；
+    // 返回 Some 时持有监听器，进程存活期间一直占用 49171，阻止第二个实例启动。
+    let _instance_lock = match ensure_single_instance() {
+        Some(l) => l,
+        None => return,
+    };
+
     // 文件日志（与旧版一致：写到 exe 同级 frpc-gui.log，保留 7 天）
     let exe_dir = std::env::current_exe()
         .ok()
@@ -167,8 +256,9 @@ fn main() {
         message: "就绪".to_string(),
     }));
 
-    // 启动即连接（托盘服务语义：打开就连，无需用户再点启动）
-    let _ = cmd_tx.send(RuntimeCmd::Start);
+    // 启动即连接（托盘服务语义：打开就连，无需用户再点启动）。
+    // 但开机网络可能未就绪，改为先等服务端可达再发 Start，避免首轮 login 失败卡死。
+    spawn_auto_connect(cmd_tx.clone(), cfg_path.clone());
 
     let app_state = AppState {
         cmd_tx: cmd_tx.clone(),

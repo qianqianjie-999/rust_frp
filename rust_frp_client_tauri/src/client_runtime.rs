@@ -152,13 +152,24 @@ async fn runtime_loop(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             RuntimeCmd::Start => {
-                // 上一次运行若仍在跑则跳过；若已结束则清理后再启动
-                if let Some(h) = &client_handle {
-                    if !h.is_finished() {
-                        continue;
+                // 修复「点启动没反应」：旧实现遇到未结束的 handle 直接 continue 跳过，
+                // 客户端一旦卡在重连循环（handle 永不结束）就永远无法自救，只能关窗重开。
+                // 新逻辑：任何状态下都先整体拆除上一次遗留的运行时（释放 9310/9311 端口），
+                // 再拉起全新会话 —— 既支持「已停止/报错后重连」，也支持「卡死时强制重启」。
+                if client_handle.is_some() {
+                    if let Some(old_rt) = client_rt.take() {
+                        log::warn!("收到 Start：上一次客户端会话仍存在，先强制拆除旧运行时再重启");
+                        let p = web_port;
+                        let _ = tokio::task::spawn_blocking(move || http_post(p, "/stop")).await;
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(500));
+                            old_rt.shutdown_timeout(Duration::from_secs(3));
+                        });
+                        // 给旧 runtime 释放端口的时间，避免新会话 bind 冲突
+                        std::thread::sleep(Duration::from_millis(800));
                     }
+                    client_handle = None;
                 }
-                client_handle = None;
                 client_rt = None;
                 CLIENT_RUNNING.store(true, Ordering::SeqCst);
                 let _ = status_tx.send(StatusUpdate {
