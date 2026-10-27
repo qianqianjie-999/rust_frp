@@ -170,6 +170,22 @@ impl Drop for ProxyConnGuard {
     }
 }
 
+/// 全局活跃连接守卫：acquire 时 total/current +1，drop 时 current -1。
+///
+/// 优雅关闭的排空判定（[`MonitorMetrics::current_connections`]）依赖该计数
+/// 覆盖长寿命会话：控制连接在 accept 包装任务完成握手移交后，由本守卫在
+/// 会话任务内继续持有计数；数据面桥接（TCP/WS/tcpmux/STCP 访客桥接）同样
+/// 以本守卫标注存活期，避免 SIGTERM 排空时漏判存量连接。
+pub struct ConnectionGuard {
+    metrics: std::sync::Arc<MonitorMetrics>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics.decrement_connections();
+    }
+}
+
 /// 监控指标
 pub struct MonitorMetrics {
     total_connections: AtomicUsize,
@@ -222,6 +238,15 @@ impl MonitorMetrics {
     pub fn increment_connections(&self) {
         self.total_connections.fetch_add(1, Ordering::SeqCst);
         self.current_connections.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 获取活跃连接守卫：guard 存活期间 current_connections 保持 +1，
+    /// 覆盖任务内所有 return 路径（drop 自动减一）
+    pub fn connection_guard(self: &std::sync::Arc<Self>) -> ConnectionGuard {
+        self.increment_connections();
+        ConnectionGuard {
+            metrics: self.clone(),
+        }
     }
 
     /// 当前活跃连接数（优雅关闭的排空判定依据）

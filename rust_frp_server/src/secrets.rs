@@ -87,3 +87,22 @@ pub(crate) fn verify_stcp_visitor_sign(
     let expected = rust_frp_auth::generate_stcp_sign_key(secret_key, proxy_name, timestamp);
     constant_time_eq(provided_sign, &expected)
 }
+
+/// 校验 STCP/SUDP 访问签名：绑定 bridge_id 与访问者 run_id，避免跨会话复用。
+pub(crate) fn verify_stcp_visitor_sign_with_bridge(
+    secret_key: &str,
+    proxy_name: &str,
+    bridge_id: &str,
+    run_id: &str,
+    timestamp: i64,
+    provided_sign: &str,
+) -> bool {
+    let now = get_timestamp();
+    if bridge_id.is_empty() || (now - timestamp).abs() > STCP_SIGN_MAX_AGE_SECS {
+        return false;
+    }
+    let expected = rust_frp_auth::generate_stcp_visitor_sign_key(
+        secret_key, proxy_name, bridge_id, run_id, timestamp,
+    );
+    constant_time_eq(provided_sign, &expected)
+}

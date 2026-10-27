@@ -446,6 +446,9 @@ impl Control {
                                 cert_fingerprint: self.peer_cert_fingerprint.clone(),
                             })
                             .await;
+                        self.control_manager
+                            .set_auth_manager(&self.run_id, self.auth_manager.clone())
+                            .await;
 
                         // frpc 断线重连会用新 run_id、同 client_id 再次登录。
                         // 必须先踢掉旧连接并等它释放 proxy 端口，否则新连接注册同名
@@ -782,7 +785,24 @@ impl Control {
         );
 
         let proxy_name = stcp_msg.proxy_name.clone();
+        let bridge_id = stcp_msg.bridge_id.clone();
         let visitor_run_id = self.run_id.clone();
+        if stcp_msg.run_id != visitor_run_id {
+            log::warn!(
+                "Rejecting STCP visitor with mismatched run_id: message={}, session={}",
+                stcp_msg.run_id,
+                visitor_run_id
+            );
+            let resp = StcpVisitorRespMsg {
+                proxy_name,
+                bridge_id,
+                error: "visitor run_id mismatch".to_string(),
+                visitor_run_id,
+                work_conn_sign_key: String::new(),
+            };
+            let _ = self.write_msg(&Message::StcpVisitorResp(resp)).await;
+            return Ok(());
+        }
 
         // 查代理所有者与注册的共享密钥（先取值再 await，避免跨 await 持锁）
         let (proxy_run_id, registered_secret) = {
@@ -794,6 +814,7 @@ impl Control {
 
         // fail-closed：代理不存在、未登记 secret_key、签名不匹配均拒绝
         let rejection = match (&proxy_run_id, &registered_secret) {
+            _ if bridge_id.is_empty() => Some("bridge_id is required".to_string()),
             (None, _) => Some("proxy not found".to_string()),
             (Some(_), None) => {
                 log::error!(
@@ -804,9 +825,11 @@ impl Control {
                 Some("proxy secret_key not configured".to_string())
             }
             (Some(_), Some(secret)) => {
-                if verify_stcp_visitor_sign(
+                if verify_stcp_visitor_sign_with_bridge(
                     secret,
                     &proxy_name,
+                    &bridge_id,
+                    &visitor_run_id,
                     stcp_msg.timestamp,
                     &stcp_msg.sign_key,
                 ) {
@@ -825,8 +848,10 @@ impl Control {
         if let Some(error) = rejection {
             let resp = StcpVisitorRespMsg {
                 proxy_name: proxy_name.clone(),
+                bridge_id,
                 error,
                 visitor_run_id,
+                work_conn_sign_key: String::new(),
             };
             if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
                 log::error!("Failed to send StcpVisitorResp: {:?}", e);
@@ -843,19 +868,94 @@ impl Control {
             );
             return Ok(());
         };
-        self.stcp_bridge_manager
-            .create_bridge(proxy_name.clone())
-            .await;
-
-        let msg_tx_proxy = self.control_manager.get_msg_tx(proxy_run_id).await;
-
-        if let Some(tx) = &msg_tx_proxy {
-            let req = ReqWorkConnMsg {
+        let Some(secret) = registered_secret else {
+            return Ok(());
+        };
+        let owner_work_conn_sign_key = rust_frp_auth::generate_stcp_work_conn_sign_key(
+            &secret,
+            &bridge_id,
+            "owner",
+            proxy_run_id,
+        );
+        let visitor_work_conn_sign_key = rust_frp_auth::generate_stcp_work_conn_sign_key(
+            &secret,
+            &bridge_id,
+            "visitor",
+            &visitor_run_id,
+        );
+        if let Err(error) = self
+            .stcp_bridge_manager
+            .create_bridge(
+                proxy_name.clone(),
+                bridge_id.clone(),
+                proxy_run_id.clone(),
+                visitor_run_id.clone(),
+                owner_work_conn_sign_key.clone(),
+                visitor_work_conn_sign_key.clone(),
+            )
+            .await
+        {
+            log::error!("Rejecting STCP bridge for {}: {}", proxy_name, error);
+            let resp = StcpVisitorRespMsg {
                 proxy_name: proxy_name.clone(),
+                bridge_id,
+                error: error.to_string(),
+                visitor_run_id,
+                work_conn_sign_key: String::new(),
             };
-            if let Err(e) = tx.send(Message::ReqWorkConn(req)).await {
-                log::error!("Failed to send ReqWorkConn to proxy: {:?}", e);
+            if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                log::error!("Failed to send StcpVisitorResp: {:?}", e);
             }
+            return Ok(());
+        }
+
+        let owner_tx = self.control_manager.get_msg_tx(proxy_run_id).await;
+        let owner_req_result = match owner_tx {
+            Some(tx) => {
+                let req = ReqWorkConnMsg {
+                    proxy_name: proxy_name.clone(),
+                    bridge_id: bridge_id.clone(),
+                    work_conn_sign_key: owner_work_conn_sign_key,
+                };
+                tx.send(Message::ReqWorkConn(req)).await
+            }
+            None => {
+                log::error!(
+                    "STCP proxy {} lost its owner before ReqWorkConn",
+                    proxy_name
+                );
+                self.stcp_bridge_manager.cleanup_bridge(&bridge_id).await;
+                let resp = StcpVisitorRespMsg {
+                    proxy_name,
+                    bridge_id,
+                    error: "proxy owner disconnected".to_string(),
+                    visitor_run_id,
+                    work_conn_sign_key: String::new(),
+                };
+                if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                    log::error!("Failed to send StcpVisitorResp: {:?}", e);
+                }
+                return Ok(());
+            }
+        };
+        if let Err(e) = owner_req_result {
+            log::error!(
+                "Failed to send ReqWorkConn to proxy {}: {:?}",
+                proxy_name,
+                e
+            );
+            self.stcp_bridge_manager.cleanup_bridge(&bridge_id).await;
+            let resp = StcpVisitorRespMsg {
+                proxy_name,
+                bridge_id,
+                error: "proxy owner unavailable".to_string(),
+                visitor_run_id,
+                work_conn_sign_key: String::new(),
+            };
+            if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
+                log::error!("Failed to send StcpVisitorResp: {:?}", e);
+            }
+            return Ok(());
         }
 
         // 访问者侧不发送 ReqWorkConn：visitor 客户端在 handle_stcp_visitor_conn
@@ -864,11 +964,14 @@ impl Control {
 
         let resp = StcpVisitorRespMsg {
             proxy_name: proxy_name.clone(),
+            bridge_id: bridge_id.clone(),
             error: String::new(),
             visitor_run_id: visitor_run_id.clone(),
+            work_conn_sign_key: visitor_work_conn_sign_key,
         };
         if let Err(e) = self.write_msg(&Message::StcpVisitorResp(resp)).await {
             log::error!("Failed to send StcpVisitorResp: {:?}", e);
+            self.stcp_bridge_manager.cleanup_bridge(&bridge_id).await;
         }
         Ok(())
     }
@@ -1079,6 +1182,8 @@ type KickSignalMap =
 pub struct ControlManager {
     // 存储 run_id -> msg_tx 映射，用于向客户端发送消息
     msg_channels: RwLock<std::collections::HashMap<String, mpsc::Sender<Message>>>,
+    /// run_id -> 登录该会话时使用的认证快照；工作连接按会话校验。
+    auth_managers: RwLock<std::collections::HashMap<String, Arc<AuthManager>>>,
     // 存储客户端连接信息 (run_id -> ClientInfo)
     clients: RwLock<std::collections::HashMap<String, ClientInfo>>,
     // 已断开客户端的历史信息（FIFO，供管理端 offline 查询）
@@ -1117,6 +1222,7 @@ impl ControlManager {
     ) -> Self {
         Self {
             msg_channels: RwLock::new(std::collections::HashMap::new()),
+            auth_managers: RwLock::new(std::collections::HashMap::new()),
             clients: RwLock::new(std::collections::HashMap::new()),
             kick_signals: RwLock::new(std::collections::HashMap::new()),
             offline_clients: RwLock::new(Vec::new()),
@@ -1157,6 +1263,7 @@ impl ControlManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut msg_channels = self.msg_channels.write().await;
         msg_channels.remove(run_id);
+        self.auth_managers.write().await.remove(run_id);
 
         // 在线条目转存离线历史（保留 version/hostname/client_ip 供管理端查询）
         {
@@ -1263,6 +1370,7 @@ impl ControlManager {
 
             // 兜底：直接清掉旧连接的注册表项（正常情况下旧 Control 退出时也会自清理）
             self.msg_channels.write().await.remove(&old_run_id);
+            self.auth_managers.write().await.remove(&old_run_id);
             self.clients.write().await.remove(&old_run_id);
             kicked.push(old_run_id);
         }
@@ -1272,6 +1380,19 @@ impl ControlManager {
     pub async fn get_msg_tx(&self, run_id: &str) -> Option<mpsc::Sender<Message>> {
         let msg_channels = self.msg_channels.read().await;
         msg_channels.get(run_id).cloned()
+    }
+
+    /// 登录成功后绑定会话的认证快照。
+    pub async fn set_auth_manager(&self, run_id: &str, auth_manager: Arc<AuthManager>) {
+        self.auth_managers
+            .write()
+            .await
+            .insert(run_id.to_string(), auth_manager);
+    }
+
+    /// 按 run_id 获取其会话认证快照；工作连接不得使用全局最新 token 误验旧会话。
+    pub async fn get_auth_manager(&self, run_id: &str) -> Option<Arc<AuthManager>> {
+        self.auth_managers.read().await.get(run_id).cloned()
     }
 
     /// 添加或更新客户端信息
@@ -1358,17 +1479,36 @@ impl ControlManager {
 /// 正常桥接在秒级完成；超过 2 分钟说明对端已不可能再来（会话已断）。
 const BRIDGE_ZOMBIE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// STCP 桥接状态，用于等待两个客户端的工连接并桥接
+/// 待桥接条目的容量上限：与 `login_throttle` 的 `MAX_ENTRIES` 同一思路——
+/// 内存必须有上界。达到上限即拒绝新建并告警，而不是让表无限增长。
+const MAX_PENDING_BRIDGES: usize = 4096;
+const MAX_RECENT_BRIDGE_IDS: usize = MAX_PENDING_BRIDGES * 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StcpBridgeRole {
+    Owner,
+    Visitor,
+}
+
+/// STCP 桥接状态：每个 bridge_id 绑定唯一 owner/visitor，并按角色暂存工作连接。
 pub(crate) struct StcpBridgeState {
-    conn1: Option<AnyConn>,
-    conn2: Option<AnyConn>,
-    /// 建桥时间（create_bridge 时刻）：用于清理等不齐两条腿的僵尸条目
+    proxy_name: String,
+    owner_run_id: String,
+    visitor_run_id: String,
+    owner_work_conn_sign_key: String,
+    visitor_work_conn_sign_key: String,
+    owner_conn: Option<AnyConn>,
+    visitor_conn: Option<AnyConn>,
+    owner_reserved: bool,
+    visitor_reserved: bool,
     created_at: std::time::Instant,
 }
 
 /// STCP 桥接管理器，用于协调两个客户端的工作连接
 pub struct StcpBridgeManager {
     bridges: RwLock<std::collections::HashMap<String, StcpBridgeState>>,
+    /// 防止已经完成的 bridge_id 在签名时间窗内被重放。
+    recent_bridge_ids: RwLock<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl Default for StcpBridgeManager {
@@ -1381,19 +1521,62 @@ impl StcpBridgeManager {
     pub fn new() -> Self {
         Self {
             bridges: RwLock::new(std::collections::HashMap::new()),
+            recent_bridge_ids: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
-    pub async fn create_bridge(&self, bridge_id: String) {
+    /// 建立一座绑定 owner/visitor 与各自工作连接密钥的桥。
+    pub(crate) async fn create_bridge(
+        &self,
+        proxy_name: String,
+        bridge_id: String,
+        owner_run_id: String,
+        visitor_run_id: String,
+        owner_work_conn_sign_key: String,
+        visitor_work_conn_sign_key: String,
+    ) -> Result<(), &'static str> {
         let mut bridges = self.bridges.write().await;
+        self.reap_zombie_bridges(&mut bridges).await;
+        let now = std::time::Instant::now();
+        let mut recent = self.recent_bridge_ids.write().await;
+        recent.retain(|_, used_at| now.duration_since(*used_at) <= BRIDGE_ZOMBIE_TTL);
+        if bridges.contains_key(&bridge_id) || recent.contains_key(&bridge_id) {
+            return Err("bridge_id already used");
+        }
+        if bridges.len() >= MAX_PENDING_BRIDGES {
+            log::warn!(
+                "STCP pending bridges reached the {} entry cap; rejecting bridge for {}",
+                MAX_PENDING_BRIDGES,
+                bridge_id
+            );
+            return Err("server has too many pending STCP bridges");
+        }
+        if recent.len() >= MAX_RECENT_BRIDGE_IDS {
+            if let Some(oldest) = recent
+                .iter()
+                .min_by_key(|(_, used_at)| **used_at)
+                .map(|(id, _)| id.clone())
+            {
+                recent.remove(&oldest);
+            }
+        }
+        recent.insert(bridge_id.clone(), now);
         bridges.insert(
             bridge_id,
             StcpBridgeState {
-                conn1: None,
-                conn2: None,
-                created_at: std::time::Instant::now(),
+                proxy_name,
+                owner_run_id,
+                visitor_run_id,
+                owner_work_conn_sign_key,
+                visitor_work_conn_sign_key,
+                owner_conn: None,
+                visitor_conn: None,
+                owner_reserved: false,
+                visitor_reserved: false,
+                created_at: now,
             },
         );
+        Ok(())
     }
 
     /// 僵尸桥兜底清理：任一条腿超过 BRIDGE_ZOMBIE_TTL 仍未凑齐即整条丢弃。
@@ -1408,10 +1591,10 @@ impl StcpBridgeManager {
         bridges.retain(|id, state| {
             if now.duration_since(state.created_at) > BRIDGE_ZOMBIE_TTL {
                 log::warn!(
-                    "Reaping zombie STCP bridge: {} (legs: {}/{})",
+                    "Reaping zombie STCP bridge: {} (owner: {}, visitor: {})",
                     id,
-                    state.conn1.is_some() as u8,
-                    state.conn2.is_some() as u8
+                    state.owner_conn.is_some(),
+                    state.visitor_conn.is_some()
                 );
                 false
             } else {
@@ -1420,53 +1603,97 @@ impl StcpBridgeManager {
         });
     }
 
-    /// 添加连接并尝试桥接。
-    /// 返回 Some((c1, c2)) 表示桥接已就绪
-    /// 返回 None 表示连接已存储（等待另一半）
-    /// 返回 Err 表示没有此桥接（连接未消耗）
-    pub async fn add_conn_and_try_bridge(
+    /// 在发送 StartWorkConn 前原子预留一个角色槽，避免出现“已回握手但未入桥”的窗口。
+    pub(crate) async fn reserve_leg(
         &self,
         bridge_id: &str,
-        conn: AnyConn,
-    ) -> Result<Option<(AnyConn, AnyConn)>, AnyConn> {
+        run_id: &str,
+        sign_key: &str,
+    ) -> Result<StcpBridgeRole, &'static str> {
         let mut bridges = self.bridges.write().await;
-        // 每次接入先做僵尸回收，保证陈旧条目不会吞掉新连接
         self.reap_zombie_bridges(&mut bridges).await;
-        if let Some(state) = bridges.get_mut(bridge_id) {
-            if state.conn1.is_none() {
-                state.conn1 = Some(conn);
-                Ok(None)
-            } else if state.conn2.is_none() {
-                state.conn2 = Some(conn);
-                // 不变量：bridge 存在于 map 且 conn1/conn2 均已就位（上方分支保证）
-                let mut state = bridges
-                    .remove(bridge_id)
-                    .expect("bridge state must exist (checked above)");
-                let c1 = state
-                    .conn1
-                    .take()
-                    .expect("conn1 must be set before bridging");
-                let c2 = state
-                    .conn2
-                    .take()
-                    .expect("conn2 must be set before bridging");
-                Ok(Some((c1, c2)))
-            } else {
-                Ok(None)
-            }
+        let Some(state) = bridges.get_mut(bridge_id) else {
+            return Err("STCP bridge not found");
+        };
+
+        let role = if run_id == state.owner_run_id
+            && rust_frp_util::constant_time_eq(
+                sign_key.as_bytes(),
+                state.owner_work_conn_sign_key.as_bytes(),
+            ) {
+            StcpBridgeRole::Owner
+        } else if run_id == state.visitor_run_id
+            && rust_frp_util::constant_time_eq(
+                sign_key.as_bytes(),
+                state.visitor_work_conn_sign_key.as_bytes(),
+            )
+        {
+            StcpBridgeRole::Visitor
         } else {
-            Err(conn)
+            return Err("STCP bridge leg authorization failed");
+        };
+
+        let (reserved, conn) = match role {
+            StcpBridgeRole::Owner => (&mut state.owner_reserved, &state.owner_conn),
+            StcpBridgeRole::Visitor => (&mut state.visitor_reserved, &state.visitor_conn),
+        };
+        if *reserved || conn.is_some() {
+            return Err("STCP bridge leg already claimed");
+        }
+        *reserved = true;
+        Ok(role)
+    }
+
+    /// StartWorkConn 写失败时释放预留，允许客户端重试。
+    pub(crate) async fn release_leg(&self, bridge_id: &str, role: StcpBridgeRole) {
+        let mut bridges = self.bridges.write().await;
+        if let Some(state) = bridges.get_mut(bridge_id) {
+            match role {
+                StcpBridgeRole::Owner => state.owner_reserved = false,
+                StcpBridgeRole::Visitor => state.visitor_reserved = false,
+            }
         }
     }
 
-    /// 判断该 proxy_name 是否存在待桥接（STCP）条目
-    pub async fn contains(&self, bridge_id: &str) -> bool {
-        self.bridges.read().await.contains_key(bridge_id)
+    /// 将已回完 StartWorkConn 的连接安装到对应角色；第二侧到位时返回整对连接。
+    pub(crate) async fn install_leg(
+        &self,
+        bridge_id: &str,
+        role: StcpBridgeRole,
+        conn: AnyConn,
+    ) -> Result<Option<(AnyConn, AnyConn)>, AnyConn> {
+        let mut bridges = self.bridges.write().await;
+        let Some(state) = bridges.get_mut(bridge_id) else {
+            return Err(conn);
+        };
+        let (reserved, slot) = match role {
+            StcpBridgeRole::Owner => (&mut state.owner_reserved, &mut state.owner_conn),
+            StcpBridgeRole::Visitor => (&mut state.visitor_reserved, &mut state.visitor_conn),
+        };
+        if !*reserved || slot.is_some() {
+            return Err(conn);
+        }
+        *reserved = false;
+        *slot = Some(conn);
+        if state.owner_conn.is_none() || state.visitor_conn.is_none() {
+            return Ok(None);
+        }
+        let pair = state.owner_conn.take().zip(state.visitor_conn.take());
+        if pair.is_some() {
+            bridges.remove(bridge_id);
+        }
+        Ok(pair)
     }
 
-    pub async fn cleanup(&self, bridge_id: &str) {
+    /// 清理指定 proxy 的所有待桥接条目。
+    pub(crate) async fn cleanup(&self, proxy_name: &str) {
         let mut bridges = self.bridges.write().await;
-        bridges.remove(bridge_id);
+        bridges.retain(|_, state| state.proxy_name != proxy_name);
+    }
+
+    /// 只清理指定 bridge_id，供 owner 投递失败或响应写失败时使用。
+    pub(crate) async fn cleanup_bridge(&self, bridge_id: &str) {
+        self.bridges.write().await.remove(bridge_id);
     }
 }
 
@@ -1689,66 +1916,225 @@ mod stcp_bridge_tests {
         Box::new(TestLeg(a))
     }
 
-    #[tokio::test]
-    async fn create_and_bridge_both_legs() {
-        let m = StcpBridgeManager::new();
-        m.create_bridge("p1".to_string()).await;
-        assert!(m.contains("p1").await);
-        // 第一条腿：存入，等待另一半
-        match m.add_conn_and_try_bridge("p1", fake_leg()).await {
-            Ok(v) => assert!(v.is_none(), "只到一条腿时应返回 None（已存入）"),
-            Err(_) => panic!("第一条腿应成功存入"),
+    async fn install_test_leg(
+        manager: &StcpBridgeManager,
+        bridge_id: &str,
+        role: StcpBridgeRole,
+    ) -> Option<(AnyConn, AnyConn)> {
+        match manager.install_leg(bridge_id, role, fake_leg()).await {
+            Ok(result) => result,
+            Err(_) => panic!("install leg should succeed"),
         }
-        // 第二条腿：凑齐，返回待桥接的一对，条目随之移除
-        match m.add_conn_and_try_bridge("p1", fake_leg()).await {
-            Ok(v) => assert!(v.is_some(), "两条腿凑齐应返回待桥接的一对"),
-            Err(_) => panic!("第二条腿应凑齐桥接"),
-        }
-        assert!(!m.contains("p1").await, "桥接完成后条目应移除");
+    }
+
+    async fn create_test_bridge(m: &StcpBridgeManager, proxy: &str, bridge: &str) {
+        m.create_bridge(
+            proxy.to_string(),
+            bridge.to_string(),
+            format!("{bridge}-owner"),
+            format!("{bridge}-visitor"),
+            format!("{bridge}-owner-key"),
+            format!("{bridge}-visitor-key"),
+        )
+        .await
+        .expect("create bridge");
     }
 
     #[tokio::test]
-    async fn add_conn_without_bridge_returns_conn_back() {
+    async fn role_authenticated_legs_bridge_together() {
         let m = StcpBridgeManager::new();
+        create_test_bridge(&m, "p1", "bridge-1").await;
         assert!(
-            m.add_conn_and_try_bridge("no-such", fake_leg())
+            m.reserve_leg("bridge-1", "bridge-1-owner", "wrong")
                 .await
                 .is_err(),
-            "桥不存在时应把连接交回调用方（Err）"
+            "错误角色签名必须被拒绝"
+        );
+        let owner_role = m
+            .reserve_leg("bridge-1", "bridge-1-owner", "bridge-1-owner-key")
+            .await
+            .expect("reserve owner");
+        assert_eq!(owner_role, StcpBridgeRole::Owner);
+        assert!(install_test_leg(&m, "bridge-1", owner_role).await.is_none());
+
+        let visitor_role = m
+            .reserve_leg("bridge-1", "bridge-1-visitor", "bridge-1-visitor-key")
+            .await
+            .expect("reserve visitor");
+        assert_eq!(visitor_role, StcpBridgeRole::Visitor);
+        assert!(
+            install_test_leg(&m, "bridge-1", visitor_role)
+                .await
+                .is_some(),
+            "两条授权腿凑齐后应返回桥接连接对"
+        );
+        assert!(m.bridges.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_bridge_rejects_leg_without_consuming_connection() {
+        let m = StcpBridgeManager::new();
+        assert!(
+            m.reserve_leg("no-such", "run", "key").await.is_err(),
+            "bridge 不存在时必须拒绝工作连接"
         );
     }
 
     #[tokio::test]
     async fn cleanup_removes_bridge_entry() {
-        // 模拟 owner 断线：cleanup_proxies 对每个代理调 cleanup
         let m = StcpBridgeManager::new();
-        m.create_bridge("ann-ssh-stcp".to_string()).await;
-        let _ = m.add_conn_and_try_bridge("ann-ssh-stcp", fake_leg()).await;
-        assert!(m.contains("ann-ssh-stcp").await);
-        m.cleanup("ann-ssh-stcp").await;
+        create_test_bridge(&m, "shared-proxy", "bridge-a").await;
+        create_test_bridge(&m, "shared-proxy", "bridge-b").await;
+        m.cleanup("shared-proxy").await;
+        assert!(m.bridges.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_bridge_id_is_rejected_instead_of_overwritten() {
+        let m = StcpBridgeManager::new();
+        create_test_bridge(&m, "p2", "bridge-2").await;
+        let first_len = m.bridges.read().await.len();
         assert!(
-            !m.contains("ann-ssh-stcp").await,
-            "cleanup 后桥条目必须消失（否则新 visitor 填入僵尸条目后永远挂起）"
+            m.create_bridge(
+                "p2".to_string(),
+                "bridge-2".to_string(),
+                "attacker-owner".to_string(),
+                "attacker-visitor".to_string(),
+                "attacker-owner-key".to_string(),
+                "attacker-visitor-key".to_string(),
+            )
+            .await
+            .is_err(),
+            "重复 bridge_id 必须拒绝，不能覆盖现有桥"
+        );
+        assert_eq!(m.bridges.read().await.len(), first_len);
+    }
+
+    #[tokio::test]
+    async fn completed_bridge_id_cannot_be_replayed() {
+        let m = StcpBridgeManager::new();
+        create_test_bridge(&m, "p2", "bridge-replay").await;
+        let owner = m
+            .reserve_leg(
+                "bridge-replay",
+                "bridge-replay-owner",
+                "bridge-replay-owner-key",
+            )
+            .await
+            .expect("owner");
+        let _ = install_test_leg(&m, "bridge-replay", owner).await;
+        let visitor = m
+            .reserve_leg(
+                "bridge-replay",
+                "bridge-replay-visitor",
+                "bridge-replay-visitor-key",
+            )
+            .await
+            .expect("visitor");
+        assert!(install_test_leg(&m, "bridge-replay", visitor)
+            .await
+            .is_some());
+        assert!(
+            m.create_bridge(
+                "p2".to_string(),
+                "bridge-replay".to_string(),
+                "owner".to_string(),
+                "visitor".to_string(),
+                "owner-key".to_string(),
+                "visitor-key".to_string(),
+            )
+            .await
+            .is_err(),
+            "completed bridge_id must remain rejected within replay window"
         );
     }
 
     #[tokio::test]
-    async fn create_bridge_overwrites_stale_entry() {
-        // owner 重连后重新注册 → create_bridge 覆盖残桥，语义必须是"全新空桥"：
-        // 旧腿被丢弃，两条新腿才能凑齐（一条腿时不得误报桥接就绪）
+    async fn two_concurrent_bridges_for_same_proxy_stay_isolated() {
         let m = StcpBridgeManager::new();
-        m.create_bridge("p2".to_string()).await;
-        let _ = m.add_conn_and_try_bridge("p2", fake_leg()).await;
-        m.create_bridge("p2".to_string()).await;
-        // 覆盖后第一条新腿：应存入并返回 None（旧腿已被丢弃，不能与新腿凑对）
-        match m.add_conn_and_try_bridge("p2", fake_leg()).await {
-            Ok(v) => assert!(v.is_none(), "覆盖后的新桥只到一条腿时应返回 None"),
-            Err(_) => panic!("覆盖后的新桥应接受第一条新腿"),
+        create_test_bridge(&m, "shared-proxy", "bridge-a").await;
+        create_test_bridge(&m, "shared-proxy", "bridge-b").await;
+
+        let owner_a = m
+            .reserve_leg("bridge-a", "bridge-a-owner", "bridge-a-owner-key")
+            .await
+            .expect("owner a");
+        let owner_b = m
+            .reserve_leg("bridge-b", "bridge-b-owner", "bridge-b-owner-key")
+            .await
+            .expect("owner b");
+        let _ = install_test_leg(&m, "bridge-a", owner_a).await;
+        let _ = install_test_leg(&m, "bridge-b", owner_b).await;
+
+        let visitor_a = m
+            .reserve_leg("bridge-a", "bridge-a-visitor", "bridge-a-visitor-key")
+            .await
+            .expect("visitor a");
+        assert!(install_test_leg(&m, "bridge-a", visitor_a).await.is_some());
+        assert!(
+            m.bridges.read().await.contains_key("bridge-b"),
+            "bridge A 完成不能删除 bridge B"
+        );
+        let visitor_b = m
+            .reserve_leg("bridge-b", "bridge-b-visitor", "bridge-b-visitor-key")
+            .await
+            .expect("visitor b");
+        assert!(install_test_leg(&m, "bridge-b", visitor_b).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_bridge_reaps_zombie_entries() {
+        let m = StcpBridgeManager::new();
+        create_test_bridge(&m, "proxy", "zombie").await;
+        {
+            let mut bridges = m.bridges.write().await;
+            if let Some(s) = bridges.get_mut("zombie") {
+                s.created_at = std::time::Instant::now()
+                    - BRIDGE_ZOMBIE_TTL
+                    - std::time::Duration::from_secs(1);
+            }
         }
-        // 第二条新腿：凑齐
-        match m.add_conn_and_try_bridge("p2", fake_leg()).await {
-            Ok(v) => assert!(v.is_some(), "两条新腿凑齐应返回待桥接的一对"),
-            Err(_) => panic!("第二条新腿应凑齐桥接"),
+        create_test_bridge(&m, "proxy", "fresh").await;
+        assert!(
+            !m.bridges.read().await.contains_key("zombie"),
+            "create_bridge 也应回收超过 TTL 的僵尸条目"
+        );
+        assert!(
+            m.bridges.read().await.contains_key("fresh"),
+            "新建的桥不应被误删"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bridge_is_rejected_at_capacity() {
+        let m = StcpBridgeManager::new();
+        for i in 0..MAX_PENDING_BRIDGES {
+            assert!(
+                m.create_bridge(
+                    "proxy".to_string(),
+                    format!("cap-{i}"),
+                    format!("owner-{i}"),
+                    format!("visitor-{i}"),
+                    format!("owner-key-{i}"),
+                    format!("visitor-key-{i}"),
+                )
+                .await
+                .is_ok(),
+                "容量之内应全部建桥成功（第 {i} 条失败）"
+            );
         }
+        assert!(
+            m.create_bridge(
+                "proxy".to_string(),
+                "one-too-many".to_string(),
+                "owner".to_string(),
+                "visitor".to_string(),
+                "owner-key".to_string(),
+                "visitor-key".to_string(),
+            )
+            .await
+            .is_err(),
+            "达到容量上限后必须拒绝建桥"
+        );
     }
 }

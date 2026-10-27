@@ -189,19 +189,44 @@ async fn start_server_with_work_port(token: &str, work_port: u16) -> (u16, u16) 
 }
 
 /// 直拨工作端口并完成 NewWorkConn/StartWorkConn 握手，返回就绪的工作连接
-async fn dial_and_handshake_work_conn(
+async fn dial_and_handshake_bridge_work_conn(
     work_port: u16,
     run_id: &str,
     proxy_name: &str,
     token: &str,
+    bridge_id: &str,
+    bridge_sign_key: &str,
 ) -> tokio::net::TcpStream {
+    match dial_and_handshake_bridge_work_conn_result(
+        work_port,
+        run_id,
+        proxy_name,
+        token,
+        bridge_id,
+        bridge_sign_key,
+    )
+    .await
+    {
+        Ok(conn) => conn,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+async fn dial_and_handshake_bridge_work_conn_result(
+    work_port: u16,
+    run_id: &str,
+    proxy_name: &str,
+    token: &str,
+    bridge_id: &str,
+    bridge_sign_key: &str,
+) -> Result<tokio::net::TcpStream, String> {
     let mut work_conn = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::net::TcpStream::connect(format!("127.0.0.1:{work_port}")),
     )
     .await
-    .expect("dial work port within timeout")
-    .expect("dial work port");
+    .map_err(|_| "dial work port timeout".to_string())?
+    .map_err(|e| format!("dial work port: {e}"))?;
     let auth_manager = AuthManager::new(&AuthConfig {
         method: "token".to_string(),
         token: Some(token.to_string()),
@@ -211,7 +236,7 @@ async fn dial_and_handshake_work_conn(
     let sign_key = auth_manager
         .generate_work_conn_sign_key(run_id)
         .await
-        .expect("sign key");
+        .map_err(|e| format!("sign key: {e}"))?;
     rust_frp_core::write_message(
         &mut work_conn,
         &Message::NewWorkConn(rust_frp_core::NewWorkConnMsg {
@@ -219,26 +244,30 @@ async fn dial_and_handshake_work_conn(
             proxy_name: proxy_name.to_string(),
             timestamp: rust_frp_util::get_timestamp(),
             sign_key,
+            bridge_id: bridge_id.to_string(),
+            bridge_sign_key: bridge_sign_key.to_string(),
             use_encryption: false,
             use_compression: false,
         }),
     )
     .await
-    .expect("send NewWorkConn");
+    .map_err(|e| format!("send NewWorkConn: {e}"))?;
     let start = tokio::time::timeout(
         Duration::from_secs(5),
         rust_frp_core::read_message(&mut work_conn),
     )
     .await
-    .expect("StartWorkConn within timeout")
-    .expect("read StartWorkConn");
+    .map_err(|_| "StartWorkConn timeout".to_string())?
+    .map_err(|e| format!("read StartWorkConn: {e}"))?;
     match start {
         Message::StartWorkConn(s) => {
-            assert!(s.error.is_empty(), "StartWorkConn error: {}", s.error);
+            if !s.error.is_empty() {
+                return Err(s.error);
+            }
         }
-        other => panic!("expected StartWorkConn, got {other:?}"),
+        other => return Err(format!("expected StartWorkConn, got {other:?}")),
     }
-    work_conn
+    Ok(work_conn)
 }
 
 /// STCP 桥接全链路：服务端**自定义工作端口**（≠ bind_port+1000）下，
@@ -317,12 +346,20 @@ async fn stcp_bridge_relays_over_custom_work_port() {
     let (mut ctrl_visitor, _) =
         connect_and_login_as(bind_port, token, "stcp-visitor-run", "dual-port-visitor").await;
     let ts = rust_frp_util::get_timestamp();
-    let sign_key = rust_frp_auth::generate_stcp_sign_key("stcp-bridge-secret", "stcpbridge", ts);
+    let bridge_id = rust_frp_util::rand_id(24);
+    let sign_key = rust_frp_auth::generate_stcp_visitor_sign_key(
+        "stcp-bridge-secret",
+        "stcpbridge",
+        &bridge_id,
+        "stcp-visitor-run",
+        ts,
+    );
     rust_frp_core::write_message(
         &mut ctrl_visitor,
         &Message::StcpVisitor(rust_frp_core::StcpVisitorMsg {
             proxy_name: "stcpbridge".to_string(),
             run_id: "stcp-visitor-run".to_string(),
+            bridge_id: bridge_id.clone(),
             timestamp: ts,
             sign_key,
         }),
@@ -332,7 +369,7 @@ async fn stcp_bridge_relays_over_custom_work_port() {
 
     // 3. 代理侧收到 ReqWorkConn → 拨自定义工作端口（b22ef43：桥路径回发 StartWorkConn）
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let owner_bridge_sign_key = loop {
         let msg = tokio::time::timeout_at(deadline, rust_frp_core::read_message(&mut ctrl_proxy))
             .await
             .expect("ReqWorkConn within timeout")
@@ -340,13 +377,21 @@ async fn stcp_bridge_relays_over_custom_work_port() {
         match msg {
             Message::ReqWorkConn(r) => {
                 assert_eq!(r.proxy_name, "stcpbridge");
-                break;
+                assert_eq!(r.bridge_id, bridge_id);
+                break r.work_conn_sign_key;
             }
             _ => continue,
         }
-    }
-    let mut proxy_leg =
-        dial_and_handshake_work_conn(work_port, "stcp-proxy-run", "stcpbridge", token).await;
+    };
+    let mut proxy_leg = dial_and_handshake_bridge_work_conn(
+        work_port,
+        "stcp-proxy-run",
+        "stcpbridge",
+        token,
+        &bridge_id,
+        &owner_bridge_sign_key,
+    )
+    .await;
     eprintln!(
         "[ckpt] proxy leg established on custom work port {}",
         work_port
@@ -354,7 +399,7 @@ async fn stcp_bridge_relays_over_custom_work_port() {
 
     // 4. 访问者侧收到桥就绪确认（StcpVisitorResp）→ 拨自定义工作端口
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let visitor_bridge_sign_key = loop {
         let msg = tokio::time::timeout_at(deadline, rust_frp_core::read_message(&mut ctrl_visitor))
             .await
             .expect("StcpVisitorResp within timeout")
@@ -362,13 +407,21 @@ async fn stcp_bridge_relays_over_custom_work_port() {
         match msg {
             Message::StcpVisitorResp(r) => {
                 assert!(r.error.is_empty(), "StcpVisitorResp error: {}", r.error);
-                break;
+                assert_eq!(r.bridge_id, bridge_id);
+                break r.work_conn_sign_key;
             }
             _ => continue,
         }
-    }
-    let mut visitor_leg =
-        dial_and_handshake_work_conn(work_port, "stcp-visitor-run", "stcpbridge", token).await;
+    };
+    let mut visitor_leg = dial_and_handshake_bridge_work_conn(
+        work_port,
+        "stcp-visitor-run",
+        "stcpbridge",
+        token,
+        &bridge_id,
+        &visitor_bridge_sign_key,
+    )
+    .await;
     eprintln!("[ckpt] visitor leg established, bridge pairing");
 
     // 5. 桥双向中继：代理侧写 → 访问者侧读；访问者侧写 → 代理侧读
@@ -403,6 +456,267 @@ async fn stcp_bridge_relays_over_custom_work_port() {
     .await
     .expect("bridge relay within timeout");
     eprintln!("[ckpt] stcp bridge relay verified over custom work port");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stcp_work_conn_requires_bridge_secret() {
+    let _guard = server_lock().await;
+    let token = "stcp-auth-token";
+    let work_port = free_tcp_port();
+    let (bind_port, _) = start_server_with_work_port(token, work_port).await;
+
+    let (mut owner_ctrl, _) =
+        connect_and_login_as(bind_port, token, "stcp-owner", "stcp-owner").await;
+    rust_frp_core::write_message(
+        &mut owner_ctrl,
+        &Message::RegisterProxy(rust_frp_core::RegisterProxyMsg {
+            proxy: ProxyConfig {
+                name: "stcp-auth".to_string(),
+                r#type: "stcp".to_string(),
+                local_ip: "127.0.0.1".to_string(),
+                local_port: 1,
+                secret_key: Some("real-stcp-secret".to_string()),
+                ..Default::default()
+            },
+        }),
+    )
+    .await
+    .expect("register owner proxy");
+    match rust_frp_core::read_message(&mut owner_ctrl)
+        .await
+        .expect("owner register response")
+    {
+        Message::RegisterProxyResp(resp) => assert!(resp.error.is_empty(), "{}", resp.error),
+        other => panic!("expected RegisterProxyResp, got {other:?}"),
+    }
+
+    let (mut visitor_ctrl, _) =
+        connect_and_login_as(bind_port, token, "stcp-visitor", "stcp-visitor").await;
+    let bridge_id = rust_frp_util::rand_id(24);
+    let ts = rust_frp_util::get_timestamp();
+    let sign_key = rust_frp_auth::generate_stcp_visitor_sign_key(
+        "real-stcp-secret",
+        "stcp-auth",
+        &bridge_id,
+        "stcp-visitor",
+        ts,
+    );
+    rust_frp_core::write_message(
+        &mut visitor_ctrl,
+        &Message::StcpVisitor(rust_frp_core::StcpVisitorMsg {
+            proxy_name: "stcp-auth".to_string(),
+            run_id: "stcp-visitor".to_string(),
+            bridge_id: bridge_id.clone(),
+            timestamp: ts,
+            sign_key,
+        }),
+    )
+    .await
+    .expect("send visitor request");
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        rust_frp_core::read_message(&mut visitor_ctrl),
+    )
+    .await
+    .expect("visitor response timeout")
+    .expect("read visitor response");
+    match response {
+        Message::StcpVisitorResp(resp) => {
+            assert!(resp.error.is_empty(), "{}", resp.error);
+            assert_eq!(resp.bridge_id, bridge_id);
+        }
+        other => panic!("expected StcpVisitorResp, got {other:?}"),
+    }
+
+    let (attacker_ctrl, _) =
+        connect_and_login_as(bind_port, token, "stcp-attacker", "stcp-attacker").await;
+    assert!(
+        attacker_ctrl.peer_addr().is_ok(),
+        "attacker control must stay online"
+    );
+    let error = dial_and_handshake_bridge_work_conn_result(
+        work_port,
+        "stcp-attacker",
+        "stcp-auth",
+        token,
+        &bridge_id,
+        "guessed-without-secret",
+    )
+    .await
+    .expect_err("work conn without STCP secret must be rejected");
+    assert!(
+        error.contains("authorization failed"),
+        "unexpected rejection: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_stcp_visitors_use_independent_bridges() {
+    use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _guard = server_lock().await;
+    let token = "stcp-concurrent-token";
+    let work_port = free_tcp_port();
+    let (bind_port, _) = start_server_with_work_port(token, work_port).await;
+
+    let (mut owner_ctrl, _) =
+        connect_and_login_as(bind_port, token, "stcp-owner", "stcp-owner").await;
+    rust_frp_core::write_message(
+        &mut owner_ctrl,
+        &Message::RegisterProxy(rust_frp_core::RegisterProxyMsg {
+            proxy: ProxyConfig {
+                name: "stcp-shared".to_string(),
+                r#type: "stcp".to_string(),
+                local_ip: "127.0.0.1".to_string(),
+                local_port: 1,
+                secret_key: Some("shared-secret".to_string()),
+                ..Default::default()
+            },
+        }),
+    )
+    .await
+    .expect("register owner proxy");
+    match rust_frp_core::read_message(&mut owner_ctrl)
+        .await
+        .expect("owner register response")
+    {
+        Message::RegisterProxyResp(resp) => assert!(resp.error.is_empty(), "{}", resp.error),
+        other => panic!("expected RegisterProxyResp, got {other:?}"),
+    }
+
+    let (mut visitor1_ctrl, _) = connect_and_login_as(bind_port, token, "stcp-v1", "stcp-v1").await;
+    let (mut visitor2_ctrl, _) = connect_and_login_as(bind_port, token, "stcp-v2", "stcp-v2").await;
+    let bridge1 = rust_frp_util::rand_id(24);
+    let bridge2 = rust_frp_util::rand_id(24);
+    for (ctrl, run_id, bridge_id) in [
+        (&mut visitor1_ctrl, "stcp-v1", &bridge1),
+        (&mut visitor2_ctrl, "stcp-v2", &bridge2),
+    ] {
+        let ts = rust_frp_util::get_timestamp();
+        rust_frp_core::write_message(
+            ctrl,
+            &Message::StcpVisitor(rust_frp_core::StcpVisitorMsg {
+                proxy_name: "stcp-shared".to_string(),
+                run_id: run_id.to_string(),
+                bridge_id: bridge_id.clone(),
+                timestamp: ts,
+                sign_key: rust_frp_auth::generate_stcp_visitor_sign_key(
+                    "shared-secret",
+                    "stcp-shared",
+                    bridge_id,
+                    run_id,
+                    ts,
+                ),
+            }),
+        )
+        .await
+        .expect("send concurrent visitor request");
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut owner_keys = HashMap::new();
+    while owner_keys.len() < 2 {
+        match tokio::time::timeout_at(deadline, rust_frp_core::read_message(&mut owner_ctrl))
+            .await
+            .expect("owner ReqWorkConn timeout")
+            .expect("owner control read")
+        {
+            Message::ReqWorkConn(req) => {
+                assert!(req.bridge_id == bridge1 || req.bridge_id == bridge2);
+                owner_keys.insert(req.bridge_id, req.work_conn_sign_key);
+            }
+            _ => continue,
+        }
+    }
+
+    let mut visitor_keys = HashMap::new();
+    for (ctrl, expected_bridge) in [
+        (&mut visitor1_ctrl, &bridge1),
+        (&mut visitor2_ctrl, &bridge2),
+    ] {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rust_frp_core::read_message(ctrl))
+                .await
+                .expect("visitor response timeout")
+                .expect("visitor control read")
+            {
+                Message::StcpVisitorResp(resp) => {
+                    assert!(resp.error.is_empty(), "{}", resp.error);
+                    assert_eq!(&resp.bridge_id, expected_bridge);
+                    visitor_keys.insert(resp.bridge_id, resp.work_conn_sign_key);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    let mut owner1 = dial_and_handshake_bridge_work_conn(
+        work_port,
+        "stcp-owner",
+        "stcp-shared",
+        token,
+        &bridge1,
+        &owner_keys[&bridge1],
+    )
+    .await;
+    let mut owner2 = dial_and_handshake_bridge_work_conn(
+        work_port,
+        "stcp-owner",
+        "stcp-shared",
+        token,
+        &bridge2,
+        &owner_keys[&bridge2],
+    )
+    .await;
+    let mut visitor1 = dial_and_handshake_bridge_work_conn(
+        work_port,
+        "stcp-v1",
+        "stcp-shared",
+        token,
+        &bridge1,
+        &visitor_keys[&bridge1],
+    )
+    .await;
+    let mut visitor2 = dial_and_handshake_bridge_work_conn(
+        work_port,
+        "stcp-v2",
+        "stcp-shared",
+        token,
+        &bridge2,
+        &visitor_keys[&bridge2],
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        owner1.write_all(b"owner-one").await.expect("owner1 write");
+        owner2.write_all(b"owner-two").await.expect("owner2 write");
+        let mut v1 = [0u8; 9];
+        let mut v2 = [0u8; 9];
+        visitor1.read_exact(&mut v1).await.expect("visitor1 read");
+        visitor2.read_exact(&mut v2).await.expect("visitor2 read");
+        assert_eq!(&v1, b"owner-one");
+        assert_eq!(&v2, b"owner-two");
+
+        visitor1
+            .write_all(b"visitor-1")
+            .await
+            .expect("visitor1 write");
+        visitor2
+            .write_all(b"visitor-2")
+            .await
+            .expect("visitor2 write");
+        let mut o1 = [0u8; 9];
+        let mut o2 = [0u8; 9];
+        owner1.read_exact(&mut o1).await.expect("owner1 read");
+        owner2.read_exact(&mut o2).await.expect("owner2 read");
+        assert_eq!(&o1, b"visitor-1");
+        assert_eq!(&o2, b"visitor-2");
+    })
+    .await
+    .expect("concurrent STCP bridges timed out");
 }
 
 #[tokio::test]
@@ -547,6 +861,7 @@ async fn tcp_proxy_data_flows_over_dedicated_work_port() {
                 sign_key,
                 use_encryption: false,
                 use_compression: false,
+                ..Default::default()
             }),
         ),
     )

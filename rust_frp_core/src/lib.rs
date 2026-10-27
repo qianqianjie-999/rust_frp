@@ -302,10 +302,17 @@ pub struct RegisterProxyRespMsg {
 /// # 字段说明
 ///
 /// - `proxy_name`: 需要建立连接的代理名称
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// - `bridge_id` / `work_conn_sign_key`: STCP 系列桥关联信息与 owner 角色签名
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ReqWorkConnMsg {
     /// 目标代理名称
     pub proxy_name: String,
+    /// STCP 系列桥 ID；普通工作连接为空
+    #[serde(default)]
+    pub bridge_id: String,
+    /// 仅供目标 owner 使用的工作连接角色签名
+    #[serde(default)]
+    pub work_conn_sign_key: String,
 }
 
 /// 新工作连接消息 - 客户端通知服务器有新的工作连接可用
@@ -329,9 +336,10 @@ pub struct ReqWorkConnMsg {
 /// - `proxy_name`: 此工作连接对应的代理名称
 /// - `timestamp`: 时间戳（毫秒），用于防重放
 /// - `sign_key`: HMAC 签名密钥，证明连接请求的合法性
+/// - `bridge_id` / `bridge_sign_key`: STCP 系列桥 ID 与角色签名
 /// - `use_encryption`: 是否对此连接启用端到端加密
 /// - `use_compression`: 是否对此连接启用压缩
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NewWorkConnMsg {
     /// 客户端运行 ID
     pub run_id: String,
@@ -341,6 +349,12 @@ pub struct NewWorkConnMsg {
     pub timestamp: i64,
     /// HMAC 签名密钥
     pub sign_key: String,
+    /// STCP 系列桥 ID；普通工作连接为空
+    #[serde(default)]
+    pub bridge_id: String,
+    /// 基于 STCP secret_key 的角色签名；普通工作连接为空
+    #[serde(default)]
+    pub bridge_sign_key: String,
     /// 是否启用加密
     pub use_encryption: bool,
     /// 是否启用压缩
@@ -517,12 +531,16 @@ pub struct UdpPacketMsg {
 ///
 /// - `proxy_name`: 要访问的代理名称（对应 server_name）
 /// - `run_id`: 访问者客户端的运行 ID
+/// - `bridge_id`: 每次访问唯一的桥 ID，同时用于响应关联与防重放
 /// - `timestamp`: 时间戳
 /// - `sign_key`: HMAC 签名密钥（基于 secret_key）
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StcpVisitorMsg {
     pub proxy_name: String,
     pub run_id: String,
+    /// 每次访问独立生成；同时用作请求关联 ID 与防重放 nonce
+    #[serde(default)]
+    pub bridge_id: String,
     pub timestamp: i64,
     pub sign_key: String,
 }
@@ -532,13 +550,21 @@ pub struct StcpVisitorMsg {
 /// # 字段说明
 ///
 /// - `proxy_name`: 代理名称
+/// - `bridge_id`: 对应的访问请求 ID
 /// - `error`: 错误信息（空表示成功）
 /// - `visitor_run_id`: 访问者客户端运行 ID（成功时返回）
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// - `work_conn_sign_key`: visitor 工作连接角色签名
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StcpVisitorRespMsg {
     pub proxy_name: String,
+    /// 对应的访问请求 ID
+    #[serde(default)]
+    pub bridge_id: String,
     pub error: String,
     pub visitor_run_id: String,
+    /// 仅供该 visitor 使用的工作连接角色签名
+    #[serde(default)]
+    pub work_conn_sign_key: String,
 }
 
 /// STCP 启动工作连接消息 - 服务器通知客户端创建 STCP 工作连接
@@ -1242,6 +1268,7 @@ mod tests {
     fn test_req_work_conn_msg() {
         let msg = ReqWorkConnMsg {
             proxy_name: "ssh".to_string(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: ReqWorkConnMsg = serde_json::from_str(&json).unwrap();

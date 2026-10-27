@@ -221,6 +221,36 @@ pub fn generate_stcp_sign_key(secret_key: &str, proxy_name: &str, timestamp: i64
     base64::engine::general_purpose::STANDARD.encode(tag.as_ref())
 }
 
+/// 生成 STCP 系列访问请求签名（绑定每次访问的 bridge_id，抵抗请求重放与串线）
+pub fn generate_stcp_visitor_sign_key(
+    secret_key: &str,
+    proxy_name: &str,
+    bridge_id: &str,
+    run_id: &str,
+    timestamp: i64,
+) -> String {
+    let msg = format!("stcp:{proxy_name}:{bridge_id}:{run_id}:{timestamp}");
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, secret_key.as_bytes());
+    let tag = hmac::sign(&hmac_key, msg.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(tag.as_ref())
+}
+
+/// 生成 STCP 工作连接角色签名。
+///
+/// 普通 frps token 只能证明客户端已登录；该签名额外证明工作连接属于某条
+/// 已授权的 STCP 桥及正确角色，防止同 token 下的其他客户端抢占桥腿。
+pub fn generate_stcp_work_conn_sign_key(
+    secret_key: &str,
+    bridge_id: &str,
+    role: &str,
+    run_id: &str,
+) -> String {
+    let msg = format!("stcp-work:{bridge_id}:{role}:{run_id}");
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, secret_key.as_bytes());
+    let tag = hmac::sign(&hmac_key, msg.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(tag.as_ref())
+}
+
 #[async_trait]
 impl AuthVerifier for TokenAuthVerifier {
     /// 验证登录令牌
@@ -1112,6 +1142,33 @@ mod tests {
             generate_stcp_sign_key("wrong_secret", "ssh_proxy", 1000)
         );
         assert_ne!(base, generate_stcp_sign_key("", "ssh_proxy", 1000));
+    }
+
+    #[test]
+    fn test_stcp_visitor_sign_binds_bridge_id() {
+        let a = generate_stcp_visitor_sign_key("shared_secret", "ssh", "bridge-a", "run-a", 1000);
+        let b = generate_stcp_visitor_sign_key("shared_secret", "ssh", "bridge-b", "run-a", 1000);
+        let other_run =
+            generate_stcp_visitor_sign_key("shared_secret", "ssh", "bridge-a", "run-b", 1000);
+        assert_ne!(
+            a, b,
+            "different bridge ids must not share a visitor signature"
+        );
+        assert_ne!(
+            a, other_run,
+            "visitor signature must be bound to the authenticated run id"
+        );
+    }
+
+    #[test]
+    fn test_stcp_work_conn_sign_binds_role_and_run_id() {
+        let owner = generate_stcp_work_conn_sign_key("shared_secret", "bridge", "owner", "run-a");
+        let visitor =
+            generate_stcp_work_conn_sign_key("shared_secret", "bridge", "visitor", "run-a");
+        let other_run =
+            generate_stcp_work_conn_sign_key("shared_secret", "bridge", "owner", "run-b");
+        assert_ne!(owner, visitor);
+        assert_ne!(owner, other_run);
     }
 
     #[tokio::test]

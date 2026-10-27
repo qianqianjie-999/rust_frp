@@ -386,6 +386,8 @@ async fn serve_conn(mut conn: TcpStream, peer: SocketAddr, deps: TcpMuxDeps) {
     let _conn_guard = global_metrics()
         .get_proxy_stat(&route.proxy_name)
         .map(ProxyConnGuard::acquire);
+    // 优雅关闭排空：tcpmux 桥接存活期间保持全局连接计数
+    let _drain_guard = global_metrics().connection_guard();
 
     // 服务端插件回调：NewUserConn（可拒绝本次外部接入）
     if let Err(reason) = crate::proxy_manager::notify_new_user_conn(

@@ -301,6 +301,7 @@ fn test_stcp_visitor_msg_serialization() {
     let msg = Message::StcpVisitor(rust_frp_core::StcpVisitorMsg {
         proxy_name: "ssh".to_string(),
         run_id: "run123".to_string(),
+        bridge_id: "bridge123".to_string(),
         timestamp: 1700000000,
         sign_key: "abc_sign".to_string(),
     });
@@ -310,6 +311,7 @@ fn test_stcp_visitor_msg_serialization() {
         Message::StcpVisitor(m) => {
             assert_eq!(m.proxy_name, "ssh");
             assert_eq!(m.run_id, "run123");
+            assert_eq!(m.bridge_id, "bridge123");
             assert_eq!(m.sign_key, "abc_sign");
         }
         _ => panic!("expected StcpVisitor, got wrong variant"),

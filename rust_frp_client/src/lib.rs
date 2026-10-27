@@ -967,17 +967,43 @@ impl XtcpRegistry {
     }
 }
 
-/// STCP 访问端应答等待表：proxy_name -> 等待桥就绪确认的 oneshot 列表
-type StcpPendingMap =
-    std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<Result<String, String>>>>;
+/// STCP 访问端应答等待表：proxy_name -> (等待者 id, 等待桥就绪确认的 oneshot) 列表
+///
+/// 带上 id 是为了**精确反注册**：等待方超时/被拒/发送失败提前返回后必须把自己摘掉。
+/// 只 push 不摘会让 dead sender 在全局表里无限累积——客户端长跑时内存与
+/// 每次 `resolve` 的唤醒耗时都会单调增长（见 StcpWaiter 的 Drop）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StcpVisitorGrant {
+    bridge_id: String,
+    work_conn_sign_key: String,
+}
+
+type StcpPendingMap = std::collections::HashMap<
+    String,
+    Vec<(
+        u64,
+        tokio::sync::oneshot::Sender<Result<StcpVisitorGrant, String>>,
+    )>,
+>;
+
+/// 等待失败的原因：区分"服务端明确拒绝"与"本地等待异常"，调用方据此给出不同文案
+#[derive(Debug)]
+enum StcpWaitError {
+    /// 超过等待时限（桥一直没就绪）
+    Timeout,
+    /// 等待通道被关闭（控制连接重连等）
+    Dropped,
+}
 
 /// STCP 访问端应答等待器：handle_stcp_visitor_conn 在发出 StcpVisitor 后
 /// 必须等服务端桥就绪确认（StcpVisitorResp）再拨工作连接。否则存在竞态：
 /// 工作连接可能先于控制消息被服务端处理，此时桥尚未建立，连接被当作
 /// 普通代理工作连接丢弃，visitor 永远等不到 StartWorkConn 而超时。
 struct StcpRespRegistry {
-    /// proxy_name -> 等待桥就绪确认的 oneshot 列表（并发访问同代理时全部唤醒）
+    /// proxy_name -> 等待桥就绪确认的等待者列表（并发访问同代理时全部唤醒）
     pending: std::sync::Mutex<StcpPendingMap>,
+    /// 等待者发号器：id 单调递增，进程内不重复
+    next_id: std::sync::atomic::AtomicU64,
 }
 
 impl StcpRespRegistry {
@@ -985,33 +1011,103 @@ impl StcpRespRegistry {
         static REG: std::sync::OnceLock<StcpRespRegistry> = std::sync::OnceLock::new();
         REG.get_or_init(|| StcpRespRegistry {
             pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
-    /// 注册等待者，返回接收端
-    fn register(&self, proxy_name: &str) -> tokio::sync::oneshot::Receiver<Result<String, String>> {
+    /// 注册等待者，返回**可自动反注册**的等待句柄（见 `StcpWaiter`）
+    fn register(&self, bridge_id: &str) -> StcpWaiter {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(proxy_name.to_string())
+            .entry(bridge_id.to_string())
             .or_default()
-            .push(tx);
-        rx
+            .push((id, tx));
+        StcpWaiter {
+            bridge_id: bridge_id.to_string(),
+            id,
+            rx: Some(rx),
+        }
     }
 
-    /// 服务端应答到达时唤醒该代理的全部等待者
-    fn resolve(&self, proxy_name: &str, result: Result<String, String>) {
+    /// 服务端应答到达时只唤醒对应 bridge_id 的等待者。
+    fn resolve(&self, bridge_id: &str, result: Result<StcpVisitorGrant, String>) {
         if let Some(waiters) = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(proxy_name)
+            .remove(bridge_id)
         {
-            for tx in waiters {
+            for (_, tx) in waiters {
                 let _ = tx.send(result.clone());
             }
         }
+    }
+
+    /// 摘掉单个等待者（由 `StcpWaiter::drop` 触发）；列表空则顺带删掉 key，
+    /// 避免留下空 Vec 占住表名。
+    fn cancel(&self, bridge_id: &str, id: u64) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut now_empty = false;
+        if let Some(waiters) = pending.get_mut(bridge_id) {
+            waiters.retain(|(wid, _)| *wid != id);
+            now_empty = waiters.is_empty();
+        }
+        if now_empty {
+            pending.remove(bridge_id);
+        }
+    }
+
+    /// 当前仍在等待的 sender 数（测试判据）
+    #[cfg(test)]
+    fn pending_len(&self, proxy_name: &str) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(proxy_name)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+}
+
+/// 等待句柄：**Drop 即反注册**。
+///
+/// 这样无论等待方是成功、被拒、超时还是发送失败提前 return，都不会在
+/// 全局表里留下 dead sender——把"必须记得清理"从调用方的自觉变成类型系统的保证。
+struct StcpWaiter {
+    bridge_id: String,
+    id: u64,
+    rx: Option<tokio::sync::oneshot::Receiver<Result<StcpVisitorGrant, String>>>,
+}
+
+impl StcpWaiter {
+    /// 等待服务端应答；返回后句柄析构，自动反注册。
+    async fn wait_timeout(
+        mut self,
+        dur: std::time::Duration,
+    ) -> Result<Result<StcpVisitorGrant, String>, StcpWaitError> {
+        // let-else 而非 expect：句柄被消费过一次即视为通道已关闭，不引入 panic 点
+        let Some(rx) = self.rx.take() else {
+            return Err(StcpWaitError::Dropped);
+        };
+        match tokio::time::timeout(dur, rx).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Err(StcpWaitError::Dropped),
+            Err(_) => Err(StcpWaitError::Timeout),
+        }
+    }
+}
+
+impl Drop for StcpWaiter {
+    fn drop(&mut self) {
+        StcpRespRegistry::global().cancel(&self.bridge_id, self.id);
     }
 }
 
@@ -1219,7 +1315,10 @@ impl ClientControl {
             Message::StcpVisitorResp(resp) => {
                 // STCP 访问端桥就绪确认：成功唤醒等待者，失败则让其报错返回
                 let result = if resp.error.is_empty() {
-                    Ok("bridge ready".to_string())
+                    Ok(StcpVisitorGrant {
+                        bridge_id: resp.bridge_id.clone(),
+                        work_conn_sign_key: resp.work_conn_sign_key.clone(),
+                    })
                 } else {
                     Err(resp.error.clone())
                 };
@@ -1232,7 +1331,7 @@ impl ClientControl {
                         &resp.error
                     }
                 );
-                StcpRespRegistry::global().resolve(&resp.proxy_name, result);
+                StcpRespRegistry::global().resolve(&resp.bridge_id, result);
             }
             Message::ReqWorkConn(req_work_conn_msg) => {
                 // 服务器请求建立工作连接
@@ -1245,6 +1344,8 @@ impl ClientControl {
                     req_work_conn_msg.proxy_name
                 );
                 let proxy_name = req_work_conn_msg.proxy_name.clone();
+                let bridge_id = req_work_conn_msg.bridge_id.clone();
+                let bridge_sign_key = req_work_conn_msg.work_conn_sign_key.clone();
                 let run_id = self.run_id.clone();
                 let config = Arc::clone(&self.config);
                 let work_conn_tls = self.work_conn_tls;
@@ -1254,12 +1355,16 @@ impl ClientControl {
                 tokio::spawn(async move {
                     log::debug!("开始建立工作连接: proxy={}", proxy_name);
                     if let Err(e) = establish_work_connection(
-                        &proxy_name,
-                        &run_id,
                         &config,
-                        work_conn_tls,
-                        server_work_conn_port,
-                        session.as_ref(),
+                        WorkConnEstablishRequest {
+                            proxy_name: &proxy_name,
+                            run_id: &run_id,
+                            bridge_id: &bridge_id,
+                            bridge_sign_key: &bridge_sign_key,
+                            work_conn_tls,
+                            server_work_conn_port,
+                            session: session.as_ref(),
+                        },
                     )
                     .await
                     {
@@ -1538,6 +1643,10 @@ struct WorkConnRequest<'a> {
     server_work_conn_port: u16,
     use_encryption: bool,
     use_compression: bool,
+    /// STCP/SUDP/XTCP 回退桥 ID；普通代理为空
+    bridge_id: &'a str,
+    /// 服务端下发的角色签名；普通代理为空
+    bridge_sign_key: &'a str,
 }
 
 /// 打开工作连接并完成握手后的结果
@@ -1545,6 +1654,16 @@ struct WorkConnRequest<'a> {
 /// 元组为 `(连接, 服务器观测到的访问者 IP, 访问者端口)`；后两项供
 /// PROXY protocol v1 头使用。
 type OpenedWorkConn = (Box<dyn rust_frp_net::FrpConn>, String, u16);
+
+struct WorkConnEstablishRequest<'a> {
+    proxy_name: &'a str,
+    run_id: &'a str,
+    bridge_id: &'a str,
+    bridge_sign_key: &'a str,
+    work_conn_tls: bool,
+    server_work_conn_port: u16,
+    session: Option<&'a Arc<dyn Session>>,
+}
 
 /// 直拨服务器专用工作端口（数据/控制分离的数据面通道）
 ///
@@ -1616,6 +1735,8 @@ async fn open_work_conn(
         server_work_conn_port,
         use_encryption,
         use_compression,
+        bridge_id,
+        bridge_sign_key,
     } = req;
 
     let via = config.transport.work_conn_via.to_ascii_lowercase();
@@ -1688,6 +1809,8 @@ async fn open_work_conn(
         proxy_name: proxy_name.to_string(),
         timestamp: get_timestamp(),
         sign_key,
+        bridge_id: bridge_id.to_string(),
+        bridge_sign_key: bridge_sign_key.to_string(),
         use_encryption,
         use_compression,
     };
@@ -1738,13 +1861,18 @@ async fn open_work_conn(
 /// - 端口：优先使用客户端配置的 work_conn_port，默认 server_port + 1000
 /// - TLS：服务器通过 LoginRespMsg.work_conn_tls 协商后按需 TLS 加密
 async fn establish_work_connection(
-    proxy_name: &str,
-    run_id: &str,
     config: &ClientConfig,
-    work_conn_tls: bool,
-    server_work_conn_port: u16,
-    session: Option<&Arc<dyn Session>>,
+    req: WorkConnEstablishRequest<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let WorkConnEstablishRequest {
+        proxy_name,
+        run_id,
+        bridge_id,
+        bridge_sign_key,
+        work_conn_tls,
+        server_work_conn_port,
+        session,
+    } = req;
     // 查找代理配置
     let proxy_config = config
         .proxies
@@ -1773,6 +1901,8 @@ async fn establish_work_connection(
             server_work_conn_port,
             use_encryption,
             use_compression,
+            bridge_id,
+            bridge_sign_key,
         },
     )
     .await?;
@@ -2259,13 +2389,21 @@ async fn handle_stcp_visitor_conn(
     };
 
     // STCP/XTCP 访问签名：基于访问者配置的 secret_key（与服务端代理 secret_key 一致）
-    // sign_key = Base64(HMAC-SHA256(secret_key, "stcp:{proxy_name}:{timestamp}"))
+    // sign_key = Base64(HMAC-SHA256(secret_key, "stcp:{proxy}:{bridge}:{run}:{timestamp}"))
+    let bridge_id = rust_frp_util::rand_id(24);
     let timestamp = get_timestamp();
-    let sign_key = rust_frp_auth::generate_stcp_sign_key(&secret_key, &proxy_name, timestamp);
+    let sign_key = rust_frp_auth::generate_stcp_visitor_sign_key(
+        &secret_key,
+        &proxy_name,
+        &bridge_id,
+        &run_id,
+        timestamp,
+    );
 
     let stcp_msg = rust_frp_core::StcpVisitorMsg {
         proxy_name: proxy_name.clone(),
         run_id: run_id.clone(),
+        bridge_id: bridge_id.clone(),
         timestamp,
         sign_key,
     };
@@ -2273,7 +2411,8 @@ async fn handle_stcp_visitor_conn(
     // 先注册应答等待者再发送：控制循环可能在我们 await 之前就处理完
     // StcpVisitor 并收到 StcpVisitorResp，后注册会错过已发出的应答
     // （oneshot 值先于注册到达即永久丢失，只能等 10s 超时）。
-    let resp_rx = StcpRespRegistry::global().register(&proxy_name);
+    // 句柄析构即反注册：下面的任何提前 return 都不会留下 dead sender
+    let waiter = StcpRespRegistry::global().register(&bridge_id);
     if let Err(e) = stcp_tx.send(Message::StcpVisitor(stcp_msg)).await {
         return Err(format!("Failed to send StcpVisitor: {}", e).into());
     }
@@ -2281,18 +2420,28 @@ async fn handle_stcp_visitor_conn(
     // 等待服务端桥就绪确认（StcpVisitorResp）再拨工作连接。
     // 不等的话存在竞态：工作连接先于控制消息到达服务端时桥尚未建立，
     // 该连接会被当作普通代理工作连接丢弃，visitor 永久等不到 StartWorkConn。
-    match tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx).await {
-        Ok(Ok(Ok(_))) => {}
-        Ok(Ok(Err(e))) => return Err(format!("STCP visitor rejected by server: {}", e).into()),
-        Ok(Err(_)) => return Err("STCP visitor waiter dropped (reconnect?)".into()),
-        Err(_) => {
+    let grant = match waiter
+        .wait_timeout(std::time::Duration::from_secs(10))
+        .await
+    {
+        Ok(Ok(grant)) => {
+            if grant.bridge_id != bridge_id {
+                return Err("STCP visitor response bridge mismatch".into());
+            }
+            grant
+        }
+        Ok(Err(e)) => return Err(format!("STCP visitor rejected by server: {}", e).into()),
+        Err(StcpWaitError::Dropped) => {
+            return Err("STCP visitor waiter dropped (reconnect?)".into())
+        }
+        Err(StcpWaitError::Timeout) => {
             return Err(format!(
                 "timeout waiting for STCP visitor resp of {} (bridge not ready)",
                 proxy_name
             )
             .into())
         }
-    }
+    };
 
     // 工作连接：与 establish_work_connection 共用同一建立与包装逻辑
     // server_work_conn_port 经 LoginResp 下发链传入：服务端自定义了工作端口时，
@@ -2307,6 +2456,8 @@ async fn handle_stcp_visitor_conn(
             server_work_conn_port,
             use_encryption,
             use_compression,
+            bridge_id: &bridge_id,
+            bridge_sign_key: &grant.work_conn_sign_key,
         },
     )
     .await?;
@@ -2591,17 +2742,25 @@ async fn sudp_open_session(
     sessions: SudpSessions,
 ) -> Result<mpsc::Sender<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
     // 与服务端代理 secret_key 一致的访问签名（服务端 fail-closed 校验）
+    let bridge_id = rust_frp_util::rand_id(24);
     let timestamp = get_timestamp();
-    let sign_key =
-        rust_frp_auth::generate_stcp_sign_key(&ctx.secret_key, &ctx.proxy_name, timestamp);
+    let sign_key = rust_frp_auth::generate_stcp_visitor_sign_key(
+        &ctx.secret_key,
+        &ctx.proxy_name,
+        &bridge_id,
+        &ctx.run_id,
+        timestamp,
+    );
 
     // 先注册应答等待者再发送：服务端可能在控制消息写出前就处理完建桥，
     // 后注册会永久错过 StcpVisitorResp（oneshot 值已缓冲则无此忧）。
-    let resp_rx = StcpRespRegistry::global().register(&ctx.proxy_name);
+    // 同 STCP：句柄析构即反注册，超时/失败不留 dead sender
+    let waiter = StcpRespRegistry::global().register(&bridge_id);
     ctx.stcp_tx
         .send(Message::StcpVisitor(rust_frp_core::StcpVisitorMsg {
             proxy_name: ctx.proxy_name.clone(),
             run_id: ctx.run_id.clone(),
+            bridge_id: bridge_id.clone(),
             timestamp,
             sign_key,
         }))
@@ -2611,18 +2770,28 @@ async fn sudp_open_session(
     // 等待服务端桥就绪确认（StcpVisitorResp）再拨工作连接——与 STCP visitor
     // 同一竞态防护：桥未建立时工作连接先到会被当作普通代理连接池化丢弃，
     // 会话永远等不到数据（对齐 handle_stcp_visitor_conn / 上游 8146c08）。
-    match tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx).await {
-        Ok(Ok(Ok(_))) => {}
-        Ok(Ok(Err(e))) => return Err(format!("SUDP visitor rejected by server: {}", e).into()),
-        Ok(Err(_)) => return Err("SUDP visitor waiter dropped (reconnect?)".into()),
-        Err(_) => {
+    let grant = match waiter
+        .wait_timeout(std::time::Duration::from_secs(10))
+        .await
+    {
+        Ok(Ok(grant)) => {
+            if grant.bridge_id != bridge_id {
+                return Err("SUDP visitor response bridge mismatch".into());
+            }
+            grant
+        }
+        Ok(Err(e)) => return Err(format!("SUDP visitor rejected by server: {}", e).into()),
+        Err(StcpWaitError::Dropped) => {
+            return Err("SUDP visitor waiter dropped (reconnect?)".into())
+        }
+        Err(StcpWaitError::Timeout) => {
             return Err(format!(
                 "timeout waiting for SUDP visitor resp of {} (bridge not ready)",
                 ctx.proxy_name
             )
             .into())
         }
-    }
+    };
 
     let (work_conn, _, _) = open_work_conn(
         &ctx.config,
@@ -2634,6 +2803,8 @@ async fn sudp_open_session(
             server_work_conn_port: ctx.server_work_conn_port,
             use_encryption: ctx.use_encryption,
             use_compression: ctx.use_compression,
+            bridge_id: &bridge_id,
+            bridge_sign_key: &grant.work_conn_sign_key,
         },
     )
     .await?;
@@ -5443,13 +5614,29 @@ mod visitor_work_port_tests {
             login_resp.work_conn_port,
         ));
 
+        // spawn 只代表任务已排队，不代表 UDP bind 已完成；先通过“端口不可再绑”
+        // 确认 visitor 已进入 recv 循环，避免首包被无监听端口静默丢弃。
+        let visitor_addr = format!("127.0.0.1:{visitor_bind}");
+        let mut visitor_ready = false;
+        for _ in 0..100 {
+            match tokio::net::UdpSocket::bind(&visitor_addr).await {
+                Ok(probe) => drop(probe),
+                Err(_) => {
+                    visitor_ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(visitor_ready, "SUDP visitor did not bind before packet");
+
         // 发包触发会话建立（此时 StcpVisitor 仅入队，控制循环未启动）
         let my_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind my udp");
         let payload: &[u8; 18] = b"sudp-port-threaded";
         my_sock
-            .send_to(payload, format!("127.0.0.1:{visitor_bind}"))
+            .send_to(payload, &visitor_addr)
             .await
             .expect("send udp");
 
@@ -5465,12 +5652,96 @@ mod visitor_work_port_tests {
 
         // 回环：my_sock → visitor 腿 → 桥 → 代理腿 → UDP echo → 原路返回
         let mut buf = [0u8; 18];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(5), my_sock.recv_from(&mut buf))
+        // 产品 visitor 响应预算为 10s；测试窗口必须覆盖该预算并留出
+        // 全量 workspace 并行执行时的调度余量，避免把正常等待判成死锁。
+        let (n, _) = tokio::time::timeout(Duration::from_secs(15), my_sock.recv_from(&mut buf))
             .await
             .expect("sudp echo within timeout (visitor leg dialed before bridge ready?)")
             .expect("recv udp echo");
         assert_eq!(&buf[..n], payload, "udp payload mismatch");
 
         loop_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod stcp_waiter_registry_tests {
+    //! P1-1 回归：等待方消失后不得在全局表留下 dead sender。
+    //! 留下 sender 的后果是客户端长跑时内存与每次 resolve 的唤醒耗时单调增长。
+    use super::*;
+
+    #[test]
+    fn waiter_dropped_after_abandon_leaves_no_sender() {
+        let key = "waiter-leak-regression";
+        for _ in 0..5 {
+            let waiter = StcpRespRegistry::global().register(key);
+            drop(waiter); // 模拟超时/提前返回：等待方消失
+        }
+        assert_eq!(
+            StcpRespRegistry::global().pending_len(key),
+            0,
+            "等待方消失后必须无残留 sender（否则全局表无界增长）"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiter_clears_entry_after_timeout() {
+        let key = "waiter-timeout-regression";
+        let waiter = StcpRespRegistry::global().register(key);
+        assert_eq!(StcpRespRegistry::global().pending_len(key), 1);
+        let r = waiter
+            .wait_timeout(std::time::Duration::from_millis(20))
+            .await;
+        assert!(matches!(r, Err(StcpWaitError::Timeout)), "无应答时应超时");
+        assert_eq!(
+            StcpRespRegistry::global().pending_len(key),
+            0,
+            "超时后必须自动反注册"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_wakes_waiter_and_clears_entry() {
+        let key = "waiter-resolve-regression";
+        let waiter = StcpRespRegistry::global().register(key);
+        let grant = StcpVisitorGrant {
+            bridge_id: key.to_string(),
+            work_conn_sign_key: "work-key".to_string(),
+        };
+        StcpRespRegistry::global().resolve(key, Ok(grant.clone()));
+        let r = waiter.wait_timeout(std::time::Duration::from_secs(1)).await;
+        assert!(matches!(r, Ok(Ok(v)) if v == grant), "应收到服务端确认");
+        assert_eq!(
+            StcpRespRegistry::global().pending_len(key),
+            0,
+            "resolve 后不应残留"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_responses_do_not_wake_other_connections() {
+        let key1 = "bridge-response-1";
+        let key2 = "bridge-response-2";
+        let waiter1 = StcpRespRegistry::global().register(key1);
+        let waiter2 = StcpRespRegistry::global().register(key2);
+        let grant = StcpVisitorGrant {
+            bridge_id: key1.to_string(),
+            work_conn_sign_key: "work-key-1".to_string(),
+        };
+        StcpRespRegistry::global().resolve(key1, Ok(grant.clone()));
+        assert_eq!(
+            waiter1
+                .wait_timeout(std::time::Duration::from_secs(1))
+                .await
+                .expect("wait key1")
+                .expect("grant key1"),
+            grant
+        );
+        assert_eq!(
+            StcpRespRegistry::global().pending_len(key2),
+            1,
+            "bridge 1 response must not wake bridge 2"
+        );
+        drop(waiter2);
     }
 }

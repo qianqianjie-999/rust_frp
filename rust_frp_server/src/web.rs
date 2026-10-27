@@ -644,6 +644,14 @@ impl WebServer {
     }
 }
 
+impl Drop for WebServer {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod auth_disabled_gate_tests {
     use super::is_unsafe_unauthenticated;
