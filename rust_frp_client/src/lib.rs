@@ -559,7 +559,7 @@ impl ProxyManager for ClientProxyManager {
     async fn clear(&self) {
         // 停止所有工作连接处理器
         let handlers = self.work_conn_handlers.write().await;
-        for (_, handle) in handlers.iter() {
+        for handle in handlers.values() {
             handle.abort();
         }
         drop(handlers);
@@ -3496,6 +3496,10 @@ impl Client {
                     }
                     // 500ms 防抖：编辑器保存常产生多次 Modify 事件
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    // 把防抖窗口内积压的事件一并吃掉。只 sleep 不排空的话，一次保存
+                    // 产生的 N 个 Modify 会排成 N 次全量重载（各间隔 500ms）——现场实测
+                    // 5 次重载/2.5s，每次都断开控制连接重新登录，visitor 反复重建。
+                    while watch_rx.try_recv().is_ok() {}
                     log::info!("Config file changed, triggering config reload...");
                     reload_notify.notify_one();
                 }
@@ -4036,6 +4040,12 @@ impl Client {
                     .await
                     .map_err(|e| e.to_string())?;
             }
+
+            // 先拆旧访问者任务并等它们真正退出（释放本地监听端口），再按新配置
+            // 重建。少了这一步，新任务 spawn 时旧的 listener 还占着端口，只能靠
+            // bind 的 1s 重试兜底——重载期间 9311/8080 会出现可见空窗，日志还会被
+            // AddrInUse 刷屏（2026-10-27 现场：一次保存触发 5 次重载，通道全灭）。
+            self.visitor_manager.clear().await;
 
             // 重新启动所有访问者
             for visitor in &self.config.visitors {

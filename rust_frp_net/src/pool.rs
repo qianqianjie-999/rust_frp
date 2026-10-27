@@ -440,7 +440,7 @@ impl PoolManager {
     /// 清理所有过期连接
     pub async fn cleanup_all(&self) {
         let pools = self.pools.read().await;
-        for (_addr, pool) in pools.iter() {
+        for pool in pools.values() {
             pool.cleanup().await;
         }
     }

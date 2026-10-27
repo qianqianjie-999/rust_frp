@@ -372,7 +372,7 @@ impl MonitorMetrics {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        list.sort_by(|a, b| b.last_close_time.cmp(&a.last_close_time));
+        list.sort_by_key(|p| std::cmp::Reverse(p.last_close_time));
         list
     }
 

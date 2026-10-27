@@ -368,20 +368,17 @@ fn main() {
             // 状态线程：独占 status_rx，刷新共享状态 + 托盘图标
             let latest_t = latest_for_thread.clone();
             let tray_t = tray.clone();
-            std::thread::spawn(move || loop {
-                match status_rx.recv() {
-                    Ok(u) => {
-                        {
-                            let mut l = latest_t.lock().unwrap();
-                            l.state = u.state.clone();
-                            l.visitors = u.visitors.clone();
-                            l.message = u.message.clone();
-                        }
-                        let _ = tray_t.set_icon(Some(icon::status_image(&u.state)));
-                        let _ =
-                            tray_t.set_tooltip(Some(format!("rust_frp - {}", u.state.text())));
+            std::thread::spawn(move || {
+                // 发送端丢弃（recv 返回 Err）即退出——等价于 while let 的终止条件
+                while let Ok(u) = status_rx.recv() {
+                    {
+                        let mut l = latest_t.lock().unwrap();
+                        l.state = u.state.clone();
+                        l.visitors = u.visitors.clone();
+                        l.message = u.message.clone();
                     }
-                    Err(_) => break, // 发送端已丢弃
+                    let _ = tray_t.set_icon(Some(icon::status_image(&u.state)));
+                    let _ = tray_t.set_tooltip(Some(format!("rust_frp - {}", u.state.text())));
                 }
             });
 
