@@ -4161,15 +4161,16 @@ mod client_manager_tests {
     struct TaskDropped(Arc<std::sync::atomic::AtomicBool>);
     impl Drop for TaskDropped {
         fn drop(&mut self) {
-            self.0
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     /// 起一个永不自行结束的 visitor 任务（模拟 accept 循环），
     /// 返回句柄与 drop 标记
-    fn spawn_never_ending_visitor_task()
-    -> (tokio::task::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>) {
+    fn spawn_never_ending_visitor_task() -> (
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let f = flag.clone();
         let handle = tokio::spawn(async move {

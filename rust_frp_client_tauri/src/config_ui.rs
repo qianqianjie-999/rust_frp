@@ -103,11 +103,7 @@ impl ClientConfigUi {
                 form.log_level = cfg.log.level.unwrap_or_else(|| "info".to_string());
                 form.web_port = cfg.web_server.port.to_string();
                 form.visitors = cfg.visitors.iter().map(VisitorUi::from_config).collect();
-                log::info!(
-                    "已加载配置 {}: {} 个访问者",
-                    path_str,
-                    form.visitors.len()
-                );
+                log::info!("已加载配置 {}: {} 个访问者", path_str, form.visitors.len());
             }
             Err(e) => {
                 log::warn!("加载配置 {} 失败（{}），使用默认表单", path_str, e);
@@ -193,8 +189,7 @@ impl ClientConfigUi {
         let log_tbl = table_mut(&mut doc, "log");
         log_tbl.insert("level".into(), self.log_level.clone().into());
 
-        let text =
-            toml::to_string_pretty(&doc).map_err(|e| format!("配置序列化失败: {e}"))?;
+        let text = toml::to_string_pretty(&doc).map_err(|e| format!("配置序列化失败: {e}"))?;
         std::fs::write(config_path, text).map_err(|e| format!("写配置失败: {e}"))?;
         log::info!("配置已保存: {}", config_path.display());
         Ok(())

@@ -48,7 +48,11 @@ fn copy_webview2_loader() {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("webview2-com-sys-") {
-                let candidate = entry.path().join("out").join(arch).join("WebView2Loader.dll");
+                let candidate = entry
+                    .path()
+                    .join("out")
+                    .join(arch)
+                    .join("WebView2Loader.dll");
                 if candidate.is_file() {
                     source = Some(candidate);
                     break;

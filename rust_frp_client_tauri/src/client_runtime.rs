@@ -305,9 +305,7 @@ fn poll_status(port: u16) -> StatusUpdate {
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|item| {
-                            item.get("name")
-                                .and_then(|n| n.as_str())
-                                .map(String::from)
+                            item.get("name").and_then(|n| n.as_str()).map(String::from)
                         })
                         .collect()
                 })
@@ -362,10 +360,7 @@ pub fn http_get_json(port: u16, path: &str) -> Option<serde_json::Value> {
     }
     let mut resp = String::new();
     if let Err(e) = stream.read_to_string(&mut resp) {
-        log::warn!(
-            "http_get_json: read 失败: {e}（已读 {} 字节）",
-            resp.len()
-        );
+        log::warn!("http_get_json: read 失败: {e}（已读 {} 字节）", resp.len());
         return None;
     }
     let Some((_head, body)) = resp.split_once("\r\n\r\n") else {

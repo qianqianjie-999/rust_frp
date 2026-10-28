@@ -80,15 +80,7 @@ pub fn set_enabled(enable: bool) -> Result<(), String> {
 fn open_run_key(access: u32) -> Option<HKEY> {
     let subkey = to_wide(RUN_SUBKEY);
     let mut key: HKEY = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            access,
-            &mut key,
-        )
-    };
+    let rc = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut key) };
     if rc == ERROR_SUCCESS {
         Some(key)
     } else {

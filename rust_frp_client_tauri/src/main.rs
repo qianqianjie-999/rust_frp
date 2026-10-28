@@ -140,9 +140,7 @@ fn ensure_single_instance() -> Option<std::net::TcpListener> {
     match std::net::TcpListener::bind("127.0.0.1:49171") {
         Ok(l) => Some(l),
         Err(e) => {
-            log::info!(
-                "检测到已有 rust_frpc-gui 实例在运行（49171 被占: {e}），本实例退出"
-            );
+            log::info!("检测到已有 rust_frpc-gui 实例在运行（49171 被占: {e}），本实例退出");
             None
         }
     }
@@ -156,7 +154,8 @@ fn tcp_reachable(addr: &str, port: u16) -> bool {
         .map(|i| i.collect())
         .unwrap_or_default();
     for sa in addrs {
-        if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000)).is_ok() {
+        if std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(1000)).is_ok()
+        {
             return true;
         }
     }
@@ -166,10 +165,7 @@ fn tcp_reachable(addr: &str, port: u16) -> bool {
 /// 启动即连接，但开机时网络（WiFi/DNS）可能尚未就绪：先轮询服务端可达，
 /// 成功或超时（30s）后再发 Start，避免首轮 login 在链路未起时失败而卡死。
 /// 配置缺失则退化为固定延迟 3s。
-fn spawn_auto_connect(
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<RuntimeCmd>,
-    cfg_path: PathBuf,
-) {
+fn spawn_auto_connect(cmd_tx: tokio::sync::mpsc::UnboundedSender<RuntimeCmd>, cfg_path: PathBuf) {
     std::thread::spawn(move || {
         let mut server: Option<(String, u16)> = None;
         if let Ok(text) = std::fs::read_to_string(&cfg_path) {
@@ -229,7 +225,10 @@ fn main() {
     // init_logging 装的是 tracing 订阅器，这里把 log 门面桥接到 tracing，
     // 否则本 crate 及复用模块里的 log::info!/log::warn! 全是静默空操作。
     let _ = tracing_log::LogTracer::init();
-    log::info!("rust_frpc-gui (tauri) 启动，工作目录: {}", exe_dir.display());
+    log::info!(
+        "rust_frpc-gui (tauri) 启动，工作目录: {}",
+        exe_dir.display()
+    );
 
     let cfg_path = config_path();
     log::info!("配置文件路径: {}", cfg_path.display());
@@ -284,16 +283,13 @@ fn main() {
             // 托盘菜单项
             let show_item =
                 MenuItem::with_id(app.handle(), "show", "显示主窗口", true, None::<&str>)?;
-            let start_item =
-                MenuItem::with_id(app.handle(), "start", "启动", true, None::<&str>)?;
-            let stop_item =
-                MenuItem::with_id(app.handle(), "stop", "停止", true, None::<&str>)?;
+            let start_item = MenuItem::with_id(app.handle(), "start", "启动", true, None::<&str>)?;
+            let stop_item = MenuItem::with_id(app.handle(), "stop", "停止", true, None::<&str>)?;
             let reload_item =
                 MenuItem::with_id(app.handle(), "reload", "重载配置", true, None::<&str>)?;
             let autostart_item =
                 MenuItem::with_id(app.handle(), "autostart", "开机自启", true, None::<&str>)?;
-            let quit_item =
-                MenuItem::with_id(app.handle(), "quit", "退出", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app.handle(), "quit", "退出", true, None::<&str>)?;
 
             let menu = Menu::new(app.handle())?;
             menu.append(&show_item)?;
@@ -306,7 +302,11 @@ fn main() {
             menu.append(&quit_item)?;
 
             let autostart_on = autostart::is_enabled();
-            let _ = autostart_item.set_text(if autostart_on { "✓ 开机自启" } else { "开机自启" });
+            let _ = autostart_item.set_text(if autostart_on {
+                "✓ 开机自启"
+            } else {
+                "开机自启"
+            });
 
             // 事件回调捕获
             let tray_cmd = cmd_tx.clone();
