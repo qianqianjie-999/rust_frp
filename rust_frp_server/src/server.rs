@@ -355,6 +355,8 @@ impl Server {
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // 启动监控任务
         self.start_monitor_task().await;
+        // 启动 STCP 待桥接条目定时回收（空闲期也必须回收，见方法注释）
+        self.start_stcp_bridge_gc_task().await;
 
         // 启动 Web 服务器
         if let Some(mut web_server) = self.web_server.take() {
@@ -1526,6 +1528,43 @@ impl Server {
                     metrics_data["bytes_sent"].as_u64().unwrap_or(0) / 1024,
                     metrics_data["bytes_received"].as_u64().unwrap_or(0) / 1024
                 );
+            }
+        });
+    }
+
+    /// STCP 待桥接条目的定时回收：不依赖请求触发的懒清理。
+    ///
+    /// 起因（2026-10-28 复盘僵尸桥）：`reap_zombie_bridges` 原先只在
+    /// create_bridge / reserve_leg 里被顺带调用，于是
+    /// ① 没人访问的时段完全不回收，僵尸条目常驻；
+    /// ② 对端集体失联时条目持续堆积，把 `MAX_PENDING_BRIDGES` 推向饱和，
+    ///    满了之后所有 STCP 建桥被拒，等于整条 STCP 通路不可用。
+    /// 这里每 `BRIDGE_GC_INTERVAL` 主动扫一遍，随 shutdown 一起退出。
+    async fn start_stcp_bridge_gc_task(&self) {
+        let sbm = self.stcp_bridge_manager.clone();
+        let shutdown = self.shutdown_notify.clone();
+        tokio::spawn(async move {
+            log::info!(
+                "STCP bridge GC started (interval {:?})",
+                crate::control::BRIDGE_GC_INTERVAL
+            );
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(crate::control::BRIDGE_GC_INTERVAL) => {
+                        let (reaped, replay) = sbm.sweep_stale().await;
+                        if reaped > 0 || replay > 0 {
+                            log::debug!(
+                                "STCP bridge GC: reaped {} stale bridge(s), {} replay id(s)",
+                                reaped,
+                                replay
+                            );
+                        }
+                    }
+                    _ = shutdown.notified() => {
+                        log::debug!("STCP bridge GC task stopped");
+                        return;
+                    }
+                }
             }
         });
     }

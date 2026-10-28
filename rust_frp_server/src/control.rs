@@ -1475,9 +1475,30 @@ impl ControlManager {
     }
 }
 
-/// STCP 僵尸桥存活上限：一条腿到达后另一条腿的最长等待时间。
-/// 正常桥接在秒级完成；超过 2 分钟说明对端已不可能再来（会话已断）。
-const BRIDGE_ZOMBIE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// 空桥存活上限：桥已建好，但 owner / visitor 两条腿**都还没到**。
+///
+/// 正常 1~2s 内就该凑齐；15s 已是极端余量，再久只可能是这条 visitor 请求
+/// 早已在客户端侧超时放弃，服务端白留一个空壳。
+const BRIDGE_EMPTY_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 半桥存活上限：已有一条腿到位，等另一条腿。
+///
+/// 原值 120s 的问题（2026-10-28 复盘僵尸桥）：visitor 客户端通常 10~20s 就
+/// 超时放弃了，服务端却还替它把另一条死连接和整个条目按住两分钟。流量稀疏
+/// 时这些条目更糟——`reap` 只在 create_bridge / reserve_leg 里被顺带调用，
+/// 空闲期等于没有回收，于是条目一边堆积、一边把 MAX_PENDING_BRIDGES 推向
+/// 饱和，满了就整条 STCP 通路一起被拒（fail-closed 放大）。
+/// 45s 覆盖慢速公网加一次客户端重试，再长没有意义。
+const BRIDGE_ZOMBIE_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// 已完成 bridge_id 的防重放保留期。
+///
+/// 与 visitor 签名时间窗同量级，**不参与上面两项的缩短**：留存 id 是为了挡住
+/// 拿旧签名重复建桥，窗口越短越不安全，所以这里维持原 120s。
+const BRIDGE_ID_REPLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 待桥接条目的定时回收周期。原先只靠请求触发懒清理，空闲期等于零回收。
+pub(crate) const BRIDGE_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 待桥接条目的容量上限：与 `login_throttle` 的 `MAX_ENTRIES` 同一思路——
 /// 内存必须有上界。达到上限即拒绝新建并告警，而不是让表无限增长。
@@ -1502,6 +1523,25 @@ pub(crate) struct StcpBridgeState {
     owner_reserved: bool,
     visitor_reserved: bool,
     created_at: std::time::Instant,
+}
+
+impl StcpBridgeState {
+    /// 该条目是否已过期。
+    ///
+    /// 空桥与半桥分开计时：一条腿都还没到，说明连工作连接都没建起来，用短超时；
+    /// 已有腿到位则按半桥等对端。返回的 `&'static str` 只用于日志区分原因。
+    fn expired_reason(&self, now: std::time::Instant) -> Option<&'static str> {
+        let age = now.duration_since(self.created_at);
+        let any_leg = self.owner_conn.is_some()
+            || self.visitor_conn.is_some()
+            || self.owner_reserved
+            || self.visitor_reserved;
+        if any_leg {
+            (age > BRIDGE_ZOMBIE_TTL).then_some("half-open")
+        } else {
+            (age > BRIDGE_EMPTY_TTL).then_some("empty")
+        }
+    }
 }
 
 /// STCP 桥接管理器，用于协调两个客户端的工作连接
@@ -1536,16 +1576,22 @@ impl StcpBridgeManager {
         visitor_work_conn_sign_key: String,
     ) -> Result<(), &'static str> {
         let mut bridges = self.bridges.write().await;
-        self.reap_zombie_bridges(&mut bridges).await;
+        self.reap_zombie_bridges(&mut bridges);
         let now = std::time::Instant::now();
         let mut recent = self.recent_bridge_ids.write().await;
-        recent.retain(|_, used_at| now.duration_since(*used_at) <= BRIDGE_ZOMBIE_TTL);
+        recent.retain(|_, used_at| now.duration_since(*used_at) <= BRIDGE_ID_REPLAY_WINDOW);
         if bridges.contains_key(&bridge_id) || recent.contains_key(&bridge_id) {
             return Err("bridge_id already used");
         }
         if bridges.len() >= MAX_PENDING_BRIDGES {
+            // 理论上到不了这里：建桥必须先过 secret_key 签名校验（只有合法 visitor
+            // 能建），且 5s 定时 GC 会持续回收空桥(15s)/半桥(45s)。真到 4096 条
+            // 待桥，意味着全体客户端同时异常。
+            // 此时宁可拒绝新桥，也不驱逐已有条目 —— 驱逐会误杀正在握手的正常
+            // 连接，而排队反而能给 GC 时间把过期的清掉。
             log::warn!(
-                "STCP pending bridges reached the {} entry cap; rejecting bridge for {}",
+                "STCP pending bridges reached the {} entry cap; rejecting bridge for {} \
+                 (GC recycles empty/half-open entries every 5s)",
                 MAX_PENDING_BRIDGES,
                 bridge_id
             );
@@ -1579,28 +1625,34 @@ impl StcpBridgeManager {
         Ok(())
     }
 
-    /// 僵尸桥兜底清理：任一条腿超过 BRIDGE_ZOMBIE_TTL 仍未凑齐即整条丢弃。
+    /// 僵尸桥兜底清理：按 `expired_reason` 判定，回收过期条目并返回回收数量。
     ///
-    /// 正常路径（cleanup_proxies / 桥接完成 remove）覆盖绝大多数场景；
-    /// 此函数兜住"visitor 侧重连、owner 换会话"等导致条目无人回收的情况。
-    async fn reap_zombie_bridges(
+    /// 正常路径（cleanup / 桥接完成 remove）覆盖绝大多数场景；此函数兜住
+    /// "visitor 侧重连、owner 换会话、对端进程被 kill" 等无人回收的情况。
+    /// 被判定过期的条目在这里移除，其暂存的 `AnyConn` 随 `StcpBridgeState` drop
+    /// 而关闭 —— 这是刻意的：让还在干等的另一侧立刻感知断连，而不是陪它等满
+    /// 客户端超时。
+    fn reap_zombie_bridges(
         &self,
         bridges: &mut std::collections::HashMap<String, StcpBridgeState>,
-    ) {
+    ) -> usize {
         let now = std::time::Instant::now();
-        bridges.retain(|id, state| {
-            if now.duration_since(state.created_at) > BRIDGE_ZOMBIE_TTL {
+        let before = bridges.len();
+        bridges.retain(|id, state| match state.expired_reason(now) {
+            Some(reason) => {
                 log::warn!(
-                    "Reaping zombie STCP bridge: {} (owner: {}, visitor: {})",
+                    "Reaping zombie STCP bridge: {} reason={} age={}ms owner_leg={} visitor_leg={}",
                     id,
-                    state.owner_conn.is_some(),
-                    state.visitor_conn.is_some()
+                    reason,
+                    now.duration_since(state.created_at).as_millis(),
+                    state.owner_conn.is_some() || state.owner_reserved,
+                    state.visitor_conn.is_some() || state.visitor_reserved
                 );
                 false
-            } else {
-                true
             }
+            None => true,
         });
+        before - bridges.len()
     }
 
     /// 在发送 StartWorkConn 前原子预留一个角色槽，避免出现“已回握手但未入桥”的窗口。
@@ -1611,7 +1663,7 @@ impl StcpBridgeManager {
         sign_key: &str,
     ) -> Result<StcpBridgeRole, &'static str> {
         let mut bridges = self.bridges.write().await;
-        self.reap_zombie_bridges(&mut bridges).await;
+        self.reap_zombie_bridges(&mut bridges);
         let Some(state) = bridges.get_mut(bridge_id) else {
             return Err("STCP bridge not found");
         };
@@ -1694,6 +1746,24 @@ impl StcpBridgeManager {
     /// 只清理指定 bridge_id，供 owner 投递失败或响应写失败时使用。
     pub(crate) async fn cleanup_bridge(&self, bridge_id: &str) {
         self.bridges.write().await.remove(bridge_id);
+    }
+
+    /// 定时回收入口：清过期待桥接条目与过期防重放记录。
+    ///
+    /// 与 `reap_zombie_bridges` 的区别在于**空闲期也生效** —— 原先的懒清理
+    /// 只在有请求进来时才跑，没人访问的时段等于完全不回收。
+    ///
+    /// 返回 `(回收的桥数, 回收的重放 id 数)`，供调用方决定是否打日志。
+    pub(crate) async fn sweep_stale(&self) -> (usize, usize) {
+        let reaped = {
+            let mut bridges = self.bridges.write().await;
+            self.reap_zombie_bridges(&mut bridges)
+        };
+        let now = std::time::Instant::now();
+        let mut recent = self.recent_bridge_ids.write().await;
+        let before = recent.len();
+        recent.retain(|_, used_at| now.duration_since(*used_at) <= BRIDGE_ID_REPLAY_WINDOW);
+        (reaped, before - recent.len())
     }
 }
 
@@ -2136,5 +2206,150 @@ mod stcp_bridge_tests {
             .is_err(),
             "达到容量上限后必须拒绝建桥"
         );
+    }
+}
+
+#[cfg(test)]
+mod stcp_bridge_gc_tests {
+    //! 僵尸桥回收回归（2026-10-28）。
+    //!
+    //! 现场症状：owner 侧不响应时待桥接条目长期驻留，原先 120s 一刀切 + 只在
+    //! 请求里懒清理，空闲期完全不回收。本次拆成空桥(15s)/半桥(45s) 两段，
+    //! 并加 5s 定时 GC。这里的用例锁住"别把还在正常等待的半桥提前掐断"。
+
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn bridge_state(age: Duration, owner_leg: bool, visitor_leg: bool) -> StcpBridgeState {
+        StcpBridgeState {
+            proxy_name: "ann-web-stcp".to_string(),
+            owner_run_id: "owner-run".to_string(),
+            visitor_run_id: "visitor-run".to_string(),
+            owner_work_conn_sign_key: "ok".to_string(),
+            visitor_work_conn_sign_key: "vk".to_string(),
+            owner_conn: None,
+            visitor_conn: None,
+            owner_reserved: owner_leg,
+            visitor_reserved: visitor_leg,
+            created_at: Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn empty_bridge_expires_at_empty_ttl() {
+        let now = Instant::now();
+        assert_eq!(
+            bridge_state(BRIDGE_EMPTY_TTL - Duration::from_secs(1), false, false)
+                .expired_reason(now),
+            None,
+            "未到空桥 TTL 不应回收"
+        );
+        assert_eq!(
+            bridge_state(BRIDGE_EMPTY_TTL + Duration::from_secs(1), false, false)
+                .expired_reason(now),
+            Some("empty"),
+            "空桥超过短 TTL 必须回收"
+        );
+    }
+
+    #[test]
+    fn half_open_bridge_keeps_until_zombie_ttl() {
+        // 关键回归：已过空桥 TTL、但还在半桥窗口内的条目**不能**被清，
+        // 否则正在等对端 work conn 的 visitor 会被提前掐断。
+        let now = Instant::now();
+        assert_eq!(
+            bridge_state(BRIDGE_EMPTY_TTL + Duration::from_secs(10), true, false)
+                .expired_reason(now),
+            None,
+            "半桥在 zombie TTL 内必须保留"
+        );
+        assert_eq!(
+            bridge_state(BRIDGE_ZOMBIE_TTL + Duration::from_secs(1), true, false)
+                .expired_reason(now),
+            Some("half-open"),
+            "半桥超过 zombie TTL 必须回收"
+        );
+    }
+
+    #[test]
+    fn reserved_leg_counts_as_arrived() {
+        // 只有预留、conn 还没装上的窗口期（StartWorkConn 正在写）同样算"有腿"，
+        // 不能按空桥短 TTL 回收。
+        let now = Instant::now();
+        assert_eq!(
+            bridge_state(BRIDGE_EMPTY_TTL + Duration::from_secs(5), true, false)
+                .expired_reason(now),
+            None
+        );
+        assert_eq!(
+            bridge_state(BRIDGE_EMPTY_TTL + Duration::from_secs(5), false, true)
+                .expired_reason(now),
+            None
+        );
+    }
+
+    #[test]
+    fn replay_window_is_not_shortened_with_zombie_ttl() {
+        // 缩短半桥 TTL 不得连带缩短防重放窗口（安全语义），
+        // 且 GC 周期必须短于最短 TTL，否则空桥会在两轮 GC 之间堆积。
+        assert!(BRIDGE_ID_REPLAY_WINDOW >= BRIDGE_ZOMBIE_TTL);
+        assert!(BRIDGE_ZOMBIE_TTL > BRIDGE_EMPTY_TTL);
+        assert!(BRIDGE_GC_INTERVAL < BRIDGE_EMPTY_TTL);
+    }
+
+    #[tokio::test]
+    async fn sweep_stale_reaps_expired_bridges_and_replay_ids() {
+        let m = StcpBridgeManager::new();
+        {
+            let mut bridges = m.bridges.write().await;
+            bridges.insert(
+                "stale".to_string(),
+                bridge_state(BRIDGE_EMPTY_TTL + Duration::from_secs(5), false, false),
+            );
+            bridges.insert(
+                "fresh".to_string(),
+                bridge_state(Duration::from_secs(1), false, false),
+            );
+        }
+        {
+            let mut recent = m.recent_bridge_ids.write().await;
+            recent.insert(
+                "expired-id".to_string(),
+                Instant::now() - BRIDGE_ID_REPLAY_WINDOW - Duration::from_secs(1),
+            );
+            recent.insert("live-id".to_string(), Instant::now());
+        }
+
+        let (reaped, replay) = m.sweep_stale().await;
+        assert_eq!(reaped, 1, "只应回收过期空桥");
+        assert_eq!(replay, 1, "只应清掉超过防重放窗口的 id");
+        {
+            let bridges = m.bridges.read().await;
+            assert!(bridges.contains_key("fresh"), "未过期的桥不能被误删");
+            assert!(!bridges.contains_key("stale"));
+        }
+        let recent = m.recent_bridge_ids.read().await;
+        assert!(recent.contains_key("live-id"));
+        assert!(!recent.contains_key("expired-id"));
+    }
+
+    #[tokio::test]
+    async fn sweep_stale_is_noop_when_nothing_expired() {
+        let m = StcpBridgeManager::new();
+        m.create_bridge(
+            "proxy".to_string(),
+            "live".to_string(),
+            "owner".to_string(),
+            "visitor".to_string(),
+            "ok".to_string(),
+            "vk".to_string(),
+        )
+        .await
+        .expect("建桥应成功");
+
+        let (reaped, replay) = m.sweep_stale().await;
+        assert_eq!(reaped, 0);
+        assert_eq!(replay, 0);
+        assert!(m.bridges.read().await.contains_key("live"));
     }
 }
