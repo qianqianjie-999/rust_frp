@@ -1,6 +1,6 @@
 [package]
 name = "rust_frp_client_tauri"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "rust_frp 客户端 Tauri 图形界面（托盘 + 网页控制台，Win7-Win11）"
 default-run = "rust_frpc-gui"

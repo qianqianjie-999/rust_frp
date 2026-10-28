@@ -3932,7 +3932,7 @@ impl Client {
             pool_count: self.config.transport.pool_count,
             user: self.config.user.clone().unwrap_or_default(),
             client_id: self.config.client_id.clone().unwrap_or(hostname),
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: get_timestamp(),
             run_id: run_id.clone(),
             // token 认证 → 静态令牌；oidc 认证 → 向 IdP 现取 access_token

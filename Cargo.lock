@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3071,7 +3071,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_client_tauri"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "rust_frp_client",
@@ -3090,7 +3090,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "glob",
@@ -3106,7 +3106,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "log",
@@ -3122,7 +3122,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3150,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_plugin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3166,7 +3166,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3197,7 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_util"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "glob",

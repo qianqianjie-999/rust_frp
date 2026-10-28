@@ -140,7 +140,7 @@ impl Control {
     /// 发送失败只记日志——此时连接已不可用，继续返回 `Err` 终止本次控制会话即可。
     async fn send_login_error(&mut self, message: &str) {
         let resp = rust_frp_core::LoginRespMsg {
-            version: "0.1.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             run_id: String::new(),
             error: message.to_string(),
             work_conn_tls: self.work_conn_tls,
@@ -469,7 +469,7 @@ impl Control {
 
                         // 发送登录响应（work_conn_tls 协商：服务器启用 TLS 时工作连接同步启用）
                         let resp = rust_frp_core::LoginRespMsg {
-                            version: "0.1.0".to_string(),
+                            version: env!("CARGO_PKG_VERSION").to_string(),
                             run_id: self.run_id.clone(),
                             error: "".to_string(),
                             work_conn_tls: self.work_conn_tls,
