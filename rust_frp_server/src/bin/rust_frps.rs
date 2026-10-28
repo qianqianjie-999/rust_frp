@@ -3,6 +3,12 @@ use rust_frp_server::Server;
 use std::env;
 use tracing::{error, info, warn};
 
+fn version_requested(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "-v" || arg == "--version")
+}
+
 /// 按配置的 `[log]` 段初始化日志；失败（如日志文件打不开）直接退出
 ///
 /// 退出码 1 与「配置错误」一致 —— 建议 systemd 单元配
@@ -20,6 +26,10 @@ fn init_logging_for_server(config: &rust_frp_config::ServerConfig) {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
+    if version_requested(&args) {
+        println!("rust_frps {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     // 对齐原版 --strict_config（默认 true）：未知字段直接报错
     // 支持 `--strict_config`（置 true）与 `--strict_config=false` 内联形式
@@ -187,5 +197,27 @@ async fn main() {
         info!("All connections drained, shutdown complete");
     } else {
         warn!("Drain timeout reached, forcing shutdown");
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::version_requested;
+
+    #[test]
+    fn version_flags_are_recognized_without_config() {
+        assert!(version_requested(&[
+            "rust_frps".to_string(),
+            "--version".to_string()
+        ]));
+        assert!(version_requested(&[
+            "rust_frps".to_string(),
+            "-v".to_string()
+        ]));
+        assert!(!version_requested(&[
+            "rust_frps".to_string(),
+            "-c".to_string(),
+            "frps.toml".to_string()
+        ]));
     }
 }
