@@ -1368,12 +1368,9 @@ impl ClientControl {
                     )
                     .await
                     {
-                        if e.to_string().to_lowercase().contains("connection reset")
-                            || e.to_string().to_lowercase().contains("connection aborted")
-                            || e.to_string().to_lowercase().contains("broken pipe")
-                        {
+                        if work_conn_disconnect_is_retryable(&e.to_string()) {
                             log::debug!(
-                                "Work connection for {} closed (peer disconnected): {:?}",
+                                "Work connection for {} closed during setup (retryable): {:?}",
                                 proxy_name,
                                 e
                             );
@@ -1622,6 +1619,20 @@ fn generate_work_conn_sign_key(token: &str, run_id: &str) -> String {
     let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, encryption_key.as_ref());
     let tag = hmac::sign(&hmac_key, msg.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(tag.as_ref())
+}
+
+fn work_conn_disconnect_is_retryable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "unexpectedeof",
+        "early eof",
+        "close_notify",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// 派生应用层加密密钥（SHA-256(token)，与服务端 AuthManager::generate_encryption_key 一致）
@@ -5754,5 +5765,39 @@ mod stcp_waiter_registry_tests {
             "bridge 1 response must not wake bridge 2"
         );
         drop(waiter2);
+    }
+}
+
+#[cfg(test)]
+mod work_conn_error_tests {
+    use super::work_conn_disconnect_is_retryable;
+
+    #[test]
+    fn recycled_pool_eof_is_retryable() {
+        for message in [
+            "peer closed connection without sending TLS close_notify",
+            "Custom { kind: UnexpectedEof, error: \"early eof\" }",
+            "connection reset by peer",
+            "Broken pipe",
+        ] {
+            assert!(
+                work_conn_disconnect_is_retryable(message),
+                "expected transient disconnect for {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn authentication_and_configuration_errors_stay_visible() {
+        for message in [
+            "Server error: Sign key mismatch",
+            "Proxy config not found: web_app",
+            "use_encryption requires a configured token",
+        ] {
+            assert!(
+                !work_conn_disconnect_is_retryable(message),
+                "non-transient error must remain ERROR: {message}"
+            );
+        }
     }
 }
