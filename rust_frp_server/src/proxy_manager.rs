@@ -440,12 +440,13 @@ impl ServerProxyManager {
             "udp" => self.start_udp_proxy(config).await?,
             "websocket" => self.start_websocket_proxy(config).await?,
             "tcpmux" => self.register_tcpmux_proxy(config).await?,
-            "sudp" => {
-                // sudp 与 stcp 同构：不绑定端口，仅作为访问者监听器等待
-                // frpc visitor 经 STCP 通道请求建桥（UDP 报文由两端 frpc 自行封装）
+            "sudp" | "stcp" | "xtcp" => {
+                // 三者都不绑定端口，仅在访问者发起时按需建桥；
+                // 缺 secret_key 时访问者校验必然失败，这里提前告警
                 if config.secret_key.as_deref().unwrap_or("").is_empty() {
                     log::warn!(
-                        "sudp proxy {} has no secret_key configured; visitor access will be rejected",
+                        "{} proxy {} has no secret_key configured; visitor access will be rejected",
+                        config.r#type,
                         config.name
                     );
                 }
