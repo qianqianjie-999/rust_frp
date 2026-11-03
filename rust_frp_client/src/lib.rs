@@ -1630,6 +1630,7 @@ fn work_conn_disconnect_is_retryable(message: &str) -> bool {
         "unexpectedeof",
         "early eof",
         "close_notify",
+        "half-close grace",
     ]
     .iter()
     .any(|needle| message.contains(needle))

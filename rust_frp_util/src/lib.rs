@@ -206,11 +206,11 @@ where
 /// 已经 EOF 之后才启动**，因此只要双向都还活着（含上述全部场景）就完全不受影响，
 /// 只回收"已经半死"的连接。
 ///
-/// # 300s 的取舍
+/// # 60s 的取舍
 ///
 /// 正常 HTTP 半关闭（客户端 `shutdown(SHUT_WR)` → 服务端回响应）在秒级完成，
 /// 远小于该值；设得更长只是让"被钉住的 socket"多占一会儿 fd。要调整改这一个常量。
-pub const BRIDGE_HALF_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+pub const BRIDGE_HALF_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 读到 EOF（`Ok(0)`）时通知一次的透明包装。
 ///
@@ -363,7 +363,7 @@ where
         }
         Err(e) => {
             if e.kind() == std::io::ErrorKind::TimedOut {
-                log::warn!("{}", e);
+                log::debug!("{}", e);
             }
             Err(e.into())
         }
