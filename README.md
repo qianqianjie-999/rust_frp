@@ -60,7 +60,7 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 ## 功能特性
 
 - **TCP 代理**：将内网 TCP 服务暴露到公网，支持任意端口
-- **HTTP 虚拟主机**：基于域名的 HTTP/HTTPS 路由，支持多自定义域名（`custom_domains`）。`subdomain` / `subdomain_base` 字段仅为配置兼容而保留，**尚未实现自动拼接路由**（需在 `custom_domains` 中写完整域名）
+- **HTTP 虚拟主机**：基于域名的 HTTP/HTTPS 路由，支持多自定义域名（`custom_domains`）。`subdomain` 会作为**完整域名**额外注册（等价于再追加一条 `custom_domains` 条目），服务端不做基域拼接；本项目**没有** `subdomain_base` / `subDomainHost` 配置项，只写一个前缀（如 `subdomain = "web"`）不会被任何 Host 匹配到
 - **WebSocket 代理**：支持 WebSocket HTTP Upgrade，透传实时通信流量
 - **STCP（安全 TCP）**：服务端中转的安全 TCP，无需在服务端开放额外端口映射
 - **XTCP（P2P TCP）**：点对点直连，支持 NAT 穿透打洞，失败自动回退 STCP

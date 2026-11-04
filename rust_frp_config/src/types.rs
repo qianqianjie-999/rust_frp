@@ -1296,7 +1296,7 @@ pub struct ProxyConfig {
 
     /// 子域名（HTTP/HTTPS 代理用）
     ///
-    /// 配合服务器的 `subdomain_base` 使用
+    /// 按**完整域名**注册（服务端不拼接基域，也没有 `subdomain_base` 配置项）
     #[serde(alias = "subDomain")]
     pub subdomain: Option<String>,
 
