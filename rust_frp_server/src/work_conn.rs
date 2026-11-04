@@ -346,8 +346,11 @@ impl ServerWorkConnManager {
                 .clone()
         };
 
-        // 重试次数按容量推导；服务端上限为 0（不限）时取一个安全下限，避免只试一次
-        let max_retries = self.pool_size.max(1) + 1;
+        // 重试次数必须按**池容量**推导，而不是服务端上限：池内每条超龄（>30s）或
+        // 失效条目都会消耗一次重试（`continue`），而服务端 `max_pool_count = 0`
+        // 表示不限容量（0.2.2 起的默认），此前按服务端上限算出的 2 次会全被超龄
+        // 条目吃掉，导致预建池闲置 30s 后所有取连接请求永久失败（生产回归）。
+        let max_retries = pool.capacity.max(1) + 1;
         let mut last_err = String::new();
 
         for retry in 0..max_retries {
