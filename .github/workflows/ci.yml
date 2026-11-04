@@ -106,9 +106,13 @@ jobs:
         working-directory: fuzz
         run: |
           set -euo pipefail
+          # 必须显式指定 gnu target：taiki-e/install-action 装的 cargo-fuzz 是 musl
+          # 静态预编译版，其默认 target = 自身编译三元组（x86_64-unknown-linux-musl），
+          # 而 ASAN 与 musl 的 crt-static 不兼容（实测 CI 报错
+          # "sanitizer is incompatible with statically linked libc" + E0463）。
           for target in fuzz_config fuzz_wire_frame; do
             echo "== $target =="
-            cargo fuzz run "$target" -- -max_total_time=30 -print_final_stats=1
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=30 -print_final_stats=1
           done
 
   gui-windows:
