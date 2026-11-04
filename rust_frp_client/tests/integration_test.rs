@@ -171,7 +171,11 @@ async fn test_hsmac_sign_roundtrip() {
 fn test_config_transport_defaults() {
     let transport = TransportConfig::default();
     assert_eq!(transport.protocol, "tcp");
-    assert_eq!(transport.pool_count, 10);
+    // 与原版 frp 对齐：默认不预建工作连接（旧默认 10 会常驻大量空闲 TLS 连接）
+    assert_eq!(transport.pool_count, 0);
+    // 服务端上限默认 0 = 不限（与原版 frp maxPoolCount 一致）
+    assert_eq!(transport.effective_max_pool_count(), 0);
+    assert_eq!(transport.tcp_keepalive_secs, 30);
     assert!(transport.tcp_mux);
 }
 

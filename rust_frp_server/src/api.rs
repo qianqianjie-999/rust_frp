@@ -164,7 +164,9 @@ async fn build_server_info(server: &Server) -> Value {
         "quicBindPort": cfg.quic_bind_port.unwrap_or(0),
         // rust_frp 暂未实现 subdomain 路由，字段保留以对齐原版响应结构
         "subdomainHost": "",
-        "maxPoolCount": cfg.transport.pool_count,
+        // maxPoolCount 是**服务端允许的上限**（原版 frp 语义），与客户端
+        // 请求的 pool_count 分开；客户端 pool_count 默认 0 时不会产生常驻连接。
+        "maxPoolCount": cfg.transport.effective_max_pool_count(),
         "maxPortsPerClient": cfg.max_ports_per_user.unwrap_or(0),
         "heartbeatTimeout": 90,
         "allowPortsStr": allow_ports,

@@ -123,6 +123,31 @@ pub trait Session: Send + Sync {
 /// `GET <FRP_WS_PATH>` 发起 WebSocket 升级；服务端据此路径前缀识别并升级。
 pub const FRP_WS_PATH: &str = "/~!frp";
 
+/// 为一条 TCP 连接开启 keepalive（空闲探测）
+///
+/// 专用工作端口（双端口模式）上的连接在无业务流量时是**完全静默**的，云上
+/// NAT / 安全组通常在 5~10 分钟内回收其表项。没有 keepalive 时，双方要等到
+/// 下一次写入才会发现连接已断，连接池还会以为这些连接仍然可用——这正是
+/// 现场观测到的「空闲工作连接约 6 分钟被替换、补池任务随即再建一条」的成因。
+///
+/// 只设置「空闲时间」与「探测间隔」（各平台通用），不设置重试次数：
+/// Windows 上 socket2 没有对应实现，且重试次数用系统默认即可。
+///
+/// # 参数
+///
+/// * `stream` - 目标 TCP 连接
+/// * `idle` - 空闲多久后开始探测
+pub fn apply_tcp_keepalive(stream: &TokioTcpStream, idle: Duration) -> Result<(), NetError> {
+    // 探测间隔取空闲时间的 1/3，但不低于 10 秒，避免包量被过度放大
+    let interval = std::cmp::max(idle / 3, Duration::from_secs(10));
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(idle)
+        .with_interval(interval);
+    socket2::SockRef::from(stream)
+        .set_tcp_keepalive(&keepalive)
+        .map_err(NetError::Io)
+}
+
 /// 实现 TokioTcpStream 的 FrpConn trait
 impl FrpConn for TokioTcpStream {
     fn remote_addr(&self) -> Option<SocketAddr> {

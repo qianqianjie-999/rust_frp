@@ -798,6 +798,14 @@ static WORK_PORT_LAST_FAIL_SECS: std::sync::atomic::AtomicI64 =
 
 const WORK_PORT_RETRY_INTERVAL_SECS: i64 = 60;
 
+/// 出站 TCP 复用缓存的大小（`ConnManager` 内部池）
+///
+/// 与 `transport.pool_count`（预建工作连接数，默认 0）**无关**：那个值是
+/// 「为代理提前准备多少条工作连接」，这里是「客户端拨号时复用多少条底层
+/// TCP」。两者共用一个数值会让 `pool_count = 0` 把信号量初始化为 0，
+/// 进而把 `get()` 永久阻塞。
+const CONN_REUSE_POOL_SIZE: usize = 10;
+
 fn work_port_currently_preferred() -> bool {
     let last = WORK_PORT_LAST_FAIL_SECS.load(std::sync::atomic::Ordering::Relaxed);
     if last == 0 {
@@ -856,7 +864,11 @@ impl Connector {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let tls_config = build_client_tls_config(&config)?;
 
-        let conn_manager = ConnManager::new(tls_config, config.transport.pool_count as usize);
+        // 注意：这里的「连接池」是**出站 TCP 复用缓存**，与 `transport.pool_count`
+        // （预建工作连接数）是两件事。历史上两者共用同一个数值，导致
+        // `pool_count = 0` 会把这里的信号量初始化为 0，`get()` 永久阻塞。
+        // 现按语义拆开：复用缓存固定用 CONN_REUSE_POOL_SIZE。
+        let conn_manager = ConnManager::new(tls_config, CONN_REUSE_POOL_SIZE);
 
         Ok(Self {
             config,
@@ -1700,6 +1712,15 @@ async fn dial_work_port(
     )
     .await
     .map_err(|_| format!("connect to work port {} timed out (5s)", work_addr))??;
+
+    // 预建的工作连接（pool_count > 0）会长期空闲，必须靠 keepalive 让内核
+    // 定期探测，否则云上 NAT 会在 5~10 分钟内静默回收，连接池随后拿着死连接
+    // 去桥接，表现为「偶发首个请求失败 / 502」。
+    if let Some(idle) = config.transport.tcp_keepalive_idle() {
+        if let Err(e) = rust_frp_net::apply_tcp_keepalive(&tcp_conn, idle) {
+            log::debug!("set TCP keepalive on work conn failed: {}", e);
+        }
+    }
     log::info!(
         "Connected to server work conn port: {} (proxy {})",
         work_addr,

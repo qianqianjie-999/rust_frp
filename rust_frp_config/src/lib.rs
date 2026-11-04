@@ -908,6 +908,17 @@ pub struct QuicConfig {
     pub keepalive_period: Option<u64>,
 }
 
+/// 服务端连接池上限的默认值：**0 = 不限**（对齐原版 frp `transport.maxPoolCount`）
+///
+/// 默认不设上限时，客户端配置多少就允许多少；需要约束单客户端资源占用时
+/// 再显式配置 `max_pool_count`。
+pub const DEFAULT_MAX_POOL_COUNT: u32 = 0;
+
+/// 工作连接 TCP keepalive 空闲时间的默认值（秒）
+///
+/// 取 30s 是为了在任何常见 NAT 空闲超时（通常 ≥ 300s）之前刷新表项。
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct TransportConfig {
@@ -950,11 +961,57 @@ pub struct TransportConfig {
     #[serde(alias = "tlsOnly")]
     pub tls_only: bool,
 
-    /// 连接池大小
+    /// 客户端预建立的工作连接数量（对齐原版 frp `transport.poolCount`）
     ///
-    /// 客户端预建立的工作连接数量。建议值：5-100
+    /// # 默认值
+    ///
+    /// **0**（与原版 frp 一致）：只在访问者连接到来时才请求工作连接。
+    ///
+    /// # 什么时候该调大
+    ///
+    /// 大量**短连接**场景下，预建可以省掉「请求工作连接 → 建连 → 握手」这一
+    /// 个往返（实测约 50~100 ms）。代价是常驻 `pool_count × 代理数` 条空闲
+    /// TLS 连接，且这些连接需要 keepalive 续命（见 `tcp_keepalive_secs`），
+    /// 否则会被云上 NAT 回收后立刻重建，反而制造握手风暴。
+    ///
+    /// # 何时不要开
+    ///
+    /// 启用 `tcp_mux`（默认开启）时，原版 frp 文档明确说连接池收益有限——
+    /// 多路复用本身已经把建连成本摊薄了。
     #[serde(alias = "poolCount")]
     pub pool_count: u32,
+
+    /// 服务端允许的连接池上限（对齐原版 frp `transport.maxPoolCount`）
+    ///
+    /// 客户端请求的 `pool_count` 超过此值时按此值收敛（不报错）。
+    /// 与 `pool_count` 分离的原因：原版 frp 里这两个参数本来就是「客户端想开多少」
+    /// 与「服务端允许开多少」两件事，混用一个字段会导致客户端把默认值改小时
+    /// 服务端上限一起塌掉。
+    ///
+    /// # 默认值
+    ///
+    /// 未配置时为 **0 = 不限**（与原版 frp 一致，由客户端 `pool_count` 自行决定）。
+    /// 需要防止单客户端开过大池时再显式配置本项。
+    #[serde(alias = "maxPoolCount")]
+    pub max_pool_count: Option<u32>,
+
+    /// 工作连接 TCP keepalive 空闲时间（秒），0 表示禁用
+    ///
+    /// # 为什么需要
+    ///
+    /// 专用工作端口（双端口模式）上的连接在没有业务流量时是**完全空闲**的，
+    /// 云上 NAT / 安全组通常会在 5~10 分钟内回收空闲 TCP。没有 keepalive 时，
+    /// 对端要到下次写入才发现连接已死；连接池还会以为这些连接可用。
+    ///
+    /// 开启后内核会按该间隔发探测包，NAT 表项得以续期，死连接也能被及时清掉。
+    ///
+    /// # 取值建议
+    ///
+    /// 小于链路上 NAT 的空闲超时（常见 300s）。默认 30s 足够保守。
+    ///
+    /// **0** = 关闭（不推荐，除非链路没有中间 NAT）。
+    #[serde(alias = "tcpKeepaliveSecs")]
+    pub tcp_keepalive_secs: u64,
 
     /// 带宽限制（可选），格式如 "1MB" 或 "1GB"
     #[serde(alias = "bandwidthLimit")]
@@ -1022,13 +1079,34 @@ impl Default for TransportConfig {
             tls: None,
             tcp_mux: true,
             tls_only: false,
-            pool_count: 10,
+            // 与原版 frp 对齐：默认不预建工作连接
+            pool_count: 0,
+            max_pool_count: None,
+            tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             bandwidth_limit: None,
             use_encryption: false,
             use_compression: false,
             quic: None,
             wire_protocol: "v1".to_string(),
             work_conn_via: "auto".to_string(),
+        }
+    }
+}
+
+impl TransportConfig {
+    /// 服务端实际生效的连接池上限；**0 表示不限**
+    ///
+    /// 客户端 `pool_count` 超过该值时按该值收敛；`pool_count = 0`（默认）
+    /// 时客户端根本不请求预建连接，此值不产生任何常驻连接。
+    pub fn effective_max_pool_count(&self) -> u32 {
+        self.max_pool_count.unwrap_or(DEFAULT_MAX_POOL_COUNT)
+    }
+
+    /// 工作连接 keepalive 空闲时间；`None` 表示禁用
+    pub fn tcp_keepalive_idle(&self) -> Option<std::time::Duration> {
+        match self.tcp_keepalive_secs {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
         }
     }
 }
@@ -2938,7 +3016,31 @@ custom_domains = ["example.com", "www.example.com"]
         let config = TransportConfig::default();
         assert_eq!(config.protocol, "tcp");
         assert!(config.tcp_mux);
-        assert_eq!(config.pool_count, 10);
+        // 与原版 frp 对齐：默认不预建工作连接（旧版本这里是 10，会在空闲时
+        // 常驻 pool_count × 代理数 条 TLS 连接）
+        assert_eq!(config.pool_count, 0);
+        assert_eq!(config.effective_max_pool_count(), DEFAULT_MAX_POOL_COUNT);
+        assert_eq!(
+            config.tcp_keepalive_idle(),
+            Some(std::time::Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
+        );
+    }
+
+    /// `pool_count`（客户端想开多少）与 `max_pool_count`（服务端允许多少）语义分离
+    #[test]
+    fn test_pool_count_overrides_and_keepalive_disable() {
+        let cfg: TransportConfig =
+            toml::from_str("poolCount = 2\nmaxPoolCount = 4\ntcpKeepaliveSecs = 0")
+                .expect("parse transport config");
+        assert_eq!(cfg.pool_count, 2);
+        assert_eq!(cfg.effective_max_pool_count(), 4);
+        // 0 = 关闭 keepalive
+        assert_eq!(cfg.tcp_keepalive_idle(), None);
+
+        // 未显式配置 maxPoolCount 时退回默认上限，不受 pool_count 影响
+        let cfg2: TransportConfig =
+            toml::from_str("poolCount = 0").expect("parse transport config");
+        assert_eq!(cfg2.effective_max_pool_count(), DEFAULT_MAX_POOL_COUNT);
     }
 
     #[test]

@@ -729,8 +729,13 @@ impl Control {
 
         if error_msg.is_empty() {
             log::info!("proxy registered: {}", proxy_name);
-            // 初始化工作连接池（不做预填充，由 get_work_conn 的取后补充自然填充）
-            self.work_conn_manager.init_pool(&proxy_name).await;
+            // 按**客户端声明的 `pool_count`** 初始化工作连接池，并收敛到服务端
+            // `maxPoolCount` 上限（与原版 frp 语义一致）。
+            // 此前这里一律用服务端上限：客户端配 `pool_count = 0` 也会被预建
+            // `maxPoolCount` 条空闲 TLS 连接，在生产上表现为「每个代理常驻 10 条」。
+            self.work_conn_manager
+                .init_pool_with_capacity(&proxy_name, self.pool_count as usize)
+                .await;
         } else {
             log::error!("failed to register proxy {}: {}", proxy_name, error_msg);
         }

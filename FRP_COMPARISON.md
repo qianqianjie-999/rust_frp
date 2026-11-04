@@ -1,5 +1,10 @@
 # rust_frp ↔ 原版 frp 能力对照报告
 
+> **先看这条**：本文对照的是**功能与配置语义**。两者的**线协议不互通，且不计划互通**——
+> 原版 `frpc` 连不上 `rust_frps`，反之亦然。双端口（控制/工作连接分离）是本项目的
+> 核心设计，线协议按此自有设计，不迁就原版的单连接 yamux 语义。
+> 详见 `README.md` 的「⚠️ 与原版 frp 的关系（必读）」。
+>
 > 对照基线：`/home/qianqianjie/frp`（fatedier/frp，v0.71.0，commit `832df8d`）
 > vs `/home/qianqianjie/rust_frp`（本地 master，`37fab80`）
 > 报告日期：2026-10-04　｜　方法：**源码级逐项核对**（读双方源码/config struct/路由表，不采信 README 宣称）

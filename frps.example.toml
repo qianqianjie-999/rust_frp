@@ -81,7 +81,13 @@ allow_ports = [
 [transport]
 protocol = "tcp"
 tcp_mux = true
-pool_count = 10
+# 服务端允许的连接池上限（对齐原版 frp `maxPoolCount`）。
+# 与客户端的 `pool_count` 是两件事：这里只是「允许多少」，客户端默认 0 时
+# 不会产生任何常驻工作连接。
+# 0 = 不限（默认，与原版一致）；需要约束单客户端资源占用时再改成具体数值。
+# max_pool_count = 10
+# 工作连接 TCP keepalive 空闲时间（秒），0 = 关闭
+tcp_keepalive_secs = 30
 # 非法的带宽值（空串 / 0 / 负数 / 非数字）会直接报配置错误
 # bandwidth_limit = "10MB"
 

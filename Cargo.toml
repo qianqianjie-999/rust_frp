@@ -47,6 +47,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 kcp = "0.6"
 yamux = "0.13"
+# 仅用于给工作连接设置 TCP keepalive：专用工作端口上的空闲连接会被云 NAT
+# 回收（实测约 6 分钟一轮），没有 keepalive 就只能等下次写入才发现连接已死。
+# socket2 早已是 tokio 的传递依赖，不引入新的编译单元。
+socket2 = "0.6"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 notify = { version = "6.0", default-features = false, features = ["macos_kqueue"] }

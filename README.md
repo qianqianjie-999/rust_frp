@@ -7,6 +7,51 @@
 
 Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/HTTP/HTTPS 代理转发功能。
 
+## ⚠️ 与原版 frp 的关系（必读）
+
+**本项目与原版 frp 只共用「配置文件的写法」，线协议是我们自己的——不兼容，也不计划兼容。**
+
+这不是待办，是设计选择。两端必须成对使用：`rust_frps` + `rust_frpc`。
+
+| 项目 | 状态 | 说明 |
+|------|------|------|
+| 配置文件字段 | ✅ 兼容 | 原版 `frpc.toml` / `frps.toml` 的 camelCase 字段可直接复用 |
+| 配置语义 | ✅ 基本对齐 | `[log]`、`transport.tls`、`auth`、`[[proxies]]` 等 |
+| 控制面线协议 | ❌ **不兼容（有意为之）** | 帧格式不同，见下表 |
+| 原版 frpc ↔ rust_frps | ❌ 无法登录 | 实测 v0.71.1 / v0.52.3 均失败 |
+| rust_frpc ↔ 原版 frps | ❌ 无法登录 | 同上，反向亦然 |
+
+### 为什么不做协议兼容
+
+双端口（控制连接 / 工作连接分离）是本项目的核心设计，它要的正是原版 `tcpMux` 想解决但解决不彻底的东西：控制心跳不被大流量挤占、数据面不受单条 TCP 的队头阻塞牵连、两个端口可以套不同的防火墙与网络路径。把这个设计塞进原版的单连接 yamux 语义里，等于把优点削掉一半。
+
+所以线协议从头就是按双端口设计的：独立的 `work_conn_port`、按连接粒度的 HMAC 签名、可选的 v2 方向性 AEAD 控制通道。让它去兼容原版的 `[1B 类型][8B 长度]` 帧，只会同时束缚两边。
+
+### 两条链路的封装差异（供排障参考）
+
+| 实现 | 控制帧格式 | 多路复用标识 |
+|------|-----------|-------------|
+| 原版 frp（Go） | `[1B 消息类型][8B 大端长度][JSON]`（`fatedier/golib/msg/json`，Login 的类型字节是 `'o'`） | yamux 帧 |
+| rust_frp | `[4B 大端长度][JSON]` | 自研 `TCP_MUX_MAGIC` 前缀 + yamux 会话流 |
+
+实测记录（2026-11-04，生产实例）：
+
+```text
+官方 frpc v0.71.1（默认 tcpMux=true）
+  客户端首包 : 00 01 00 01 00 00 00 01 00 5c          ← yamux SYN 帧
+  服务端日志 : message size too large: 65537 bytes (max: 65536)
+
+官方 frpc v0.71.1（transport.tcpMux = false）
+  客户端首包 : 6f 00 00 00 00 00 00 00 bd 7b 22 ...    ← 'o' + u64 长度 + JSON
+  服务端日志 : message size too large: 1862270976 bytes (max: 65536)
+
+官方 frpc v0.52.3 → 与上面完全相同（1862270976）
+```
+
+> **迁移建议**：原版部署请**整对替换**（服务端与客户端一起换）。如果必须与原版共存，就让两套各跑各的（原版 frps+frpc 一对、rust_frps+rust_frpc 一对），不要指望交叉混连。
+>
+> 上面这些报错是**预期行为**，不是 bug：看到 `message size too large: 65537` 或 `1862270976`，基本就是拿原版客户端连了 rust_frps。
+
 ## 功能特性
 
 - **TCP 代理**：将内网 TCP 服务暴露到公网，支持任意端口
@@ -68,10 +113,10 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 | 健康检查 | ✅ | 支持 TCP/HTTP 检查 |
 | 带宽限制 | ✅ | 支持代理级和全局级限制 |
 | PROXY Protocol | ✅ | 可选启用，透传真实访问者 IP（v1 文本 / v2 二进制，`proxyProtocolVersion` 选择版本） |
-| 原版配置兼容 | ✅ | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容）；`[log]` 段已支持；**仍有部分原版字段暂未支持**，非严格模式下解析成功并 WARN 提示、严格模式下直接报错（清单见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md) 第十节） |
+| 原版配置兼容 | ✅（仅配置） | 原版 frp 的 camelCase 字段名可直接解析（snake_case/camelCase 双向兼容）；`[log]` 段已支持；**仍有部分原版字段暂未支持**，非严格模式下解析成功并 WARN 提示、严格模式下直接报错（清单见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md) 第十节）。**注意：这是配置兼容；线协议自有且不计划兼容，见上方「与原版 frp 的关系」** |
 | frpc CLI 子命令 | ✅ | `verify`（校验配置）/ `reload`（热重载）/ `status`（代理状态）/ `stop`（优雅停止），后三者走 frpc 管理端口（Basic Auth 保护）；另有 `nathole discover`（NAT 探测）、`frpc <type> [visitor]`（单代理/访客快速启动，9 类代理）、`--config_dir`（多实例）、`--api-timeout`、`--strict_config`（严格配置模式，默认 true，未知字段直接报错；`--strict_config=false` 退回 WARN 模式） |
 | 流量统计 | ✅ | 桥接结束累加双向字节：服务端 `/api/proxies`（`traffic_in/out`）+ Prometheus per-proxy 指标；客户端 `frpc status`（`traffic_down/up`） |
-| 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试 |
+| 工作连接池模式 | ✅ | per-proxy mpsc channel，取后补充+失败重试；`pool_count` **默认 0**（与原版一致，不预建连接），需要低延迟时建议配 1~2 而非常见的 10；服务端用 `maxPoolCount` 单独设上限；工作连接默认开启 TCP keepalive（`tcp_keepalive_secs = 30`），避免空闲连接被云 NAT 回收后反复重建 |
 
 > **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 87%。尚未支持的主要项：
 > 客户端插件 `virtual_net`、SSH 隧道网关、`featureGates`、Store 配置源、legacy INI 配置等。
@@ -550,7 +595,12 @@ protocol = "tcp"
 bandwidth_limit = "10MB"  # 全局带宽限制
 tls = { enable = true }
 tcp_mux = true
-pool_count = 10
+# 预建工作连接数：默认 0（不预建，与原版 frp 一致）。
+# 短连接密集的场景可配 1~2 换取首包低延迟；配 10 意味着「每个代理常驻 10 条
+# 空闲 TLS 连接」，实测在云上会被 NAT 每约 6 分钟回收一轮、引发握手风暴。
+pool_count = 0
+# 工作连接 TCP keepalive 空闲时间（秒），0 = 关闭
+tcp_keepalive_secs = 30
 
 # 认证配置 - Token 方式
 # [auth]

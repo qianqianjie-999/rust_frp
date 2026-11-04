@@ -95,6 +95,12 @@ pub(crate) struct ServerManagers {
 /// 优雅关闭排空轮询间隔
 const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// 出站 TCP 复用缓存大小（`ConnManager` 内部池）
+///
+/// 与 `transport.pool_count`（预建工作连接数）无关：后者默认 0，若直接拿它
+/// 当信号量容量，`ConnManager::get()` 会永久阻塞。
+const CONN_REUSE_POOL_SIZE: usize = 10;
+
 /// 由 `transport.quic` 构造 QUIC 传输参数（未配置时用与原版 frp 一致的默认值）
 fn quic_options(config: &ServerConfig) -> QuicOptions {
     let q = config.transport.quic.as_ref();
@@ -265,7 +271,7 @@ impl Server {
         ));
         let http_vhost_router = Arc::new(HttpVhostRouter::new());
         let work_conn_manager = Arc::new(ServerWorkConnManager::new(
-            config.transport.pool_count as usize,
+            config.transport.effective_max_pool_count() as usize,
         ));
         let proxy_owners = Arc::new(RwLock::new(std::collections::HashMap::new()));
         // 服务端 HTTP 插件管理器（未配置 http_plugins 时为空管理器，回调直接短路）
@@ -309,7 +315,7 @@ impl Server {
             _ => None,
         };
 
-        let conn_manager = ConnManager::new(tls_config, config.transport.pool_count as usize);
+        let conn_manager = ConnManager::new(tls_config, CONN_REUSE_POOL_SIZE);
         let stcp_bridge_manager = Arc::new(StcpBridgeManager::new());
         let xtcp_visitors = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
@@ -495,6 +501,7 @@ impl Server {
         // tls_only 时拒绝一切明文工作连接
         let work_conn_tls_config = self.conn_manager.get_tls_config().cloned();
         let work_conn_tls_only = self.config.transport.tls_only;
+        let work_conn_keepalive = self.config.transport.tcp_keepalive_idle();
         let work_conn_managers = self.managers();
         let work_conn_listener_for_task = work_conn_listener.clone();
         let handle = tokio::spawn(async move {
@@ -503,6 +510,7 @@ impl Server {
                 work_conn_managers,
                 work_conn_tls_config,
                 work_conn_tls_only,
+                work_conn_keepalive,
             )
             .await;
         });
@@ -658,6 +666,7 @@ impl Server {
         managers: ServerManagers,
         tls_config: Option<TlsConfig>,
         tls_only: bool,
+        keepalive: Option<std::time::Duration>,
     ) {
         let ServerManagers {
             control_manager,
@@ -687,6 +696,17 @@ impl Server {
                             continue;
                         }
                     };
+                    // 工作连接常被连接池预建后长期空闲；在 TLS 包装之前对底层
+                    // TCP 开启 keepalive，让内核负责 NAT 表项续期与死连接探测。
+                    if let Some(idle) = keepalive {
+                        if let Err(e) = rust_frp_net::apply_tcp_keepalive(&conn, idle) {
+                            log::debug!(
+                                "set TCP keepalive on work conn from {:?} failed: {}",
+                                addr,
+                                e
+                            );
+                        }
+                    }
                     let cm = control_manager.clone();
                     let wcm = work_conn_manager.clone();
                     let sbm = stcp_bridge_manager.clone();
@@ -2408,7 +2428,7 @@ impl Clone for Server {
             proxy_manager: self.proxy_manager.clone(),
             visitor_manager: self.visitor_manager.clone(),
             auth_runtime: self.auth_runtime.clone(),
-            conn_manager: ConnManager::new(None, self.config.transport.pool_count as usize),
+            conn_manager: ConnManager::new(None, CONN_REUSE_POOL_SIZE),
             tcp_listener: None,
             vhost_http_listener: None,
             vhost_https_listener: None,

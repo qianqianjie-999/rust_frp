@@ -88,7 +88,14 @@ protocol = "tcp"
 # max_incoming_streams = 100000
 # keepalive_period = 0         # 秒，0 = 不主动保活
 tcp_mux = true
-pool_count = 10
+# 预建工作连接数（对齐原版 frp `poolCount`）：默认 0 = 不预建。
+# 短连接密集时可配 1~2 换首包低延迟；不建议配 10——那是「每个代理常驻 10 条
+# 空闲 TLS 连接」，在云上会被 NAT 每约 6 分钟回收一轮，补池随即重建，
+# 形成每秒零点几次的 mTLS 握手与大量日志。
+pool_count = 0
+# 工作连接 TCP keepalive 空闲时间（秒），0 = 关闭。默认 30s，
+# 用于给专用工作端口上的空闲连接续命（NAT 表项超时通常 ≥ 300s）。
+tcp_keepalive_secs = 30
 # ── 可选：工作连接承载方式（数据/控制分离开关，本项目的双端口设计）──
 # rust_frp 默认双端口：bind_port（如 9300）承载控制面（登录/心跳/控制消息），
 # work_conn_port（默认 bind_port+1000，如 10300）承载工作连接（真正的业务数据）。

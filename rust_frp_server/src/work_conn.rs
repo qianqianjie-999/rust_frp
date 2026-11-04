@@ -159,14 +159,33 @@ impl ServerWorkConnManager {
         }
     }
 
-    /// 为代理初始化工作连接池
+    /// 为代理初始化工作连接池（使用管理器默认容量）
     pub async fn init_pool(&self, proxy_name: &str) {
+        self.init_pool_with_capacity(proxy_name, self.pool_size)
+            .await;
+    }
+
+    /// 按**客户端请求的预建数量**初始化池，并收敛到服务端上限
+    ///
+    /// 与原版 frp 语义一致：`poolCount` 由客户端声明，`maxPoolCount` 是服务端
+    /// 允许的上限，实际容量取两者较小值。
+    ///
+    /// 关键点：客户端 `pool_count = 0`（默认）时容量为 0 —— 池只做「等待者直投」，
+    /// 不再预建任何空闲连接。访问者到来时仍由 `get_work_conn` 现场请求一条，
+    /// 因此功能不受影响，只是不再常驻空闲 TLS 会话。
+    pub async fn init_pool_with_capacity(&self, proxy_name: &str, requested: usize) {
+        // 服务端上限为 0 表示不限（对齐原版 frp `maxPoolCount = 0`）
+        let capacity = if self.pool_size == 0 {
+            requested
+        } else {
+            std::cmp::min(requested, self.pool_size)
+        };
         let pool = Arc::new(WorkConnPool {
             state: Mutex::new(WorkConnPoolState {
                 idle: VecDeque::new(),
                 waiters: VecDeque::new(),
             }),
-            capacity: self.pool_size,
+            capacity,
             refilling: AtomicBool::new(false),
             fill_notify: Notify::new(),
             next_waiter_id: std::sync::atomic::AtomicUsize::new(0),
@@ -174,10 +193,18 @@ impl ServerWorkConnManager {
         let mut pools = self.pools.write().await;
         pools.insert(proxy_name.to_string(), pool);
         log::info!(
-            "Initialized work conn pool for proxy: {}, capacity: {}",
+            "Initialized work conn pool for proxy: {}, capacity: {} (client requested {}, server max {} = {})",
             proxy_name,
-            self.pool_size
+            capacity,
+            requested,
+            self.pool_size,
+            if self.pool_size == 0 { "unlimited" } else { "capped" }
         );
+    }
+
+    /// 服务端允许的连接池上限
+    pub fn max_pool_size(&self) -> usize {
+        self.pool_size
     }
 
     /// 注册工作连接到池中（由 process_work_conn 调用）
@@ -319,7 +346,8 @@ impl ServerWorkConnManager {
                 .clone()
         };
 
-        let max_retries = self.pool_size + 1;
+        // 重试次数按容量推导；服务端上限为 0（不限）时取一个安全下限，避免只试一次
+        let max_retries = self.pool_size.max(1) + 1;
         let mut last_err = String::new();
 
         for retry in 0..max_retries {

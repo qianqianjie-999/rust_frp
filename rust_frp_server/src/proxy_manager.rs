@@ -936,7 +936,11 @@ impl ServerProxyManager {
                     Err(e) => {
                         // 半关闭宽限期超时属于收尾清理，不是故障：降为 debug 避免淹没真实错误
                         if e.to_string().contains("half-close grace") {
-                            log::debug!("Bridge closed by half-close grace for proxy {}: {:?}", target_name, e);
+                            log::debug!(
+                                "Bridge closed by half-close grace for proxy {}: {:?}",
+                                target_name,
+                                e
+                            );
                         } else {
                             log::error!("Bridge error for proxy {}: {:?}", target_name, e);
                         }
