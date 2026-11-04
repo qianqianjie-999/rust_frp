@@ -2,7 +2,15 @@
 
 本文记录影响部署、兼容性或数据面的主要变更。普通重构和测试补充不逐条列出。
 
-## 未发布：双端口数据面调优
+## 2026-11-04：v0.2.2
+
+对应 Git tag：`v0.2.2`。
+
+### 发布
+
+- Release 产物扩展到 5 个平台：Linux x86_64（glibc / musl 静态）、macOS（aarch64 / x86_64）、Windows x86_64。
+- CI 新增协议解析 fuzz 冒烟（`fuzz_config` / `fuzz_wire_frame`，各 30s）与两个零依赖基准；
+  `cargo audit` 检出依赖漏洞时改为阻断合并（unmaintained 类告警不阻断）。
 
 ### 变更（会影响现有部署的默认行为）
 
