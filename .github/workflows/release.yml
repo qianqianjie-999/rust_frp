@@ -35,6 +35,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        # .cargo/config.toml 把该 target 的 linker 指定为绝对路径 /usr/bin/musl-gcc，
+        # 未安装 musl-tools 时 cc-rs 会报 ToolNotFound（v0.2.2 发布实测踩到）。
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Cache Rust dependencies
         uses: swatinem/rust-cache@v2
         with:
