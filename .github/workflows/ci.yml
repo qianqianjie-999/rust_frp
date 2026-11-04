@@ -104,6 +104,12 @@ jobs:
 
       - name: Run fuzz targets (30s each)
         working-directory: fuzz
+        # 仓库根 .cargo/config.toml 的 [profile.release] lto = true 会被 cargo-fuzz
+        # 继承，导致 sancov 插桩链接失败（rust-fuzz/cargo-fuzz#384）：
+        # rust-lld: error: undefined symbol: __sancov_gen_.*
+        # 该 issue 给出的规避方式即在 fuzz 构建时关掉 LTO。
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
         run: |
           set -euo pipefail
           # 必须显式指定 gnu target：taiki-e/install-action 装的 cargo-fuzz 是 musl

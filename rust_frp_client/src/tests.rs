@@ -1558,9 +1558,12 @@ mod visitor_work_port_tests {
 
         // spawn 只代表任务已排队，不代表 UDP bind 已完成；先通过“端口不可再绑”
         // 确认 visitor 已进入 recv 循环，避免首包被无监听端口静默丢弃。
+        // 预算 10s：探针自己也可能抢在 visitor 之前绑上端口，导致 visitor 走
+        // start_sudp_visitor 里 1s 的重试退避；再叠加全量并行测试的调度延迟，
+        // 1s 预算会出现偶发假红（实测 CI 出现过）。
         let visitor_addr = format!("127.0.0.1:{visitor_bind}");
         let mut visitor_ready = false;
-        for _ in 0..100 {
+        for _ in 0..1000 {
             match tokio::net::UdpSocket::bind(&visitor_addr).await {
                 Ok(probe) => drop(probe),
                 Err(_) => {
