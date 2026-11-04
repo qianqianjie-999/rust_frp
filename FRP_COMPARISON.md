@@ -267,7 +267,7 @@
 
 | 侧 | 缺失字段（原版有，rust 无） |
 |----|------------------------------|
-| frps | `vhostHTTPTimeout`、`subDomainHost`（rust 用 `subdomain_base`）、`tcpmuxPassthrough`、`detailedErrorsToClient`、`userConnTimeout`、`maxPortsPerClient`（rust 用 `maxPortsPerUser`，命名不同）、`natholeAnalysisDataReserveHours`、`udpPacketSize`、`sshTunnelGateway`、`featureGates`、`transport.heartbeatTimeout`/`tcpKeepalive`/`maxPoolCount` |
+| frps | `vhostHTTPTimeout`、`subDomainHost`（rust 仅有同名配置字段 `subdomain_base`，**未实现子域名路由**，需用 `custom_domains` 写完整域名）、`tcpmuxPassthrough`、`detailedErrorsToClient`、`userConnTimeout`、`maxPortsPerClient`（rust 用 `maxPortsPerUser`，命名不同）、`natholeAnalysisDataReserveHours`、`udpPacketSize`、`sshTunnelGateway`、`featureGates`、`transport.heartbeatTimeout`/`tcpKeepalive`/`maxPoolCount` |
 | frpc | `natHoleStunServer`、`dnsServer`、`loginFailExit`、`start`（按名启用代理）、`udpPacketSize`、`virtualNet`、`featureGates`、`store`、`transport.proxyURL`/`connectServerLocalIP`/`dialServerTimeout`/`dialServerKeepalive`/`tcpMuxKeepaliveInterval`/`heartbeatInterval`/`heartbeatTimeout` |
 | 代理 | HTTP/HTTPS：`requestHeaders`、`responseHeaders`、`routeByHTTPUser` |
 

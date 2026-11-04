@@ -934,16 +934,12 @@ impl ServerProxyManager {
                         global_metrics().record_traffic(&target_name, to_work, to_visitor);
                     }
                     Err(e) => {
-                        // 半关闭宽限期超时属于收尾清理，不是故障：降为 debug 避免淹没真实错误
-                        if e.to_string().contains("half-close grace") {
-                            log::debug!(
-                                "Bridge closed by half-close grace for proxy {}: {:?}",
-                                target_name,
-                                e
-                            );
-                        } else {
-                            log::error!("Bridge error for proxy {}: {:?}", target_name, e);
-                        }
+                        // 对端正常断开（RST / 主动关闭）与半关闭宽限超时都属于连接生命周期，
+                        // 由 util 统一降级为 debug，避免淹没真实故障
+                        rust_frp_util::log_bridge_error(
+                            &format!("Bridge error for proxy {target_name}"),
+                            e.as_ref(),
+                        );
                     }
                 }
             }
@@ -1044,10 +1040,9 @@ impl ServerProxyManager {
                         global_metrics().record_traffic(&proxy_name_clone, to_work, to_visitor);
                     }
                     Err(e) => {
-                        log::error!(
-                            "WebSocket bridge error for proxy {}: {:?}",
-                            proxy_name_clone,
-                            e
+                        rust_frp_util::log_bridge_error(
+                            &format!("WebSocket bridge error for proxy {proxy_name_clone}"),
+                            e.as_ref(),
                         );
                     }
                 }

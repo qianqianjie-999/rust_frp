@@ -52,10 +52,15 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 >
 > 上面这些报错是**预期行为**，不是 bug：看到 `message size too large: 65537` 或 `1862270976`，基本就是拿原版客户端连了 rust_frps。
 
+> **生产升级提示**：当前不同构建可能共用 `0.1.0` 版本号。升级前请记录
+> SHA-256，阅读 [升级指南](docs/UPGRADING.md)，并按
+> [兼容性矩阵](docs/COMPATIBILITY.md)
+> 验证反向代理协议和后端连接语义。
+
 ## 功能特性
 
 - **TCP 代理**：将内网 TCP 服务暴露到公网，支持任意端口
-- **HTTP 虚拟主机**：基于域名的 HTTP/HTTPS 路由，支持自定义域名和子域名
+- **HTTP 虚拟主机**：基于域名的 HTTP/HTTPS 路由，支持多自定义域名（`custom_domains`）。`subdomain` / `subdomain_base` 字段仅为配置兼容而保留，**尚未实现自动拼接路由**（需在 `custom_domains` 中写完整域名）
 - **WebSocket 代理**：支持 WebSocket HTTP Upgrade，透传实时通信流量
 - **STCP（安全 TCP）**：服务端中转的安全 TCP，无需在服务端开放额外端口映射
 - **XTCP（P2P TCP）**：点对点直连，支持 NAT 穿透打洞，失败自动回退 STCP
@@ -121,6 +126,14 @@ Rust FRP 是使用 Rust 语言实现的高性能反向代理工具，提供 TCP/
 > **与原版 frp 的差距（摘要）**：数据面已基本对齐，控制/运维面覆盖约 87%。尚未支持的主要项：
 > 客户端插件 `virtual_net`、SSH 隧道网关、`featureGates`、Store 配置源、legacy INI 配置等。
 > 逐项源码级对照与本项目更严格的安全默认值，见 [`FRP_COMPARISON.md`](FRP_COMPARISON.md)。
+
+## 项目文档
+
+- [升级指南](docs/UPGRADING.md)
+- [兼容性矩阵](docs/COMPATIBILITY.md)
+- [排障手册](docs/TROUBLESHOOTING.md)
+- [变更日志](CHANGELOG.md)
+- [与原版 frp 的功能对照](FRP_COMPARISON.md)
 
 ---
 
@@ -217,7 +230,7 @@ rust_frp/
 | 帧化握手 | 帧格式 `[2B 类型][2B 标志][4B 长度][载荷]`；ClientHello / ServerHello 完成能力协商（消息编解码器、AEAD 算法、32B 随机数） |
 | 方向性 AEAD | 控制通道读写分别使用不同密钥：`HKDF-SHA256(ikm = SHA-256(token), salt = SHA-256(转录), info = "frp wire v2 control aead <算法> <方向>")`，根本排除双向复用同一 `(key, nonce)` |
 | 算法 | `aes-256-gcm`；`xchacha20-poly1305` 为路线图项，协商时不会被选中 |
-| 兼容性 | 默认 `v1`；v1 客户端/服务端行为零变更（服务端嗅探非魔数时把字节原样回放） |
+| 兼容性 | 默认 `v1`；这里仅指 wire protocol v1 控制编码行为不变，不代表两个不同日期的 `0.1.0` 客户端在数据面、工作连接和后端连接语义上完全兼容 |
 
 ```toml
 # frpc.toml
@@ -787,6 +800,11 @@ path = "/health"
 > 💡 STCP/XTCP/SUDP 访问者的工作连接始终直拨工作端口（不走 mux），这是 10300
 > 在纯 STCP 部署中也会被用到的原因——安全组需同时放行 `bind_port` 与
 > `work_conn_port`。
+
+> ⚠️ **升级兼容性**：双端口和工作连接生命周期会影响所有 TCP 代理。若本地上游是
+> HTTP 服务，前端反向代理应显式使用 HTTP/1.1；Apache/mod_wsgi、HTTP/1.0 和长连接
+> 场景必须实际验证。详见 [升级指南](docs/UPGRADING.md) 和
+> [兼容性矩阵](docs/COMPATIBILITY.md)。
 
 ---
 

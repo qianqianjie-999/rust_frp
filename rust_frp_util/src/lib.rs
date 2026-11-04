@@ -130,6 +130,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn benign_bridge_error_covers_normal_disconnects() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let err: Box<dyn std::error::Error + Send + Sync> =
+                Box::new(std::io::Error::new(kind, "peer closed"));
+            assert!(
+                is_benign_bridge_error(err.as_ref()),
+                "{kind:?} 应视为正常断开"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_bridge_error_keeps_real_failures() {
+        let err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("disk full"));
+        assert!(!is_benign_bridge_error(err.as_ref()));
+
+        let err: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "other timeout",
+        ));
+        assert!(!is_benign_bridge_error(err.as_ref()));
+
+        let grace: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "bridge half-close grace (60s) exceeded",
+        ));
+        assert!(is_benign_bridge_error(grace.as_ref()));
+    }
+
+    #[test]
     fn test_get_timestamp() {
         let ts1 = get_timestamp();
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -367,6 +403,35 @@ where
             }
             Err(e.into())
         }
+    }
+}
+
+/// 判断桥接错误是否属于“对端正常断开”的常见形态。
+///
+/// 反向代理里 RST / 主动关闭 / 半关闭宽限超时每天出现成千上万次，属于连接生命
+/// 周期的一部分；调用方应把这类错误降级为 debug，避免真实故障被淹没。
+pub fn is_benign_bridge_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    if e.to_string().contains("half-close grace") {
+        return true;
+    }
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        return matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        );
+    }
+    false
+}
+
+/// 统一的桥接错误日志级别：正常断开 → debug，其余 → error。
+pub fn log_bridge_error(scope: &str, e: &(dyn std::error::Error + Send + Sync + 'static)) {
+    if is_benign_bridge_error(e) {
+        log::debug!("{}: {:?}", scope, e);
+    } else {
+        log::error!("{}: {:?}", scope, e);
     }
 }
 

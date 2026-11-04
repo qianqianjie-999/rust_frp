@@ -1,0 +1,29 @@
+[package]
+name = "rust_frp-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rust_frp_config = { path = "../rust_frp_config" }
+rust_frp_net = { path = "../rust_frp_net" }
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[[bin]]
+name = "fuzz_config"
+path = "fuzz_targets/fuzz_config.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wire_frame"
+path = "fuzz_targets/fuzz_wire_frame.rs"
+test = false
+doc = false
+
+# 独立 workspace，避免 cargo-fuzz 的 nightly 依赖影响主仓库构建
+[workspace]

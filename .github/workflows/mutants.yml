@@ -1,0 +1,39 @@
+name: Mutation Testing
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每月 1 日凌晨跑一次，作为测试有效性的兜底检查（不参与 PR 门禁）
+    - cron: '0 3 1 * *'
+
+jobs:
+  mutants:
+    name: cargo-mutants (rust_frp_util)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+
+      # 先用 util 作为试点：协议/重试/桥接逻辑集中在这里，变异体数量可控。
+      # 存活变异体会写进 mutants.out，需要人工判断是测试缺口还是等价变异。
+      - name: Run cargo mutants
+        run: cargo mutants -p rust_frp_util --timeout 90 --jobs 2 --output mutants.out
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants.out
+          if-no-files-found: warn

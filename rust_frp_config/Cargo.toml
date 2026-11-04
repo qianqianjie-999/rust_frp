@@ -14,3 +14,7 @@ log = { workspace = true }
 thiserror = { workspace = true }
 glob = { workspace = true }
 rust_frp_util = { path = "../rust_frp_util" }
+
+[[bench]]
+name = "config_parse"
+harness = false

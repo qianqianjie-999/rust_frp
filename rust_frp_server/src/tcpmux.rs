@@ -463,10 +463,9 @@ async fn serve_conn(mut conn: TcpStream, peer: SocketAddr, deps: TcpMuxDeps) {
         Ok((to_work, to_visitor)) => {
             global_metrics().record_traffic(&route.proxy_name, to_work, to_visitor);
         }
-        Err(e) => log::error!(
-            "tcpmux: bridge error for proxy [{}]: {:?}",
-            route.proxy_name,
-            e
+        Err(e) => rust_frp_util::log_bridge_error(
+            &format!("tcpmux: bridge error for proxy [{}]", route.proxy_name),
+            e.as_ref(),
         ),
     }
 }
