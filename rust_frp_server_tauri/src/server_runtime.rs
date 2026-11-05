@@ -312,7 +312,8 @@ async fn session_task(
         config.bind_addr,
         config.bind_port,
         config.web_server.addr,
-        config.web_server.port
+        config.web_server.port,
+        config.vhost_http_port
     );
     let mut server = match Server::new(config, Some(path_str.clone())).await {
         Ok(s) => s,
