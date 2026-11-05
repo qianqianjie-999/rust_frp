@@ -67,6 +67,15 @@ jobs:
           cp "target/${{ matrix.target }}/release/rust_frpc${suffix}" "$staging/"
           cp frps.example.toml frpc.example.toml "$staging/"
           cp README.md LICENSE "$staging/" 2>/dev/null || true
+          # 平台安装方法直接入包: Windows=安装/看门狗脚本+指南, Linux/macOS=systemd/launchd 文档
+          if [ -n "$suffix" ]; then
+            cp deploy/windows/install.bat deploy/windows/uninstall.bat \
+               deploy/windows/update.bat deploy/windows/run.cmd \
+               deploy/windows/frpc.windows.example.toml "$staging/"
+            cp docs/windows-client.md "$staging/INSTALL-windows.md"
+          else
+            cp deploy/INSTALL-linux-frps.md deploy/INSTALL-linux-frpc.md "$staging/"
+          fi
           tar -czf "rust_frp-${{ matrix.target }}.tar.gz" -C dist "rust_frp-${{ matrix.target }}"
 
       - name: Upload artifact
@@ -89,10 +98,27 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Make deploy kit (安装方法套件, 单独资产)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          kit="rust_frp-${GITHUB_REF_NAME}-deploy-kit"
+          mkdir -p "$kit/windows" "$kit/linux"
+          cp deploy/windows/install.bat deploy/windows/uninstall.bat \
+             deploy/windows/update.bat deploy/windows/run.cmd \
+             deploy/windows/frpc.windows.example.toml "$kit/windows/"
+          cp docs/windows-client.md "$kit/windows/INSTALL-windows.md"
+          cp deploy/INSTALL-linux-frps.md deploy/INSTALL-linux-frpc.md "$kit/linux/"
+          cp README.md "$kit/README.md"
+          zip -qr "$kit.zip" "$kit"
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: |
+            artifacts/*.tar.gz
+            rust_frp-*-deploy-kit.zip
           generate_release_notes: true
           fail_on_unmatched_files: true
