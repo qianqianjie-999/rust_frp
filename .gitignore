@@ -53,3 +53,4 @@ out/
 rust_frp_net/cert/*.crt
 rust_frp_net/cert/*.key
 *.pem
+dist/

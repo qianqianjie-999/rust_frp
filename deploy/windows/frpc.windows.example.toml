@@ -1,0 +1,42 @@
+# ============================================================================
+# frpc.windows.example.toml — Windows 访客(visitor)端配置模板
+# 复制为 frpc.toml 后修改: client_id / token / secret_key / 证书路径
+# !! 真实 token / secret_key 不要提交到任何仓库
+# ============================================================================
+
+client_id = "win-visitor-XX"          # 每台机器唯一
+server_addr = "123.57.86.80"          # frps 公网地址
+server_port = 9300
+
+[auth]
+method = "token"
+token = "<填 frps 端 token>"
+
+[log]
+level = "info"
+
+[transport]
+protocol = "tcp"
+
+# 计划任务以 SYSTEM 身份启动时工作目录是 System32，证书必须用绝对路径!
+[transport.tls]
+enable = true
+cert_file = "C:/frpc/client-XX.crt"   # 本客户端证书 (CN 唯一)
+key_file = "C:/frpc/client-XX.key"
+trusted_ca_file = "C:/frpc/ca.crt"    # frps 内部 CA
+
+# ---- 示例: STCP 访客, 访问播报机 SSH ----
+# server_name 必须与被访问端 frpc.toml 里 [[proxies]] 的 name 一字不差
+[[visitors]]
+name = "visit-ann-ssh"
+type = "stcp"
+server_name = "ann-ssh-stcp"
+secret_key = "<填与 owner 端一致的 secret_key>"
+bind_addr = "127.0.0.1"
+bind_port = 9311
+use_encryption = true
+
+# ---- frpc 自身管理页 ----
+[web_server]
+addr = "127.0.0.1"
+port = 9310
