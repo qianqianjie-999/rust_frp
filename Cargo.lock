@@ -3041,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_client"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -3071,7 +3071,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_client_tauri"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "log",
  "rust_frp_client",
@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "rust_frp_server"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -3194,6 +3194,26 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+]
+
+[[package]]
+name = "rust_frp_server_tauri"
+version = "0.2.3"
+dependencies = [
+ "log",
+ "notify",
+ "rust_frp_config",
+ "rust_frp_server",
+ "rust_frp_util",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tokio",
+ "toml 0.8.2",
+ "tracing",
+ "tracing-log",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
