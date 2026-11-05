@@ -53,7 +53,7 @@ jobs:
           -p rust_frp_server -p rust_frp_client
           --bin rust_frps --bin rust_frpc
 
-      - name: Build GUI apps (windows only, 成对: rust_frps-gui + rust_frpc-gui)
+      - name: Build GUI apps (windows only, rust_frps-gui + rust_frpc-gui 成对)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: >
           cargo build --release
