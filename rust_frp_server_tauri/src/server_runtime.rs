@@ -102,6 +102,7 @@ pub fn spawn_runtime(config_path: PathBuf, web_port: u16) -> RuntimeHandle {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeCmd>();
     let (status_tx, status_rx) = std::sync::mpsc::channel::<StatusUpdate>();
     let control: Arc<Control> = Arc::new(Control::default());
+    let control_for_thread = control.clone();
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -124,7 +125,7 @@ pub fn spawn_runtime(config_path: PathBuf, web_port: u16) -> RuntimeHandle {
             web_port,
             cmd_rx,
             status_tx,
-            control.clone(),
+            control_for_thread,
         ));
     });
 
@@ -449,11 +450,14 @@ fn fetch_clients(port: u16) -> Vec<String> {
     let Some(v) = http_get_json(port, "/api/clients") else {
         return Vec::new();
     };
-    let arr = match v.as_array() {
-        Some(a) => a,
+    let arr: Vec<serde_json::Value> = match v.as_array() {
+        Some(a) => a.clone(),
         None => {
             // 兼容 {"clients": [...]} 包装
-            v.get("clients").and_then(|c| c.as_array()).cloned().unwrap_or_default()
+            v.get("clients")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default()
         }
     };
     arr.iter()
