@@ -53,6 +53,13 @@ jobs:
           -p rust_frp_server -p rust_frp_client
           --bin rust_frps --bin rust_frpc
 
+      - name: Build GUI apps (windows only, 成对: rust_frps-gui + rust_frpc-gui)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          -p rust_frp_server_tauri -p rust_frp_client_tauri
+
       - name: Package
         shell: bash
         run: |
@@ -67,12 +74,18 @@ jobs:
           cp "target/${{ matrix.target }}/release/rust_frpc${suffix}" "$staging/"
           cp frps.example.toml frpc.example.toml "$staging/"
           cp README.md LICENSE "$staging/" 2>/dev/null || true
-          # 平台安装方法直接入包: Windows=安装/看门狗脚本+指南, Linux/macOS=systemd/launchd 文档
+          # 平台安装方法直接入包: Windows=安装/看门狗脚本+指南+GUI双程序, Linux/macOS=systemd/launchd 文档
           if [ -n "$suffix" ]; then
             cp deploy/windows/install.bat deploy/windows/uninstall.bat \
                deploy/windows/update.bat deploy/windows/run.cmd \
                deploy/windows/frpc.windows.example.toml "$staging/"
             cp docs/windows-client.md "$staging/INSTALL-windows.md"
+            # GUI 成对程序（MSVC 静态链接 WebView2Loader，无 DLL 依赖）
+            for g in rust_frps-gui rust_frpc-gui; do
+              src="target/${{ matrix.target }}/release/${g}.exe"
+              [ -f "$src" ] && cp "$src" "$staging/"
+            done
+            cp docs/windows-gui.md "$staging/INSTALL-gui.md"
           else
             cp deploy/INSTALL-linux-frps.md deploy/INSTALL-linux-frpc.md "$staging/"
           fi
@@ -109,6 +122,7 @@ jobs:
              deploy/windows/update.bat deploy/windows/run.cmd \
              deploy/windows/frpc.windows.example.toml "$kit/windows/"
           cp docs/windows-client.md "$kit/windows/INSTALL-windows.md"
+          cp docs/windows-gui.md "$kit/windows/INSTALL-gui.md" 2>/dev/null || true
           cp deploy/INSTALL-linux-frps.md deploy/INSTALL-linux-frpc.md "$kit/linux/"
           cp README.md "$kit/README.md"
           zip -qr "$kit.zip" "$kit"

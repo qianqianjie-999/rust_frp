@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<title>rust_frp 服务端</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --border: #e3e6ea; --text: #1f2933;
+    --muted: #6b7280; --accent: #2563eb; --green: #22c55e; --amber: #f59e0b;
+    --gray: #9ca3af; --red: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 12.5px;
+    overflow-y: auto;
+  }
+  .wrap { max-width: 700px; margin: 0 auto; padding: 10px 14px 14px; }
+  header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  header h1 { font-size: 15px; margin: 0; flex: 1; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--gray); box-shadow: 0 0 0 3px rgba(0,0,0,.04); flex: none; }
+  .state-text { color: var(--muted); font-size: 12px; }
+  .btns button {
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    padding: 4px 11px; border-radius: 6px; cursor: pointer; margin-left: 5px; font-size: 12.5px;
+  }
+  .btns button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btns button:disabled { opacity: .45; cursor: default; }
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 11px; margin-bottom: 8px; }
+  section h2 { font-size: 13px; margin: 0 0 7px; }
+  .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 14px; }
+  .f { display: flex; flex-direction: column; gap: 2px; }
+  .f.wide { grid-column: 1 / -1; }
+  .f.inline { flex-direction: row; align-items: center; gap: 6px; }
+  .f label { color: var(--muted); font-size: 11.5px; }
+  input[type=text], input[type=password], select {
+    width: 100%; padding: 4px 7px; border: 1px solid var(--border); border-radius: 6px;
+    background: #fff; color: var(--text); font-size: 12.5px;
+  }
+  input[type=checkbox] { width: 15px; height: 15px; }
+  .status-line { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .hint { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+  .msg { margin-top: 6px; font-size: 12px; min-height: 15px; }
+  .msg.ok { color: var(--green); }
+  .msg.err { color: var(--red); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  details[open] { margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="dot" id="dot"></span>
+    <h1>rust_frp 服务端</h1>
+    <span class="state-text" id="stateText">就绪</span>
+    <span class="btns">
+      <button id="btnStop">停止</button>
+      <button id="btnStart" class="primary">启动</button>
+      <button id="btnSave">保存配置</button>
+    </span>
+  </header>
+
+  <section>
+    <h2>状态</h2>
+    <div class="status-line" id="clientsLine">在线客户端：无</div>
+    <div class="msg" id="msg"></div>
+    <div class="status-line" id="msgLine"></div>
+  </section>
+
+  <section>
+    <h2>监听参数</h2>
+    <div class="fields">
+      <div class="f"><label>绑定地址</label><input type="text" id="bind_addr" placeholder="0.0.0.0" /></div>
+      <div class="f"><label>控制端口</label><input type="text" id="bind_port" placeholder="9300" /></div>
+      <div class="f wide"><label>Token（认证口令，客户端需一致）</label><input type="password" id="token" /></div>
+    </div>
+  </section>
+
+  <section>
+    <details>
+      <summary>扩展端口（可空 = 不启用）</summary>
+      <div class="fields" style="margin-top:8px">
+        <div class="f"><label>KCP (UDP)</label><input type="text" id="kcp_bind_port" placeholder="留空=禁用" /></div>
+        <div class="f"><label>QUIC (UDP)</label><input type="text" id="quic_bind_port" placeholder="留空=禁用" /></div>
+        <div class="f"><label>vhost HTTP</label><input type="text" id="vhost_http_port" placeholder="留空=禁用" /></div>
+        <div class="f"><label>vhost HTTPS</label><input type="text" id="vhost_https_port" placeholder="留空=禁用" /></div>
+        <div class="f"><label>tcpmux (HTTP CONNECT)</label><input type="text" id="tcpmux_http_connect_port" placeholder="留空=禁用" /></div>
+        <div class="f"><label>工作端口(可空)</label><input type="text" id="work_conn_port" placeholder="留空=控制端口+1000" /></div>
+      </div>
+    </details>
+  </section>
+
+  <section>
+    <h2>Dashboard 控制台</h2>
+    <div class="fields">
+      <div class="f"><label>监听地址</label><input type="text" id="web_addr" placeholder="0.0.0.0" /></div>
+      <div class="f"><label>端口（0=禁用）</label><input type="text" id="web_port" placeholder="7500" /></div>
+      <div class="f"><label>用户名(可空)</label><input type="text" id="web_user" /></div>
+      <div class="f"><label>密码(可空)</label><input type="password" id="web_password" /></div>
+      <div class="f wide inline"><label>开机自启</label><input type="checkbox" id="autostart" /></div>
+      <div class="f"><label>日志级别</label>
+        <select id="log_level">
+          <option>debug</option><option>info</option><option>warn</option><option>error</option>
+        </select>
+      </div>
+    </div>
+    <div class="hint">状态轮询固定访问 127.0.0.1:端口/healthz（免认证）。Dashboard 设了密码后在线列表将不可见，仅显示运行状态。</div>
+  </section>
+</div>
+
+<script>
+  // 解析 Tauri 的 IPC 入口（v2 兼容写法，同客户端 GUI）
+  function resolveInvoke() {
+    const w = window;
+    const internals = w.__TAURI_INTERNALS__;
+    if (internals && typeof internals.invoke === 'function') {
+      return (cmd, args, opts) => internals.invoke(cmd, args, opts);
+    }
+    const t = w.__TAURI__;
+    if (t) {
+      if (t.core && typeof t.core.invoke === 'function') {
+        return (cmd, args, opts) => t.core.invoke(cmd, args, opts);
+      }
+      if (typeof t.invoke === 'function') {
+        return (cmd, args, opts) => t.invoke(cmd, args, opts);
+      }
+    }
+    return null;
+  }
+  const invoke = resolveInvoke();
+  const ipcDiag =
+    'internals=' + typeof window.__TAURI_INTERNALS__ +
+    ', __TAURI__=' + typeof window.__TAURI__;
+
+  function showMsg(text, kind) {
+    const el = document.getElementById('msg');
+    el.textContent = text || '';
+    el.className = 'msg' + (kind ? ' ' + kind : '');
+  }
+
+  function setStatus(resp) {
+    const dot = document.getElementById('dot');
+    const t = document.getElementById('stateText');
+    t.textContent = resp.text;
+    let color = 'var(--gray)';
+    if (resp.state === 'Running') color = 'var(--green)';
+    else if (resp.state === 'Starting') color = 'var(--amber)';
+    else if (resp.state.startsWith('Error')) color = 'var(--red)';
+    dot.style.background = color;
+    const running = resp.state === 'Running' || resp.state === 'Starting';
+    document.getElementById('btnStart').disabled = running;
+    document.getElementById('btnStop').disabled = !running;
+    const cs = resp.clients || [];
+    document.getElementById('clientsLine').textContent =
+      '在线客户端：' + (cs.length ? cs.join(', ') : '无');
+    if (resp.message) document.getElementById('msgLine').textContent = resp.message;
+  }
+
+  async function pollStatus() {
+    if (!invoke) return;
+    try {
+      const r = await invoke('get_status');
+      setStatus(r);
+    } catch (e) { /* 忽略瞬时错误 */ }
+  }
+
+  async function loadAll() {
+    if (!invoke) { showMsg('未检测到 Tauri 运行环境（' + ipcDiag + '）', 'err'); return; }
+    try {
+      const cfg = await invoke('load_config');
+      document.getElementById('bind_addr').value = cfg.bind_addr || '0.0.0.0';
+      document.getElementById('bind_port').value = cfg.bind_port || '';
+      document.getElementById('token').value = cfg.token || '';
+      document.getElementById('kcp_bind_port').value = cfg.kcp_bind_port || '';
+      document.getElementById('quic_bind_port').value = cfg.quic_bind_port || '';
+      document.getElementById('vhost_http_port').value = cfg.vhost_http_port || '';
+      document.getElementById('vhost_https_port').value = cfg.vhost_https_port || '';
+      document.getElementById('tcpmux_http_connect_port').value = cfg.tcpmux_http_connect_port || '';
+      document.getElementById('work_conn_port').value = cfg.work_conn_port || '';
+      document.getElementById('web_addr').value = cfg.web_addr || '0.0.0.0';
+      document.getElementById('web_port').value = cfg.web_port || '7500';
+      document.getElementById('web_user').value = cfg.web_user || '';
+      document.getElementById('web_password').value = cfg.web_password || '';
+      document.getElementById('log_level').value = cfg.log_level || 'info';
+      const aut = await invoke('get_autostart');
+      document.getElementById('autostart').checked = !!aut;
+    } catch (e) {
+      showMsg('加载配置失败：' + e, 'err');
+    }
+  }
+
+  function collectConfig() {
+    const g = id => document.getElementById(id).value;
+    const c = id => document.getElementById(id).checked;
+    return {
+      bind_addr: g('bind_addr'),
+      bind_port: g('bind_port'),
+      token: g('token'),
+      kcp_bind_port: g('kcp_bind_port'),
+      quic_bind_port: g('quic_bind_port'),
+      vhost_http_port: g('vhost_http_port'),
+      vhost_https_port: g('vhost_https_port'),
+      tcpmux_http_connect_port: g('tcpmux_http_connect_port'),
+      work_conn_port: g('work_conn_port'),
+      web_addr: g('web_addr'),
+      web_port: g('web_port'),
+      web_user: g('web_user'),
+      web_password: g('web_password'),
+      log_level: g('log_level'),
+      autostart: c('autostart'),
+    };
+  }
+
+  function needIpc() {
+    if (!invoke) { showMsg('未检测到 Tauri 运行环境（' + ipcDiag + '）', 'err'); return false; }
+    return true;
+  }
+  document.getElementById('btnStart').onclick = () => {
+    if (!needIpc()) return;
+    invoke('start').catch(e=>showMsg('启动失败：'+e,'err'));
+  };
+  document.getElementById('btnStop').onclick = () => {
+    if (!needIpc()) return;
+    invoke('stop').catch(e=>showMsg('停止失败：'+e,'err'));
+  };
+  document.getElementById('btnSave').onclick = async () => {
+    if (!needIpc()) return;
+    try {
+      // Rust 侧签名是 save_config(cfg: ServerConfigUi)，参数必须包在 cfg 键下
+      await invoke('save_config', { cfg: collectConfig() });
+      showMsg('配置已保存（运行中会自动热重载）', 'ok');
+    } catch (e) { showMsg('保存失败：' + e, 'err'); }
+  };
+  document.getElementById('autostart').onchange = (e) => {
+    // Rust 侧签名是 set_autostart(payload: SetAutostartPayload)
+    invoke('set_autostart', { payload: { enable: e.target.checked } })
+      .catch(err => showMsg('开机自启设置失败：' + err, 'err'));
+  };
+
+  loadAll();
+  pollStatus();
+  setInterval(pollStatus, 2000);
+</script>
+</body>
+</html>
